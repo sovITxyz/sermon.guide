@@ -14,13 +14,34 @@ permissions:
   security-events: write
 
 jobs:
+  filter:
+    name: Detect languages with source
+    runs-on: ubuntu-latest
+    outputs:
+      languages: ${{ steps.detect.outputs.languages }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          langs=()
+          if [ -f worker/pyproject.toml ] || [ -f api/pyproject.toml ]; then
+            langs+=('"python"')
+          fi
+          if [ -f web/package.json ]; then
+            langs+=('"javascript-typescript"')
+          fi
+          IFS=,
+          echo "languages=[${langs[*]}]" >> "$GITHUB_OUTPUT"
+
   analyze:
     name: Analyze (${{ matrix.language }})
+    needs: filter
+    if: needs.filter.outputs.languages != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        language: [python, javascript-typescript]
+        language: ${{ fromJSON(needs.filter.outputs.languages) }}
     steps:
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3

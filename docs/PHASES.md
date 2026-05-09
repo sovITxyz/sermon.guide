@@ -311,7 +311,7 @@ Commit. Stop.
 ```
 cd to sermon.guide. Read ARCHITECTURE.md.
 
-Goal: end-to-end ingest CLI: file → chunks → BGE embeddings → Milvus rows tagged with tenant_id. Plus ship the `tenant-auditor` subagent and paired `/check-tenant-leak` skill so future sessions can audit tenant scoping on demand.
+Goal: end-to-end ingest CLI: file → chunks → BGE embeddings → Milvus rows partitioned by book_id (per ARCHITECTURE.md §3 + §7.1 resolution). Plus ship the `tenant-auditor` subagent and paired `/check-tenant-leak` skill so future sessions can audit tenant scoping on demand.
 
 ## Build
 - Branch: phase-6/embedding-insert off main.
@@ -320,13 +320,13 @@ Goal: end-to-end ingest CLI: file → chunks → BGE embeddings → Milvus rows 
   - Load BAAI/bge-large-en-v1.5 once at module init. CPU fine for now; document GPU swap.
   - embed(texts: list[str]) -> np.ndarray (N, 1024).
 - worker/ingest.py:
-  - CLI: `python -m worker.ingest <file> --tenant-id <id> --book-id <id>`.
+  - CLI: `python -m worker.ingest <file> --user-id <id> --book-id <id>` (user_id used for the user_library row that records ownership; book_id is the vector partition).
   - Pipeline: detect → extract → chunk → embed → insert with metadata JSON (filename, chunk index).
 - No dedup yet, no Celery. Single-process.
 - Ship `.claude/agents/tenant-auditor.md`:
   - Frontmatter: `name: tenant-auditor`, `description: Audit code for tenant-scoping and isolation bugs`, `tools: Read, Grep, Bash(uv run pytest worker/tests/test_tenant_isolation.py *)`, `model: opus`.
-  - Body: every Milvus search has tenant_id in expr; every SQLAlchemy query filters by user_id; API routes derive tenant_id from JWT, never from request body; highlights queries are double-scoped (user_id AND book_id). Run isolation test as final check.
-- Ship `.claude/skills/check-tenant-leak/SKILL.md` (the grep-based check that CONTRIBUTING.md and the PR template reference). Frontmatter: `name: check-tenant-leak`, `description: Audit codebase for unscoped DB or vector queries`, `disable-model-invocation: true`. Body: grep `collection.search(`, `session.query(`, `.execute(`; verify tenant filters; flag tenant_id sourced from request body vs JWT.
+  - Body: every Milvus search has `book_id IN (<set>)` in expr where the set is sourced from Postgres user_library for a JWT-authenticated user (never the request body); every SQLAlchemy query filters by user_id derived from JWT, never the request; API routes derive user_id from JWT only; highlights queries are double-scoped (user_id AND book_id). Run isolation test as final check.
+- Ship `.claude/skills/check-tenant-leak/SKILL.md` (the grep-based check that CONTRIBUTING.md and the PR template reference). Frontmatter: `name: check-tenant-leak`, `description: Audit codebase for unscoped DB or vector queries`, `disable-model-invocation: true`. Body: grep `collection.search(`, `session.query(`, `.execute(`; verify each Milvus search has a `book_id IN` expression and each SQLAlchemy query has a `user_id` filter; flag any `user_id` or `book_id` set sourced from request body rather than JWT-derived (and the user_library lookup driven by it).
 
 ## Verify
 - Ingest a real book under tenant_a. Row count = chunk count.
@@ -439,11 +439,11 @@ Goal: HTTP layer. Sign up, log in, upload files (which queue Celery tasks).
   - POST /auth/login — return JWT.
   - get_current_user dependency that decodes JWT.
 - api/uploads.py:
-  - POST /upload — multipart file, save to local storage (R2/B2 later), enqueue Celery ingest with tenant_id from JWT, return task_id.
+  - POST /upload — multipart file, save to local storage (R2/B2 later), enqueue Celery ingest with user_id from JWT, return task_id.
   - GET /tasks/{task_id} — Celery task status.
 - api/Makefile: dev, test, lint, typecheck.
 - Wire CI: add api lint/typecheck/test job alongside worker.
-- Write `api/AGENTS.md` (~40 lines): tenant_id is always derived from JWT, never from request body or query params; auth dependency injection pattern; how to add a new route; common 401/403 mistakes; reference `tenant-auditor` subagent before merging any new query; reference `schema-reviewer` for any DB query changes.
+- Write `api/AGENTS.md` (~40 lines): `user_id` is always derived from JWT, never from request body or query params; the user's `book_id` set for any vector search is resolved server-side from `user_library` per request, never accepted from the client; auth dependency injection pattern; how to add a new route; common 401/403 mistakes; reference `tenant-auditor` subagent before merging any new query; reference `schema-reviewer` for any DB query changes.
 - Reinforce `/security-review` (built-in Claude Code skill) usage in `CONTRIBUTING.md` and `.github/PULL_REQUEST_TEMPLATE.md` for any PR touching api/ or web/ that handles user input. (PR template already includes the checkbox from Phase 0; this phase is when contributors actually start running it.)
 
 ## Verify

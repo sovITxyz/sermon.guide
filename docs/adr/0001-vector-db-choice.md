@@ -18,7 +18,7 @@ sermon.guide needs a vector database that:
 
 ## Decision Drivers
 
-- Filtered query performance with high cardinality on a metadata field (`tenant_id`).
+- Filtered query performance on a partition-keyed field. Per [ADR 0002](./0002-tenancy-model.md) the partition key is `book_id`; an additional `book_id IN (<user's library>)` `expr` runs on top of partition pruning, and that IN-list expression must stay efficient as user libraries grow.
 - Index types available — we want flat indexes available, since filtered subsets are bounded and recall matters.
 - Operational maturity (managed offerings, k8s operators, Helm charts).
 - License: must allow self-hosting under AGPL-3.0 product without paying a per-instance fee.
@@ -39,7 +39,7 @@ sermon.guide needs a vector database that:
 ### Rationale
 
 - **Flat indexes are first-class.** When every search is pre-filtered to a tenant's bounded subset, an HNSW graph adds overhead without buying recall. Milvus exposes flat, IVF-flat, and HNSW; we start with flat and revisit only if filtered p95 misses the latency budget.
-- **Partition keys are first-class.** `tenant_id` as a partition key makes the isolation invariant something we can enforce at the schema level, not just the query level.
+- **Partition keys are first-class.** A `book_id` partition key (resolved per [ADR 0002](./0002-tenancy-model.md)) auto-routes inserts and prunes searches; a mandatory `book_id IN (<user's library>)` `expr` keeps isolation visible at every call site as well.
 - **Throughput on filtered queries** — vendor benchmarks (see reference PDF, p. 5) put Milvus filtering at "Good" with p95 ~11ms in HNSW; flat will be slower per-vector but exact, and our filtered slices are small enough that the constant matters more than the asymptotics.
 - **Operational shape** — Milvus has a published k8s operator and a standalone single-binary mode that runs in docker-compose for v0. We can run one infrastructure stack from laptop to production.
 - **License** — Apache 2.0. Compatible with our AGPL-3.0 product license; no relicensing concerns.
@@ -89,5 +89,5 @@ sermon.guide needs a vector database that:
 
 ## More Information
 
-- Open question on partition key (`tenant_id` vs `book_id`) tracked in ARCHITECTURE.md §7.1 and recorded in [ADR 0002](./0002-tenancy-model.md).
+- Partition-key sub-question (`tenant_id` vs `book_id`) resolved 2026-05-09 to `book_id` — see ARCHITECTURE.md §7.1 and [ADR 0002](./0002-tenancy-model.md).
 - Revisit this decision if filtered p95 latency exceeds 50ms on production-scale data, or if a managed Milvus offering becomes uneconomical relative to alternatives.

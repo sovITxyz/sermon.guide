@@ -5,7 +5,7 @@
 After each phase commit, tick the box and append: completion date, branch name, deviations/follow-ups.
 
 - [x] Phase 0 — Repo skeleton + OSS scaffolding + ARCHITECTURE.md (completed 2026-05-09, branch `phase-0/repo-skeleton`. LICENSE: AGPL-3.0 selected.)
-- [ ] Phase 1 — Infrastructure (docker-compose) + infra/AGENTS.md
+- [x] Phase 1 — Infrastructure (docker-compose) + infra/AGENTS.md (completed 2026-05-09, branch `phase-1/infra-compose`. Modern Compose schema, no top-level `version:`. `make up` brings up Postgres 16, Redis 7, Milvus standalone v2.6.15 + etcd v3.5.25 + MinIO RELEASE.2024-05-28; `--wait` blocks until all healthcheck-gated. Re-up after `make down` measured at ~22s.)
 - [ ] Phase 2 — Milvus collection bootstrap + Python tooling
 - [ ] Phase 3 — Tenant isolation smoke test (HARD GATE) + /test-isolation skill
 - [ ] Phase 4 — Format detection + extraction

@@ -1,0 +1,17 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: no-variant-files
+        name: Block variant-file litter (_old, _new, _v2, _backup, _fixed, _copy)
+        description: |
+          Reject files named like `foo_v2.py` or `bar_old.tsx`. If you need
+          to keep an old version around, branch — don't ship parallel copies.
+        entry: bash -c 'printf "Variant-file litter blocked. Rename or delete:\n" >&2; printf "  %s\n" "$@" >&2; exit 1' --
+        language: system
+        files: '_(?:old|new|v2|backup|fixed|copy)\.(?:py|ts|tsx|js|jsx)$'
+        pass_filenames: true

@@ -1,0 +1,18 @@
+# gitleaks configuration for sermon.guide
+# Inherits the upstream default ruleset; add project-specific allowlists below.
+
+title = "sermon.guide gitleaks config"
+
+[extend]
+# Inherit gitleaks' built-in default rules.
+useDefault = true
+
+[allowlist]
+description = "Files that contain placeholder secrets and should not trip gitleaks."
+paths = [
+  '''(.*?)(\.env\.example)$''',
+  '''(.*?)docs/.*\.pdf$''',
+  '''(.*?)docs/adr/.*\.md$''',
+]
+# Add commit-specific or regex allowlists here when a false positive lands.
+# Keep this minimal — every entry weakens the gate.

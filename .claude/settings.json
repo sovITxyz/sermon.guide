@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(docker compose *)",
+      "Bash(make *)",
+      "Bash(uv run *)",
+      "Bash(pytest *)",
+      "Bash(pnpm *)",
+      "Bash(npm run *)",
+      "Bash(gh pr *)",
+      "Bash(gh api *)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Bash(git push origin main*)",
+      "Bash(git push --force*)",
+      "Bash(rm -rf*)"
+    ]
+  },
+  "enableAllProjectMcpServers": false,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.command // \"\"' | grep -qE '(rm[[:space:]]+-rf|git[[:space:]]+push[[:space:]].*--force)' && { echo 'Blocked: destructive command (rm -rf or git push --force) is not allowed.' >&2; exit 1; } || exit 0"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in worker/*.py|worker/**/*.py) echo 'NOTE: worker lint/typecheck wires in at Phase 2 (uv run ruff check --fix && uv run pyright on edited file).' ;; api/*.py|api/**/*.py) echo 'NOTE: api lint/typecheck wires in at Phase 10.' ;; esac"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in web/*.ts|web/*.tsx|web/**/*.ts|web/**/*.tsx) echo 'NOTE: web typecheck (pnpm tsc --noEmit) and biome wire in at Phase 15.' ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

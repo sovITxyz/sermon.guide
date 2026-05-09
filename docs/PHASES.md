@@ -6,7 +6,7 @@ After each phase commit, tick the box and append: completion date, branch name, 
 
 - [x] Phase 0 — Repo skeleton + OSS scaffolding + ARCHITECTURE.md (completed 2026-05-09, branch `phase-0/repo-skeleton`. LICENSE: AGPL-3.0 selected.)
 - [x] Phase 1 — Infrastructure (docker-compose) + infra/AGENTS.md (completed 2026-05-09, branch `phase-1/infra-compose`. Modern Compose schema, no top-level `version:`. `make up` brings up Postgres 16, Redis 7, Milvus standalone v2.6.15 + etcd v3.5.25 + MinIO RELEASE.2024-05-28; `--wait` blocks until all healthcheck-gated. Re-up after `make down` measured at ~22s.)
-- [ ] Phase 2 — Milvus collection bootstrap + Python tooling
+- [x] Phase 2 — Milvus collection bootstrap + Python tooling (completed 2026-05-09, branch `phase-2/milvus-bootstrap`. §7.1 resolved Option B — `book_id` partition; vectors shared globally per book; tenant scoping enforced at API via `book_id IN (user_library)` filter; `tenant_id` field dropped from schema. Worker PostToolUse hook live; Pyright LSP plugin recommended for in-turn type-error feedback.)
 - [ ] Phase 3 — Tenant isolation smoke test (HARD GATE) + /test-isolation skill
 - [ ] Phase 4 — Format detection + extraction
 - [ ] Phase 5 — Semantic chunking

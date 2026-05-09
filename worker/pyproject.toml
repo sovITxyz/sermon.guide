@@ -1,0 +1,39 @@
+[project]
+name = "sermon-worker"
+version = "0.0.0"
+description = "sermon.guide ingestion pipeline + Celery workers."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "pymilvus>=2.6,<3",
+]
+
+[dependency-groups]
+dev = [
+  "pyright",
+  "pytest",
+  "ruff",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "BLE", "TRY", "ASYNC", "S", "ARG", "ERA", "UP", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"datetime.datetime.utcnow".msg = "use datetime.now(tz=UTC)"
+"pickle".msg = "use json or msgpack — pickle is unsafe across versions"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+include = ["scripts", "tests"]
+venvPath = "."
+venv = ".venv"

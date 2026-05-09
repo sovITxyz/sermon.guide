@@ -30,7 +30,6 @@ MANIFEST
 
 # uv
 .venv/
-.python-version
 uv.lock.bak
 
 # pytest / coverage / mypy / ruff / pyright

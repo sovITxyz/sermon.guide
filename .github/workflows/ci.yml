@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  worker:
+    name: worker (lint + typecheck + test)
+    runs-on: ubuntu-latest
+    if: hashFiles('worker/pyproject.toml') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install
+        run: cd worker && uv sync --all-extras --dev
+      - name: Lint
+        run: cd worker && uv run ruff check .
+      - name: Format check
+        run: cd worker && uv run ruff format --check .
+      - name: Typecheck
+        run: cd worker && uv run pyright
+      - name: Test
+        run: cd worker && uv run pytest
+
+  api:
+    name: api (lint + typecheck + test)
+    runs-on: ubuntu-latest
+    if: hashFiles('api/pyproject.toml') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install
+        run: cd api && uv sync --all-extras --dev
+      - name: Lint
+        run: cd api && uv run ruff check .
+      - name: Format check
+        run: cd api && uv run ruff format --check .
+      - name: Typecheck
+        run: cd api && uv run pyright
+      - name: Test
+        run: cd api && uv run pytest
+
+  web:
+    name: web (typecheck + lint + test)
+    runs-on: ubuntu-latest
+    if: hashFiles('web/package.json') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install
+        run: cd web && pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: cd web && pnpm tsc --noEmit
+      - name: Lint
+        run: cd web && pnpm biome check
+      - name: Test
+        run: cd web && pnpm vitest run
+
+  retrieval-golden:
+    name: retrieval-golden (regression gate)
+    runs-on: ubuntu-latest
+    if: hashFiles('worker/tests/golden/queries.jsonl') != ''
+    needs: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install
+        run: cd worker && uv sync --all-extras --dev
+      - name: Run golden retrieval tests
+        run: cd worker && uv run pytest tests/test_retrieval_golden.py -v

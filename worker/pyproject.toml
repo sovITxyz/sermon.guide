@@ -9,6 +9,14 @@ dependencies = [
   "ebooklib>=0.20,<0.21",
   "pypandoc>=1.17,<2",
   "pymupdf4llm>=1.27,<2",
+  "llama-index-core>=0.14,<0.15",
+  "llama-index-embeddings-huggingface>=0.7,<0.8",
+  # Pulled in transitively by sentence-transformers but listed here so the
+  # CPU-only source override in [tool.uv.sources] applies. The default PyPI
+  # torch wheel bundles ~2GB of NVIDIA CUDA libraries we'd never use —
+  # neither dev hardware (Intel iGPU) nor CI (GitHub Actions ubuntu-latest)
+  # has a CUDA GPU, and Phase 6 explicitly defers GPU inference.
+  "torch>=2.5,<3",
 ]
 
 [dependency-groups]
@@ -21,6 +29,14 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.ruff]
 line-length = 100
@@ -44,6 +60,6 @@ pythonpath = ["."]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["extractors", "scripts", "tests"]
+include = ["extractors", "chunking.py", "scripts", "tests"]
 venvPath = "."
 venv = ".venv"

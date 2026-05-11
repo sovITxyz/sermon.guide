@@ -100,3 +100,8 @@ temp/
 # --- Test artifacts ---
 worker/tests/samples/output/
 worker/tests/golden/cache/
+
+# Sample books for extractor tests are NOT committed (copyright + repo bloat).
+# Drop your own EPUB/PDF in worker/tests/samples/ to enable smoke tests locally.
+worker/tests/samples/*
+!worker/tests/samples/.gitkeep

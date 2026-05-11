@@ -331,6 +331,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "numpy" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },
@@ -341,6 +342,7 @@ requires-dist = [{ name = "pymilvus", specifier = ">=2.6,<3" }]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "numpy", specifier = ">=2.4.4" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },

@@ -9,6 +9,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  "numpy>=2.4.4",
   "pyright",
   "pytest",
   "ruff",

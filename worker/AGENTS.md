@@ -91,6 +91,37 @@ copyrighted material must never be committed. Drop a small EPUB/PDF in
 there to run the smoke test locally; CI skips the suite when samples are
 absent.
 
+## Chunking
+
+`worker/chunking.py` turns extracted Markdown into semantic chunks for
+embedding. `chunk(markdown) -> list[Chunk]` wraps LlamaIndex's
+`SemanticSplitterNodeParser`: it embeds adjacent sentence groups and breaks
+where cosine distance jumps past a percentile threshold, so boundaries fall
+on shifts in meaning rather than fixed token windows
+([`ARCHITECTURE.md` §2](../ARCHITECTURE.md#2-locked-decisions)).
+
+The boundary-detection embedder is **`BAAI/bge-large-en-v1.5`** — the same
+1024-d model Phase 6 will use for the chunk embeddings written to Milvus.
+Reusing one model keeps ingestion to a single ~1.3GB download. The first
+`chunk()` call after a cold venv triggers that download via HuggingFace
+Hub; subsequent calls hit the `HF_HOME` cache and the load is millisecond.
+The end-to-end test gates on `~/.cache/huggingface/hub/models--BAAI--bge-large-en-v1.5/`
+and skips when absent so CI doesn't block on a model fetch.
+
+`Chunk` carries `(text, start_idx, end_idx, parent_section)`. `start_idx`
+and `end_idx` are character offsets into the source markdown — they are
+the citation anchor downstream. `parent_section` is the nearest ATX heading
+above the chunk, best-effort; `None` for chunks before the first heading.
+
+CLI (from `worker/`):
+
+```bash
+uv run python -m chunking path/to/book.md
+```
+
+The module is the single file `worker/chunking.py`; `python -m chunking`
+runs it as `__main__` from the worker cwd (same pattern as `extractors`).
+
 ## Milvus client init
 
 `scripts/bootstrap_milvus.py:make_client` is the canonical pattern: read

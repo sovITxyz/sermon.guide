@@ -38,10 +38,20 @@ The only cross-package import is `api/` → `worker.db`.
 
 ## Tenant isolation is not negotiable
 
-This is a multi-tenant system. Every Milvus search MUST include
-`tenant_id == "<jwt_user_id>"` in `expr`. Every SQLAlchemy query against
-`user_library`, `highlights`, or `collections` MUST filter by `user_id`
-derived from the JWT, never from the request body or query params.
+This is a multi-tenant system. The vector layer is **shared** — one set of
+vectors per deduped book, partition key `book_id` (see
+[ARCHITECTURE.md §3](./ARCHITECTURE.md#3-milvus-schema--library_vectors) and
+[§7.1](./ARCHITECTURE.md#71-dedup-vs-isolation-milvus-partition-key)). Tenant
+scoping happens at the API.
+
+**Every Milvus search MUST include `book_id IN (<user's library>)` in `expr`,
+where the set is fetched from Postgres `user_library` for the JWT-derived
+`user_id`.** An unfiltered search returns every book's vectors and is a
+CVE-class data leak.
+
+Every SQLAlchemy query against `user_library`, `highlights`, or `collections`
+MUST filter by `user_id` derived from the JWT — never from the request body
+or query params.
 
 Before merging anything that touches a Milvus or DB query, run:
 

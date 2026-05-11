@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in worker/*.py|worker/**/*.py) echo 'NOTE: worker lint/typecheck wires in at Phase 2 (uv run ruff check --fix && uv run pyright on edited file).' ;; api/*.py|api/**/*.py) echo 'NOTE: api lint/typecheck wires in at Phase 10.' ;; esac"
+            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in worker/*.py|*/worker/*.py) uv run --project worker ruff check --fix \"$file\" && uv run --project worker pyright \"$file\" ;; api/*.py|*/api/*.py) echo 'NOTE: api lint/typecheck wires in at Phase 10.' ;; esac"
           }
         ]
       },

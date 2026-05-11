@@ -5,6 +5,10 @@ description = "sermon.guide ingestion pipeline + Celery workers."
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "pymilvus>=2.6,<3",
+  "python-magic>=0.4.27,<0.5",
+  "ebooklib>=0.20,<0.21",
+  "pypandoc>=1.17,<2",
+  "pymupdf4llm>=1.27,<2",
 ]
 
 [dependency-groups]
@@ -32,9 +36,14 @@ select = ["E", "F", "W", "I", "B", "BLE", "TRY", "ASYNC", "S", "ARG", "ERA", "UP
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
 
+[tool.pytest.ini_options]
+# Worker is intentionally not packaged (see `[tool.uv] package = false`),
+# so test imports like `from extractors import …` need cwd on sys.path.
+pythonpath = ["."]
+
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["scripts", "tests"]
+include = ["extractors", "scripts", "tests"]
 venvPath = "."
 venv = ".venv"

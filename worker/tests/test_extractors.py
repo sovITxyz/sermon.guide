@@ -64,8 +64,6 @@ def _assert_sane_markdown(markdown: str, *, source: Path) -> None:
     )
 
 
-
-
 def test_detect_pdf_from_magic_bytes(tmp_path: Path) -> None:
     """libmagic identifies a minimal `%PDF-` blob as application/pdf."""
     pdf = tmp_path / "x.bin"  # extension intentionally not .pdf
@@ -90,8 +88,6 @@ def test_detect_rejects_unknown_format(tmp_path: Path) -> None:
 def test_detect_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         detect(tmp_path / "does-not-exist.epub")
-
-
 
 
 @pytest.mark.skipif(not EPUB_SAMPLE.exists(), reason="no EPUB sample in worker/tests/samples/")

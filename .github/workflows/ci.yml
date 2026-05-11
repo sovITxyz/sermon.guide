@@ -13,10 +13,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  filter:
+    name: Detect packages with source
+    runs-on: ubuntu-latest
+    outputs:
+      worker: ${{ steps.detect.outputs.worker }}
+      api: ${{ steps.detect.outputs.api }}
+      web: ${{ steps.detect.outputs.web }}
+      retrieval_golden: ${{ steps.detect.outputs.retrieval_golden }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        shell: bash
+        run: |
+          {
+            echo "worker=$([ -f worker/pyproject.toml ] && echo true || echo false)"
+            echo "api=$([ -f api/pyproject.toml ] && echo true || echo false)"
+            echo "web=$([ -f web/package.json ] && echo true || echo false)"
+            echo "retrieval_golden=$([ -f worker/tests/golden/queries.jsonl ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
   worker:
     name: worker (lint + typecheck + test)
     runs-on: ubuntu-latest
-    if: hashFiles('worker/pyproject.toml') != ''
+    needs: filter
+    if: needs.filter.outputs.worker == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -36,7 +57,8 @@ jobs:
   api:
     name: api (lint + typecheck + test)
     runs-on: ubuntu-latest
-    if: hashFiles('api/pyproject.toml') != ''
+    needs: filter
+    if: needs.filter.outputs.api == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -56,7 +78,8 @@ jobs:
   web:
     name: web (typecheck + lint + test)
     runs-on: ubuntu-latest
-    if: hashFiles('web/package.json') != ''
+    needs: filter
+    if: needs.filter.outputs.web == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -79,8 +102,8 @@ jobs:
   retrieval-golden:
     name: retrieval-golden (regression gate)
     runs-on: ubuntu-latest
-    if: hashFiles('worker/tests/golden/queries.jsonl') != ''
-    needs: worker
+    needs: [filter, worker]
+    if: needs.filter.outputs.retrieval_golden == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3

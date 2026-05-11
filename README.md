@@ -18,12 +18,30 @@ For the full picture, read [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Quick start (when phases land)
 
+### System dependencies
+
+The worker shells out to two non-Python binaries that must be installed
+separately. On Debian/Ubuntu:
+
+```bash
+sudo apt install pandoc libmagic1
+```
+
+On macOS: `brew install pandoc libmagic`. `pandoc` is used for EPUB →
+Markdown conversion (Phase 4); `libmagic` backs `python-magic` for MIME
+sniffing.
+
+### Per-package commands
+
 ```bash
 # Phase 1+ : bring infra up
 make up
 
 # Phase 2+ : bootstrap Milvus collection
 cd worker && uv run python -m worker.scripts.bootstrap_milvus
+
+# Phase 4+ : extract a book to Markdown
+cd worker && uv run python -m extractors path/to/book.epub
 
 # Phase 10+ : run the API
 cd api && uv run uvicorn api.main:app --reload
@@ -32,9 +50,9 @@ cd api && uv run uvicorn api.main:app --reload
 cd web && pnpm dev
 ```
 
-Each phase fills in more of the picture — none of these commands work yet at
-Phase 0. See [docs/PHASES.md](./docs/PHASES.md) for what's built and what's
-next.
+Each phase fills in more of the picture — only some of these commands work
+yet at the current phase. See [docs/PHASES.md](./docs/PHASES.md) for what's
+built and what's next.
 
 ## Repo map
 

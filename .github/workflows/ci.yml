@@ -22,7 +22,7 @@ jobs:
       web: ${{ steps.detect.outputs.web }}
       retrieval_golden: ${{ steps.detect.outputs.retrieval_golden }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - id: detect
         shell: bash
         run: |
@@ -39,8 +39,8 @@ jobs:
     needs: filter
     if: needs.filter.outputs.worker == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Install
@@ -60,8 +60,8 @@ jobs:
     needs: filter
     if: needs.filter.outputs.api == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Install
@@ -81,11 +81,11 @@ jobs:
     needs: filter
     if: needs.filter.outputs.web == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: pnpm
@@ -105,8 +105,8 @@ jobs:
     needs: [filter, worker]
     if: needs.filter.outputs.retrieval_golden == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Install

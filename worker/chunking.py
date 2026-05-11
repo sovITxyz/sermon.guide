@@ -32,7 +32,6 @@ import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-
 from typing import cast
 
 from llama_index.core import Document

@@ -119,7 +119,7 @@ Set up a fresh OSS repo for sermon.guide — a multi-tenant ebook RAG platform (
 11. Write `.github/` files:
     - `PULL_REQUEST_TEMPLATE.md`: "What this changes" / phase area checkboxes / AI-collaboration checklist (`/test-isolation`, `/check-tenant-leak`, `/security-review`, golden test added if retrieval changed, no `_v2`/`_old`/`_fixed` filenames, AGENTS.md updated if conventions changed) / test plan.
     - `ISSUE_TEMPLATE/bug.md` and `ISSUE_TEMPLATE/feature.md`.
-    - `workflows/ci.yml` — lint + typecheck + tests. Job stubs use `if: hashFiles('worker/pyproject.toml') != ''` style guards so CI stays green until each phase wires real checks in.
+    - `workflows/ci.yml` — lint + typecheck + tests. Gate per-package jobs (worker/api/web/retrieval-golden) with a single `filter` job that probes the filesystem for each entry point (`worker/pyproject.toml`, `api/pyproject.toml`, `web/package.json`, `worker/tests/golden/queries.jsonl`) and emits a boolean output per package; downstream jobs use `needs: filter` + `if: needs.filter.outputs.<pkg> == 'true'` so they SKIP cleanly until each phase wires its package in. **Never put `hashFiles()` in a job-level `if:`** — it is only valid in step-level `if:`; at job level it causes GitHub Actions to reject the entire workflow at load time (workflow fails in 0s on every push, CI signals silently lost). Mirror the filter-job pattern in `workflows/codeql.yml`.
     - `workflows/codeql.yml` — default GitHub-managed Python + JS config.
     - `dependabot.yml` — weekly Python (uv) + npm updates, grouped.
 
@@ -148,6 +148,10 @@ Set up a fresh OSS repo for sermon.guide — a multi-tenant ebook RAG platform (
 17. Copy the three PDFs into `docs/`.
 
 18. **Tick Phase 0's checkbox in `docs/PHASES.md`** — append completion date and `phase-0/repo-skeleton` as the branch. Note "LICENSE deferred pending Open Question answer" if the user hasn't picked yet.
+
+## Verify
+- `actionlint .github/workflows/*.yml` reports clean. (Install via `go install github.com/rhysd/actionlint/cmd/actionlint@latest` or the release binary at https://github.com/rhysd/actionlint/releases.)
+- Push the branch and confirm CI actually executes: `gh run list --branch phase-0/repo-skeleton --limit 5` shows the `CI` and `CodeQL` workflows completing cleanly (success, or clean skips for jobs whose package files don't exist yet) — NOT failing in 0s. **Local YAML parsing (`python -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`) is necessary but NOT sufficient** — it accepts syntax GitHub Actions rejects at workflow-load time (e.g. `hashFiles()` or `matrix` in job-level `if:`), which is exactly how a parse-time bug can ship without the validator noticing. Only an observed workflow run proves CI is alive.
 
 19. Commit. Stop.
 

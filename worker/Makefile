@@ -5,7 +5,7 @@
 # defaults can be overridden without exporting them in your shell. Pass
 # extra args via `make bootstrap-milvus ARGS=--force`.
 
-.PHONY: lint format format-check typecheck test test-isolation bootstrap-milvus
+.PHONY: lint format format-check typecheck test test-isolation bootstrap-milvus ingest
 
 lint:
 	uv run ruff check .
@@ -29,3 +29,11 @@ test-isolation:
 
 bootstrap-milvus:
 	set -a && . ../infra/.env && set +a && uv run python scripts/bootstrap_milvus.py $(ARGS)
+
+# Single-book ingest CLI. Phase 6 single-process pipeline:
+#   detect → extract → chunk → embed → insert (partition: book_id).
+# Required: FILE=<path> USER=<user_id> BOOK=<book_id>. Optional: ARGS=--force.
+# user_library writes are deferred to Phase 7; this target only touches Milvus.
+ingest:
+	set -a && . ../infra/.env && set +a && \
+		uv run python -m ingest "$(FILE)" --user-id "$(USER)" --book-id "$(BOOK)" $(ARGS)

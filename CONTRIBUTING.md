@@ -47,6 +47,7 @@ Run these before pushing. The PR template will ask you to confirm them.
 - [ ] **Golden retrieval test added** — if you changed retrieval, ranking, or chunking.
 - [ ] **No variant-file litter.** Files named `*_v2.py`, `*_old.ts`, `*_fixed.tsx`, `*_backup.*`, `*_copy.*` are blocked by pre-commit. If you need to keep an old version around, branch.
 - [ ] **`AGENTS.md` updated** — if you changed a convention, banned an API, added a tool, or learned something AI should know next time.
+- [ ] **`docs/PHASES.md` row flipped** — if this PR closes a phase, tick the box and append completion date, branch, and deviations/follow-ups (see the header note in PHASES.md).
 
 ## Reporting bugs
 

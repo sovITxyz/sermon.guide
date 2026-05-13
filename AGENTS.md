@@ -71,6 +71,7 @@ See `CONTRIBUTING.md` for the full version. Short form:
 - [ ] `/security-review` (built-in Claude skill) if you touched user-input handling
 - [ ] No variant-file litter (`_v2`, `_old`, `_fixed`, `_backup`, `_copy` suffixes are blocked by pre-commit)
 - [ ] `AGENTS.md` updated if conventions changed
+- [ ] `docs/PHASES.md` row flipped to `[x]` with completion date, branch, and deviations — if this PR closes a phase
 
 ## When in doubt
 

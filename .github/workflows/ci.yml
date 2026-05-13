@@ -113,3 +113,40 @@ jobs:
         run: cd worker && uv sync --all-extras --dev
       - name: Run golden retrieval tests
         run: cd worker && uv run pytest tests/test_retrieval_golden.py -v
+
+  phases-row-flipped:
+    name: phases-row-flipped (PHASES.md gate)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'phase-')
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify PHASES.md row flipped for this phase
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$HEAD_REF" =~ ^phase-([0-9]+)/ ]]; then
+            echo "Branch '$HEAD_REF' is not phase-<N>/<slug>; skipping."
+            exit 0
+          fi
+          n="${BASH_REMATCH[1]}"
+          file="docs/PHASES.md"
+          if [[ ! -f "$file" ]]; then
+            echo "::error file=$file::$file not found"
+            exit 1
+          fi
+          row="$(grep -E "^- \[[ x]\] Phase ${n}( |\$|—|-)" "$file" || true)"
+          if [[ -z "$row" ]]; then
+            echo "::error file=$file::No 'Phase ${n}' row found in $file. Expected '- [x] Phase ${n} — ...' on a phase-${n}/* branch."
+            exit 1
+          fi
+          if [[ "$row" != "- [x] Phase ${n}"* ]]; then
+            echo "::error file=$file::Branch '$HEAD_REF' closes Phase ${n}, but $file still has it unchecked."
+            echo "Found: $row"
+            echo ""
+            echo "Fix: flip the row to '[x]' and append completion date, branch, and any deviations"
+            echo "(see the header note in $file). Or rename the branch if this PR does not close Phase ${n}."
+            exit 1
+          fi
+          echo "OK: $row"

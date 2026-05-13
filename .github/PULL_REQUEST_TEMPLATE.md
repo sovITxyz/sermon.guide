@@ -31,6 +31,7 @@ Claude Code skills.
 - [ ] Golden retrieval test added/updated (retrieval / ranking / chunking changes) — Phase 11+
 - [ ] No variant-file litter (`_v2`, `_old`, `_fixed`, `_backup`, `_copy` suffixes) — pre-commit blocks these anyway
 - [ ] `AGENTS.md` updated if conventions changed
+- [ ] `docs/PHASES.md` row flipped to `[x]` with completion date, branch, and deviations — if this PR closes a phase
 
 ## Test plan
 

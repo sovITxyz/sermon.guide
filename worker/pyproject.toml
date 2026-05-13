@@ -11,6 +11,7 @@ dependencies = [
   "pymupdf4llm>=1.27,<2",
   "llama-index-core>=0.14,<0.15",
   "llama-index-embeddings-huggingface>=0.7,<0.8",
+  "sentence-transformers>=3,<6",
   # Pulled in transitively by sentence-transformers but listed here so the
   # CPU-only source override in [tool.uv.sources] applies. The default PyPI
   # torch wheel bundles ~2GB of NVIDIA CUDA libraries we'd never use —
@@ -60,6 +61,6 @@ pythonpath = ["."]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["extractors", "chunking.py", "scripts", "tests"]
+include = ["extractors", "chunking.py", "embedding.py", "ingest.py", "scripts", "tests"]
 venvPath = "."
 venv = ".venv"

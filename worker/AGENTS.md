@@ -40,6 +40,7 @@ Make targets (also run from `worker/`):
 | `typecheck`         | `uv run pyright`                                                                                                   |
 | `test`              | `uv run pytest`                                                                                                    |
 | `bootstrap-milvus`  | sources `../infra/.env` and runs `scripts/bootstrap_milvus.py`. `make bootstrap-milvus ARGS=--force` drops + recreates. |
+| `ingest`            | `make ingest FILE=path/to/book.epub USER=u_alice BOOK=b_pilgrim` — single-book pipeline. `ARGS=--force` replaces existing vectors. |
 
 ## Banned APIs
 
@@ -121,6 +122,99 @@ uv run python -m chunking path/to/book.md
 
 The module is the single file `worker/chunking.py`; `python -m chunking`
 runs it as `__main__` from the worker cwd (same pattern as `extractors`).
+
+## Embedding
+
+`worker/embedding.py` wraps `sentence-transformers` with the
+**`BAAI/bge-large-en-v1.5`** model (locked in
+[`ARCHITECTURE.md` §2](../ARCHITECTURE.md#2-locked-decisions)). `embed(texts)`
+returns a `(N, 1024)` float32 array with each row L2-normalized — the
+precondition for Milvus' `COSINE` metric to be inner-product in disguise
+([§3](../ARCHITECTURE.md#3-milvus-schema--library_vectors)).
+
+The model loads once per process via `@lru_cache`. First call after a cold
+venv pulls ~1.3GB from HuggingFace Hub; subsequent calls hit `HF_HOME` and
+load in a few seconds. Empty input returns a `(0, 1024)` array without
+touching the model — CI's empty-input path never triggers a download.
+
+Device is pinned to `"cpu"` for Phase 6; swap to `"cuda"` once a GPU
+runtime exists. `torch` is sourced CPU-only in `pyproject.toml` for the
+same reason — see the comment on the `torch` dep.
+
+The Phase 5 semantic chunker (`chunking.py`) also loads BGE-Large for
+boundary detection, via `llama-index-embeddings-huggingface`. The model
+*file* is shared (one HF Hub cache entry); each loader keeps its own
+in-memory copy. Consolidating to a single loader is a future micro-opt,
+not Phase 6 scope.
+
+**Offline mode.** Even with the cache warm, `sentence-transformers` makes
+a HEAD request to HuggingFace Hub on load to check for PEFT adapter
+files (BGE-Large has none) and to revalidate metadata. A DNS hiccup
+during that call surfaces as `RuntimeError: Cannot send a request, as
+the client has been closed.` mid-load — not the friendliest failure.
+
+Set `HF_HUB_OFFLINE=1` (and `TRANSFORMERS_OFFLINE=1` for the inner
+`transformers` calls) when you know the cache is warm and want a
+deterministic, network-free load:
+
+```bash
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+make ingest FILE=... USER=... BOOK=...
+```
+
+CI on GitHub Actions has full network access, so this is a local-dev /
+flaky-Wi-Fi hint, not a default. Production Celery workers (Phase 9)
+should set these in their pod env once the model is baked into the
+image.
+
+## Ingest
+
+`worker/ingest.py` is the single-book ingest CLI for Phase 6. Pipeline:
+
+```
+detect → extract → chunk → embed → insert (partition: book_id)
+```
+
+```bash
+uv run python -m ingest path/to/book.epub --user-id u_alice --book-id b_pilgrim
+# or via make
+make ingest FILE=path/to/book.epub USER=u_alice BOOK=b_pilgrim
+```
+
+`--user-id` is required so the calling contract is stable, but the
+`user_library` row insertion is **deferred to Phase 7** (that table
+doesn't exist yet). `user_id` does NOT land in vector metadata — that
+would defeat the dedup story per
+[§7.1](../ARCHITECTURE.md#71-dedup-vs-isolation-milvus-partition-key);
+vectors are shared globally per deduped book and tenant scoping happens
+at the API at search time via `book_id IN (<user's library>)`.
+
+Re-ingesting the same `book_id` is refused (`FileExistsError`) unless
+`--force` is passed; with `--force`, existing rows for that `book_id`
+are deleted before the new ones land. This is a stopgap until Phase 8's
+MinHash LSH dedup makes "same book → same row set" a pipeline property.
+
+No Celery yet (Phase 9) and no dedup yet (Phase 8) — single-process,
+synchronous, one book per invocation.
+
+## Tenant-isolation tooling
+
+Two pieces ship in `.claude/` for ongoing audits as the codebase grows:
+
+- **`.claude/agents/tenant-auditor.md`** — Opus subagent that reads
+  diffs/files and verifies every Milvus search has `book_id IN (...)` in
+  the filter, every `user_library` / `highlights` / `collections` query
+  filters on `user_id`, and every `user_id` / `book_id` value is
+  JWT-derived rather than client-supplied. Runs the Phase 3 isolation
+  test as its final check.
+- **`.claude/skills/check-tenant-leak/SKILL.md`** — model-disabled skill
+  that runs the mechanical grep companion. Operator-invoked
+  (`/check-tenant-leak`); both `CONTRIBUTING.md` and the PR template
+  reference it.
+
+Run both before merging anything that touches a Milvus or DB query, an
+auth dependency, or the ingestion pipeline. They are checks, not
+fixers — findings halt the audit; the fix is owner-decision territory.
 
 ## Milvus client init
 

@@ -18,6 +18,10 @@ dependencies = [
   # neither dev hardware (Intel iGPU) nor CI (GitHub Actions ubuntu-latest)
   # has a CUDA GPU, and Phase 6 explicitly defers GPU inference.
   "torch>=2.5,<3",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "alembic>=1.13,<2",
+  "asyncpg>=0.30,<0.31",
+  "pydantic-settings>=2.6,<3",
 ]
 
 [dependency-groups]
@@ -61,6 +65,6 @@ pythonpath = ["."]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["extractors", "chunking.py", "embedding.py", "ingest.py", "scripts", "tests"]
+include = ["extractors", "chunking.py", "db", "embedding.py", "ingest.py", "scripts", "tests"]
 venvPath = "."
 venv = ".venv"

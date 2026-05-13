@@ -5,7 +5,7 @@
 # defaults can be overridden without exporting them in your shell. Pass
 # extra args via `make bootstrap-milvus ARGS=--force`.
 
-.PHONY: lint format format-check typecheck test test-isolation bootstrap-milvus ingest
+.PHONY: lint format format-check typecheck test test-isolation bootstrap-milvus ingest migrate-up migrate-down migrate-new
 
 lint:
 	uv run ruff check .
@@ -37,3 +37,18 @@ bootstrap-milvus:
 ingest:
 	set -a && . ../infra/.env && set +a && \
 		uv run python -m ingest "$(FILE)" --user-id "$(USER)" --book-id "$(BOOK)" $(ARGS)
+
+# Alembic migrations. Connection URL is overridden in db/alembic/env.py from
+# DBSettings, so these targets source infra/.env to pick up SERMON_POSTGRES_*.
+# - migrate-up:   alembic upgrade head (idempotent; no-op when already at head)
+# - migrate-down: alembic downgrade -1 (one revision back; use REV=base to wipe)
+# - migrate-new:  alembic revision --autogenerate -m "$MSG" (review the diff!)
+migrate-up:
+	set -a && . ../infra/.env && set +a && uv run alembic upgrade head
+
+migrate-down:
+	set -a && . ../infra/.env && set +a && uv run alembic downgrade $(or $(REV),-1)
+
+migrate-new:
+	@test -n "$(MSG)" || (echo 'usage: make migrate-new MSG="describe change"' && exit 1)
+	set -a && . ../infra/.env && set +a && uv run alembic revision --autogenerate -m "$(MSG)"

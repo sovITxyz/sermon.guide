@@ -5,7 +5,7 @@
 # defaults can be overridden without exporting them in your shell. Pass
 # extra args via `make bootstrap-milvus ARGS=--force`.
 
-.PHONY: lint format format-check typecheck test test-isolation bootstrap-milvus ingest migrate-up migrate-down migrate-new
+.PHONY: lint format format-check typecheck test test-isolation bootstrap-milvus ingest worker enqueue migrate-up migrate-down migrate-new
 
 lint:
 	uv run ruff check .
@@ -38,6 +38,25 @@ bootstrap-milvus:
 ingest:
 	set -a && . ../infra/.env && set +a && \
 		uv run python -m ingest "$(FILE)" --user-id "$(USER)"
+
+# Phase 9 Celery worker.
+#   worker:   long-running prefork worker — Redis broker, Phase 6/8 pipeline.
+#             Loglevel info; INT/TERM stops it cleanly (TERM = warm shutdown,
+#             waits for in-flight tasks; KILL drops in-flight messages back
+#             to the broker after the visibility timeout — see celery_app.py).
+#   enqueue:  test producer for `make worker`. Required: FILE=<path> TENANT=<id>.
+#             TENANT accepts a users.user_id UUID, or a friendly label like
+#             `tenant_a` (deterministically uuid5'd + upserted into users so
+#             the FK resolves — see scripts/enqueue_ingest.py).
+worker:
+	set -a && . ../infra/.env && set +a && \
+		uv run celery -A celery_app worker --loglevel=info
+
+enqueue:
+	@test -n "$(FILE)" || (echo 'usage: make enqueue FILE=<path> TENANT=<id|label>' && exit 1)
+	@test -n "$(TENANT)" || (echo 'usage: make enqueue FILE=<path> TENANT=<id|label>' && exit 1)
+	set -a && . ../infra/.env && set +a && \
+		uv run python -m scripts.enqueue_ingest "$(FILE)" --tenant "$(TENANT)"
 
 # Alembic migrations. Connection URL is overridden in db/alembic/env.py from
 # DBSettings, so these targets source infra/.env to pick up SERMON_POSTGRES_*.

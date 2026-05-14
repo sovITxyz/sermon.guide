@@ -25,6 +25,8 @@ dependencies = [
   "datasketch>=1.10.0",
   "nltk>=3.9.4",
   "psycopg[binary]>=3,<4",
+  "celery>=5.4,<6",
+  "redis>=5,<7",
 ]
 
 [dependency-groups]
@@ -68,6 +70,6 @@ pythonpath = ["."]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["extractors", "chunking.py", "db", "embedding.py", "ingest.py", "scripts", "tests"]
+include = ["extractors", "chunking.py", "db", "embedding.py", "ingest.py", "scripts", "tests", "celery_app.py", "tasks"]
 venvPath = "."
 venv = ".venv"

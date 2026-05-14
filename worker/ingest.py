@@ -1,57 +1,83 @@
-"""End-to-end single-book ingest CLI: file → chunks → embeddings → Milvus.
+"""Dedup-aware single-book ingest: file → maybe chunks → maybe vectors → DB rows.
 
-Pipeline (ARCHITECTURE.md §5 upload path, pre-Phase-8/9):
+Phase 8 pipeline (ARCHITECTURE.md §5 upload path):
 
     detect (libmagic)
         → extract (EbookLib+pandoc or pymupdf4llm)
-        → chunk (LlamaIndex SemanticSplitter)
-        → embed (BGE-Large, L2-normalized)
-        → insert with metadata JSON, partitioned by `book_id`
+        → signature (MinHash, 5-shingles, lemmatized)
+        → dedup lookup
+              ├── duplicate? → insert user_library row only
+              │                (skip chunking + embedding)
+              └── new?       → chunk → embed → insert vectors;
+                               insert global_books + user_library;
+                               LSH.add to the in-memory index.
 
 ## Tenant scoping
 
-Vectors are **shared globally per book** — there is no `tenant_id` on the
-row (ARCHITECTURE.md §3 + §7.1). This CLI does NOT write to the
-`user_library` table; that table doesn't exist yet (Phase 7). The
-`--user-id` flag is required so the calling contract is stable from this
-phase forward, but the row insertion is deferred. A reminder is printed
-when the ingest finishes.
-
-`user_id` is NOT placed in the vector's metadata — that would defeat the
-dedup story (a single deduped book serves every owner). All tenant
-scoping happens at the API layer at search time via
-`book_id IN (<user's library>)` (see `.claude/agents/tenant-auditor.md`).
+Vectors are **shared globally per book** — there is no ``tenant_id`` on
+the row (ARCHITECTURE.md §3 + §7.1). Tenant ownership lives in
+``user_library``; every successful ingest writes that row, whether the
+book is new or deduplicated. ``user_id`` is never placed in vector
+metadata — that would defeat the dedup story (a single deduped book
+serves every owner). API-layer search resolves the JWT user's
+``book_id`` set from ``user_library`` and passes it as the Milvus
+filter; see ``.claude/agents/tenant-auditor.md``.
 
 ## Idempotency
 
-Re-ingesting the same `book_id` is refused unless `--force` is passed.
-With `--force`, existing vectors for that `book_id` are deleted before
-the new ones land. This is a stopgap until Phase 8's MinHash LSH dedup
-makes "same book → same row set" a property of the pipeline itself.
+The unique constraint ``uq_user_library_user_book`` makes the
+``user_library`` insert idempotent per ``(user_id, book_id)``: re-ingest
+of the exact same book by the same user uses ``ON CONFLICT DO NOTHING``
+and the second call is a no-op for the library row. Dedup short-circuits
+chunking before that point on every re-upload of the same content, so
+the second call costs one ``GlobalBook`` lookup + one ``user_library``
+upsert.
 
-CLI (run from `worker/`):
+CLI (run from ``worker/``):
 
-    uv run python -m ingest path/to/book.epub --user-id u_alice --book-id b_pilgrim
+    uv run python -m ingest path/to/book.epub --user-id <uuid>
 """
 
-# pymilvus 2.6 ships without `py.typed` and mis-annotates a few sync methods
-# as returning coroutines; relax the same rules as bootstrap_milvus.py.
+# pymilvus 2.6 ships without `py.typed`; datasketch is also stub-less. Same
+# relaxations as bootstrap_milvus.py / chunking.py.
 # pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownVariableType=false, reportUnnecessaryComparison=false
 
 from __future__ import annotations
 
 import argparse
 import sys
+import uuid as uuidlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 from pymilvus import MilvusClient
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+import dedup
 from chunking import Chunk, chunk
+from db import GlobalBook, UserLibraryEntry, get_sync_session_factory
+from dedup import Dedup
 from embedding import embed
 from extractors import extract
 from scripts.bootstrap_milvus import COLLECTION_NAME, make_client
+
+
+@dataclass(frozen=True, slots=True)
+class IngestResult:
+    """Outcome of one dedup-aware ingest run.
+
+    ``rows_inserted`` is the Milvus vector count; zero when the book was
+    a duplicate (``was_duplicate=True``) or when chunking produced no
+    chunks. The ``book_id`` is the ``global_books`` PK either freshly
+    minted or matched from an existing row.
+    """
+
+    book_id: UUID
+    was_duplicate: bool
+    rows_inserted: int
 
 
 def _build_rows(
@@ -64,9 +90,9 @@ def _build_rows(
     """Zip *chunks* and *embeddings* into Milvus row dicts.
 
     Metadata follows ARCHITECTURE.md §3:
-    `{filename, chunk_index, parent_section}`. `page` is omitted — the
-    Phase 5 chunker doesn't carry page anchors and the field is documented
-    as optional.
+    ``{filename, chunk_index, parent_section}``. ``page`` is omitted —
+    the Phase 5 chunker doesn't carry page anchors and the field is
+    documented as optional.
     """
     if embeddings.shape[0] != len(chunks):
         msg = (
@@ -90,107 +116,143 @@ def _build_rows(
     ]
 
 
-def _book_has_vectors(client: MilvusClient, book_id: str) -> bool:
-    """Return True if any row already exists for *book_id*."""
-    # Escape embedded quotes defensively — book_id is operator-supplied. A
-    # quote in the value would otherwise terminate the filter literal and
-    # the rest of the string would be parsed as Milvus expression syntax.
-    safe = book_id.replace('"', '\\"')
-    existing = client.query(
-        collection_name=COLLECTION_NAME,
-        filter=f'book_id == "{safe}"',
-        limit=1,
-        output_fields=["id"],
-    )
-    return len(existing) > 0
+def _insert_global_book(
+    *,
+    book_id: UUID,
+    title: str,
+    author: str | None,
+    signature_bytes: bytes,
+    text_pointer: str | None,
+) -> None:
+    """Insert a new ``global_books`` row.
+
+    Sync session bridge so the worker can write without spinning up an
+    event loop. See ``db/session.py:get_sync_engine`` for the rationale.
+    """
+    sf = get_sync_session_factory()
+    with sf() as session, session.begin():
+        session.add(
+            GlobalBook(
+                book_id=book_id,
+                title=title,
+                author=author,
+                minhash_signature=signature_bytes,
+                text_pointer=text_pointer,
+            ),
+        )
+
+
+def _upsert_user_library(*, user_id: UUID, book_id: UUID) -> None:
+    """Ensure a ``user_library`` row binding *user_id* → *book_id* exists.
+
+    Uses ``INSERT … ON CONFLICT DO NOTHING`` against the
+    ``uq_user_library_user_book`` constraint so duplicate ingests under
+    the same user are idempotent (the row is the *fact* that the user
+    owns the book; multiple inserts shouldn't create multiple facts).
+    """
+    sf = get_sync_session_factory()
+    with sf() as session, session.begin():
+        stmt = (
+            pg_insert(UserLibraryEntry)
+            .values(user_id=user_id, book_id=book_id)
+            .on_conflict_do_nothing(constraint="uq_user_library_user_book")
+        )
+        session.execute(stmt)
 
 
 def ingest_markdown(
     *,
     markdown: str,
     filename: str,
-    user_id: str,
-    book_id: str,
+    user_id: UUID,
     client: MilvusClient | None = None,
-    force: bool = False,
-) -> int:
-    """Chunk → embed → insert for already-extracted markdown.
+    dedup_index: Dedup | None = None,
+    title: str | None = None,
+    author: str | None = None,
+    text_pointer: str | None = None,
+) -> IngestResult:
+    """Dedup-aware ingest from already-extracted markdown.
 
-    Split out from `ingest` so tests can drive the chunk/embed/insert seam
-    with a tiny synthetic document — semantic chunking on a novel-sized
-    EPUB takes ~10 min per pass on CPU and would make the suite unusable.
+    Split out from ``ingest()`` so tests can drive the chunk → embed →
+    insert seam with a tiny synthetic document without paying the ~10
+    min cost of semantic chunking on a novel-sized EPUB.
 
-    Raises:
-        ValueError: empty `user_id` or `book_id`.
-        FileExistsError: vectors already present for `book_id` and not `force`.
+    *title* defaults to *filename* when missing; the dedup decision is
+    based on content, not metadata.
+
+    *client* and *dedup_index* default to the process-wide singletons
+    when not supplied; pass them explicitly from tests that want to
+    isolate state.
     """
-    if not user_id:
-        msg = "user_id is required (Phase 7 will wire it to user_library)."
-        raise ValueError(msg)
-    if not book_id:
-        msg = "book_id is required (Milvus partition key per ARCHITECTURE.md §3)."
-        raise ValueError(msg)
+    title = title if title is not None else filename
+    sig = dedup.signature(markdown)
+    index = dedup_index if dedup_index is not None else dedup.dedup_index()
+
+    existing = index.find_duplicate(sig)
+    if existing is not None:
+        _upsert_user_library(user_id=user_id, book_id=existing)
+        return IngestResult(
+            book_id=existing,
+            was_duplicate=True,
+            rows_inserted=0,
+        )
 
     client = client if client is not None else make_client()
-
-    if _book_has_vectors(client, book_id):
-        if not force:
-            msg = (
-                f"Vectors already exist for book_id={book_id!r}; "
-                "pass --force to delete and re-ingest."
-            )
-            raise FileExistsError(msg)
-        safe = book_id.replace('"', '\\"')
-        client.delete(
-            collection_name=COLLECTION_NAME,
-            filter=f'book_id == "{safe}"',
-        )
-        client.flush(collection_name=COLLECTION_NAME)
-
+    book_id = uuidlib.uuid4()
     chunks = chunk(markdown)
-    if not chunks:
-        return 0
+    rows_inserted = 0
+    if chunks:
+        embeddings = embed([c.text for c in chunks])
+        rows = _build_rows(
+            filename=filename,
+            chunks=chunks,
+            embeddings=embeddings,
+            book_id=str(book_id),
+        )
+        client.insert(collection_name=COLLECTION_NAME, data=rows)
+        client.flush(collection_name=COLLECTION_NAME)
+        client.load_collection(collection_name=COLLECTION_NAME)
+        rows_inserted = len(rows)
 
-    embeddings = embed([c.text for c in chunks])
-    rows = _build_rows(
-        filename=filename,
-        chunks=chunks,
-        embeddings=embeddings,
+    _insert_global_book(
         book_id=book_id,
+        title=title,
+        author=author,
+        signature_bytes=dedup.serialize(sig),
+        text_pointer=text_pointer,
     )
-    client.insert(collection_name=COLLECTION_NAME, data=rows)
-    client.flush(collection_name=COLLECTION_NAME)
-    client.load_collection(collection_name=COLLECTION_NAME)
-    return len(rows)
+    _upsert_user_library(user_id=user_id, book_id=book_id)
+    index.add(book_id, sig)
+
+    return IngestResult(
+        book_id=book_id,
+        was_duplicate=False,
+        rows_inserted=rows_inserted,
+    )
 
 
 def ingest(
     *,
     path: Path,
-    user_id: str,
-    book_id: str,
+    user_id: UUID,
     client: MilvusClient | None = None,
-    force: bool = False,
-) -> int:
-    """Run the full ingest pipeline. Returns the number of rows inserted.
+    dedup_index: Dedup | None = None,
+    text_pointer: str | None = None,
+) -> IngestResult:
+    """Run the full ingest pipeline. Returns the ``IngestResult``.
 
-    Validates `user_id` / `book_id` BEFORE invoking `extract` so a bad
-    invocation surfaces as `ValueError` rather than blowing up downstream
-    on a missing/wrong-type file.
+    *text_pointer* records where the raw upload lives (R2/B2 key in
+    Phase 14+, local path before that). Stored on ``global_books`` only
+    when the book is new.
     """
-    if not user_id:
-        msg = "user_id is required (Phase 7 will wire it to user_library)."
-        raise ValueError(msg)
-    if not book_id:
-        msg = "book_id is required (Milvus partition key per ARCHITECTURE.md §3)."
-        raise ValueError(msg)
     return ingest_markdown(
         markdown=extract(path),
         filename=path.name,
         user_id=user_id,
-        book_id=book_id,
         client=client,
-        force=force,
+        dedup_index=dedup_index,
+        title=path.stem,
+        text_pointer=text_pointer,
     )
 
 
@@ -198,38 +260,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ingest",
         description=(
-            "Single-book ingest: detect → extract → chunk → embed → "
-            "insert into Milvus. No dedup (Phase 8), no Celery (Phase 9)."
+            "Single-book dedup-aware ingest: detect → extract → MinHash "
+            "dedup → (skip on hit | chunk → embed → insert + record). "
+            "No Celery yet (Phase 9)."
         ),
     )
     parser.add_argument("path", type=Path, help="Path to an EPUB or PDF.")
     parser.add_argument(
         "--user-id",
         required=True,
-        help="Owning user — recorded in user_library starting Phase 7.",
-    )
-    parser.add_argument(
-        "--book-id",
-        required=True,
-        help="Milvus partition key for this book (ARCHITECTURE.md §7.1).",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Delete any existing vectors for this book_id before inserting.",
+        type=UUID,
+        help="Owning user UUID; FK to users.user_id (ARCHITECTURE.md §4).",
     )
     args = parser.parse_args(argv)
 
-    inserted = ingest(
-        path=args.path,
-        user_id=args.user_id,
-        book_id=args.book_id,
-        force=args.force,
-    )
-    sys.stdout.write(
-        f"Inserted {inserted} row(s) into '{COLLECTION_NAME}' for book_id={args.book_id!r}.\n"
-    )
-    sys.stdout.write(f"NOTE: user_library row for user_id={args.user_id!r} deferred to Phase 7.\n")
+    result = ingest(path=args.path, user_id=args.user_id)
+    if result.was_duplicate:
+        sys.stdout.write(
+            f"Duplicate detected (book_id={result.book_id}); skipped "
+            f"chunking and embedding. Recorded user_library entry for "
+            f"user_id={args.user_id}.\n"
+        )
+    else:
+        sys.stdout.write(
+            f"New book book_id={result.book_id} — inserted "
+            f"{result.rows_inserted} vector row(s) into "
+            f"'{COLLECTION_NAME}'; wrote global_books + user_library.\n"
+        )
     return 0
 
 

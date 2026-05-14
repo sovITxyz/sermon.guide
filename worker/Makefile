@@ -30,13 +30,14 @@ test-isolation:
 bootstrap-milvus:
 	set -a && . ../infra/.env && set +a && uv run python scripts/bootstrap_milvus.py $(ARGS)
 
-# Single-book ingest CLI. Phase 6 single-process pipeline:
-#   detect → extract → chunk → embed → insert (partition: book_id).
-# Required: FILE=<path> USER=<user_id> BOOK=<book_id>. Optional: ARGS=--force.
-# user_library writes are deferred to Phase 7; this target only touches Milvus.
+# Single-book dedup-aware ingest CLI (Phase 8):
+#   detect → extract → MinHash dedup → (skip on hit | chunk → embed → insert) →
+#   write global_books + user_library.
+# Required: FILE=<path> USER=<user_uuid>. The book_id is decided by dedup, not
+# the caller; pass an existing user UUID from `users.user_id`.
 ingest:
 	set -a && . ../infra/.env && set +a && \
-		uv run python -m ingest "$(FILE)" --user-id "$(USER)" --book-id "$(BOOK)" $(ARGS)
+		uv run python -m ingest "$(FILE)" --user-id "$(USER)"
 
 # Alembic migrations. Connection URL is overridden in db/alembic/env.py from
 # DBSettings, so these targets source infra/.env to pick up SERMON_POSTGRES_*.

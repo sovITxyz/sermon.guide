@@ -1,4 +1,4 @@
-"""sermon.guide Postgres schema + async session factory.
+"""sermon.guide Postgres schema + session factories.
 
 This package is the shared DB layer; ``api/`` imports it directly (see the
 dependency-direction rule in the root ``CLAUDE.md``). Tables live at
@@ -13,7 +13,12 @@ from db.models import (
     User,
     UserLibraryEntry,
 )
-from db.session import get_engine, get_session_factory
+from db.session import (
+    get_engine,
+    get_session_factory,
+    get_sync_engine,
+    get_sync_session_factory,
+)
 
 __all__ = [
     "Base",
@@ -24,4 +29,6 @@ __all__ = [
     "UserLibraryEntry",
     "get_engine",
     "get_session_factory",
+    "get_sync_engine",
+    "get_sync_session_factory",
 ]

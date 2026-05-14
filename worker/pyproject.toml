@@ -22,6 +22,9 @@ dependencies = [
   "alembic>=1.13,<2",
   "asyncpg>=0.30,<0.31",
   "pydantic-settings>=2.6,<3",
+  "datasketch>=1.10.0",
+  "nltk>=3.9.4",
+  "psycopg[binary]>=3,<4",
 ]
 
 [dependency-groups]

@@ -40,7 +40,7 @@ Make targets (also run from `worker/`):
 | `typecheck`         | `uv run pyright`                                                                                                   |
 | `test`              | `uv run pytest`                                                                                                    |
 | `bootstrap-milvus`  | sources `../infra/.env` and runs `scripts/bootstrap_milvus.py`. `make bootstrap-milvus ARGS=--force` drops + recreates. |
-| `ingest`            | `make ingest FILE=path/to/book.epub USER=u_alice BOOK=b_pilgrim` — single-book pipeline. `ARGS=--force` replaces existing vectors. |
+| `ingest`            | `make ingest FILE=path/to/book.epub USER=<user_uuid>` — single-book dedup-aware pipeline (Phase 8). The book_id is decided by dedup, not passed in. |
 | `migrate-up`        | `alembic upgrade head` against the docker-compose Postgres. Idempotent. |
 | `migrate-down`      | `alembic downgrade -1` (one revision). `make migrate-down REV=base` wipes all the way. |
 | `migrate-new`       | `make migrate-new MSG="describe change"` → `alembic revision --autogenerate`. Review the generated file before committing — autogenerate misses `server_default`, enum diffs, and may rename indexes cosmetically. |
@@ -172,35 +172,71 @@ image.
 
 ## Ingest
 
-`worker/ingest.py` is the single-book ingest CLI for Phase 6. Pipeline:
+`worker/ingest.py` is the single-book dedup-aware ingest CLI as of
+Phase 8. Pipeline:
 
 ```
-detect → extract → chunk → embed → insert (partition: book_id)
+detect → extract → MinHash signature → dedup lookup
+   ├── duplicate? → insert user_library row only
+   └── new?       → chunk → embed → insert vectors;
+                    insert global_books + user_library; LSH.add
 ```
 
 ```bash
-uv run python -m ingest path/to/book.epub --user-id u_alice --book-id b_pilgrim
+uv run python -m ingest path/to/book.epub --user-id <user_uuid>
 # or via make
-make ingest FILE=path/to/book.epub USER=u_alice BOOK=b_pilgrim
+make ingest FILE=path/to/book.epub USER=<user_uuid>
 ```
 
-`--user-id` is required so the calling contract is stable, but the
-`user_library` row insertion is **deferred to Phase 8** (MinHash dedup —
-inserts the row whether the book is new or a duplicate of an existing
-`global_books`). The schema is in place as of Phase 7 (`db/models.py`).
-`user_id` does NOT land in vector metadata — that would defeat the
-dedup story per
+`--user-id` is the JWT-derived owner; it's a FK to `users.user_id`, so
+the row must already exist. The `book_id` is no longer a CLI input —
+dedup decides it. New books get a fresh UUID; duplicates reuse the
+existing `global_books.book_id`. `user_id` does NOT land in vector
+metadata — that would defeat the dedup story per
 [§7.1](../ARCHITECTURE.md#71-dedup-vs-isolation-milvus-partition-key);
 vectors are shared globally per deduped book and tenant scoping happens
 at the API at search time via `book_id IN (<user's library>)`.
 
-Re-ingesting the same `book_id` is refused (`FileExistsError`) unless
-`--force` is passed; with `--force`, existing rows for that `book_id`
-are deleted before the new ones land. This is a stopgap until Phase 8's
-MinHash LSH dedup makes "same book → same row set" a pipeline property.
+Idempotency is property of the pipeline now: re-ingesting the same
+content under the same user short-circuits at the dedup gate, then
+upserts `user_library` (`ON CONFLICT DO NOTHING` on the
+`uq_user_library_user_book` constraint). Under a *different* user, the
+second `user_library` row points at the same `global_books` row — the
+storage-savings invariant from ARCHITECTURE.md §4.
 
-No Celery yet (Phase 9) and no dedup yet (Phase 8) — single-process,
-synchronous, one book per invocation.
+No Celery yet (Phase 9) — single-process, synchronous, one book per
+invocation.
+
+## Dedup
+
+`worker/dedup.py` is the MinHash LSH gate that sits between extract and
+chunk in `ingest.py`. ARCHITECTURE.md §2 locks the algorithm: MinHash
+LSH over lemmatized 5-shingles at Jaccard threshold 0.85, projected ~80%
+storage savings at scale.
+
+- `signature(markdown) -> MinHash` — tokenize, lowercase, WordNet
+  lemmatize, emit a `MinHash(num_perm=128, seed=1)` over 5-shingles.
+  Empty/short inputs return an empty MinHash (no candidates on lookup).
+- `Dedup.find_duplicate(sig) -> uuid | None` — query the in-memory LSH.
+  Stricter-than-construction thresholds post-filter by real Jaccard
+  against `self._sigs`; looser thresholds raise.
+- `Dedup.add(book_id, sig)` — update the in-memory LSH after a
+  `global_books` insert.
+- `dedup_index()` — `@lru_cache(maxsize=1)` process-singleton over
+  `get_sync_session_factory()`.
+
+**Persistence model.** The LSH is in memory; its inputs — one
+`global_books.minhash_signature` row per book — are the persisted-in-
+Postgres half. `Dedup._fetch_rows` rehydrates from those rows on first
+call within a process; `Dedup._load_from(rows)` is the test seam that
+takes an explicit row iterable so unit tests skip Postgres.
+
+**NLTK WordNet.** Lemmatization needs the WordNet corpus (~40MB).
+First call to `signature()` downloads it into `~/nltk_data/`. CI and
+production workers should pre-warm by calling `signature("hello world "
+"this is a test")` once at image-build time so request-path latency
+doesn't carry the download. Tests that exercise `signature()` skip
+cleanly when the corpus is absent.
 
 ## Database (db/)
 
@@ -216,10 +252,14 @@ directly — `worker.db` is the only cross-package import in the repo
   extension dependency. Timestamps are `DateTime(timezone=True)` with
   `server_default=func.now()` — naive datetimes silently miscompare,
   hence the `datetime.utcnow` ruff ban.
-- `db/session.py` — module-level `get_engine()` and
-  `get_session_factory()` singletons over async `create_async_engine`.
-  Tests and Alembic build their own engines and should not touch the
-  globals.
+- `db/session.py` — async (`get_engine()` / `get_session_factory()`)
+  and sync (`get_sync_engine()` / `get_sync_session_factory()`)
+  singletons. FastAPI (Phase 10+) uses the async path; worker ingest
+  (Phase 8) and Celery tasks (Phase 9) use the sync path — bridging via
+  `asyncio.run` would leave loop-bound asyncpg connections stale across
+  calls. Both engines share `DBSettings`; only the driver differs
+  (`asyncpg` vs `psycopg`). Tests and Alembic build their own engines
+  and should not touch the globals.
 - `db/settings.py` — `DBSettings` (pydantic-settings, env prefix
   `SERMON_POSTGRES_`). The Make migrate targets source `../infra/.env`
   before invoking Python; a `KeyError` on a `SERMON_POSTGRES_*` var

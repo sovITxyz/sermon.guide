@@ -41,6 +41,8 @@ Make targets (also run from `worker/`):
 | `test`              | `uv run pytest`                                                                                                    |
 | `bootstrap-milvus`  | sources `../infra/.env` and runs `scripts/bootstrap_milvus.py`. `make bootstrap-milvus ARGS=--force` drops + recreates. |
 | `ingest`            | `make ingest FILE=path/to/book.epub USER=<user_uuid>` — single-book dedup-aware pipeline (Phase 8). The book_id is decided by dedup, not passed in. |
+| `worker`            | `uv run celery -A celery_app worker --loglevel=info` — long-running Phase 9 Celery prefork worker. Sources `../infra/.env` for Redis broker. |
+| `enqueue`           | `make enqueue FILE=path TENANT=<uuid\|label>` — test producer for `worker`. Label form auto-derives a stable uuid5 and upserts a `users` row so the FK resolves. |
 | `migrate-up`        | `alembic upgrade head` against the docker-compose Postgres. Idempotent. |
 | `migrate-down`      | `alembic downgrade -1` (one revision). `make migrate-down REV=base` wipes all the way. |
 | `migrate-new`       | `make migrate-new MSG="describe change"` → `alembic revision --autogenerate`. Review the generated file before committing — autogenerate misses `server_default`, enum diffs, and may rename indexes cosmetically. |
@@ -204,8 +206,55 @@ upserts `user_library` (`ON CONFLICT DO NOTHING` on the
 second `user_library` row points at the same `global_books` row — the
 storage-savings invariant from ARCHITECTURE.md §4.
 
-No Celery yet (Phase 9) — single-process, synchronous, one book per
-invocation.
+Phase 9 (below) puts the same pipeline behind a Celery task, but
+`ingest.py` itself stays the synchronous source of truth — the task
+calls it directly.
+
+## Celery (Phase 9)
+
+`worker/celery_app.py` is the Celery app; `worker/tasks/ingest.py`
+registers `tasks.ingest.ingest_book` — a thin adapter that unwraps
+JSON-friendly arguments into `ingest()` from `worker/ingest.py`. Redis
+is both broker (db 0) and result backend (db 1); connection settings
+load from `SERMON_REDIS_*` in `infra/.env`.
+
+```bash
+make worker                                         # foreground prefork worker
+make enqueue FILE=tests/samples/book.epub TENANT=tenant_a   # test producer
+```
+
+`TENANT` accepts a `users.user_id` UUID *or* a friendly label. Labels
+are uuid5'd against a fixed namespace and the resulting user row is
+upserted so the `user_library` FK resolves — local dev / verify only;
+the Phase 10 API derives `user_id` from JWT, never from a payload.
+
+**Reliability config** (in `celery_app.py`, with rationale in the
+module docstring):
+
+- `task_acks_late=True` + `task_reject_on_worker_lost=True` — a SIGKILL
+  on the prefork child requeues the message; another worker (or the
+  same parent's next child) picks it up. Verified by killing
+  `ForkPoolWorker-1` mid-task; ForkPoolWorker-2 spawned and reprocessed
+  the same task within ~10s.
+- `broker_transport_options.visibility_timeout=300` — Redis broker
+  redelivers an unacked message after 5 min if the *whole* worker
+  process dies (so the parent can't reject). Default is 1h — too long
+  for interactive verify.
+- `worker_prefetch_multiplier=1` — ingest tasks run for minutes;
+  prefetching would block reservations behind a single slow embed pass.
+- `task_track_started=True` — the result backend reports `STARTED`
+  (with worker PID + hostname) the moment a worker claims the task, so
+  Phase 10's `GET /tasks/{id}` can distinguish "queued" from "running".
+
+**Idempotency caveat.** The Phase 6/8 pipeline is *not* crash-safe
+between the Milvus insert and the `global_books` write. A re-delivery
+after a partial-completion crash can produce orphan vectors (rows in
+`library_vectors` with no matching `global_books` row). The dedup gate
+catches *content* re-uploads at the MinHash layer, so most re-runs
+converge to the right end state — the orphan risk is strictly between
+"vectors flushed" and "global_books committed" within a single task
+invocation. Phase 10+ should add a task-id-keyed idempotency token
+before exposing the queue to untrusted upload traffic.
 
 ## Dedup
 

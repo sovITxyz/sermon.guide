@@ -1,7 +1,7 @@
 [project]
 name = "sermon-api"
 version = "0.0.0"
-description = "sermon.guide FastAPI HTTP layer — auth, upload, task status."
+description = "sermon.guide FastAPI HTTP layer — auth, upload, task status, search."
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi>=0.115,<0.120",
@@ -21,6 +21,18 @@ dependencies = [
   "pydantic-settings>=2.6,<3",
   "celery>=5.4,<6",
   "redis>=5,<7",
+  # Phase 11: search endpoint embeds queries with BGE-Large and runs a
+  # filtered Milvus search in-process. Pins must stay aligned with
+  # `worker/pyproject.toml` — both processes load the same model from the
+  # same HF cache, and drift in pymilvus versions across api/worker would
+  # surface as a wire-protocol mismatch only at runtime. The CPU-only
+  # torch source override below mirrors worker/ for the same reason
+  # (Phase 5 row): the default PyPI wheel ships ~2GB of CUDA libraries
+  # we'd never use on api hardware.
+  "pymilvus>=2.6,<3",
+  "sentence-transformers>=3,<6",
+  "torch>=2.5,<3",
+  "numpy>=2,<3",
 ]
 
 [dependency-groups]
@@ -34,6 +46,14 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.ruff]
 line-length = 100
@@ -63,6 +83,6 @@ pythonVersion = "3.12"
 # `db` and friends live in `../worker`; same rationale as the pytest
 # pythonpath above.
 extraPaths = ["../worker"]
-include = ["main.py", "auth.py", "uploads.py", "settings.py", "tasks_client.py", "tests"]
+include = ["main.py", "auth.py", "uploads.py", "search.py", "settings.py", "tasks_client.py", "tests"]
 venvPath = "."
 venv = ".venv"

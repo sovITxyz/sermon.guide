@@ -26,3 +26,4 @@ def test_healthz_route_is_registered() -> None:
     assert "/auth/login" in paths
     assert "/upload" in paths
     assert "/tasks/{task_id}" in paths
+    assert "/search" in paths

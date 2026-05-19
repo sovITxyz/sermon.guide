@@ -78,31 +78,51 @@ rules are here so the audit isn't your first line of defense.
 - **Forgetting `WWW-Authenticate: Bearer` on a 401.** Curl + many HTTP
   clients won't retry without it. `auth.py` always sets it.
 
+## Cross-package imports from `worker/`
+
+`api/` reaches into `../worker` for three things only — `db` (since
+Phase 7), `embedding.embed` and `scripts.bootstrap_milvus`'s
+`COLLECTION_NAME` + `make_client` (added in Phase 11 for the
+`/search` route). The api venv accordingly carries `pymilvus`,
+`sentence-transformers`, `torch` (CPU-only via the same
+`[tool.uv.sources]` override `worker/` uses), and `numpy`. Pin them in
+lockstep with `worker/pyproject.toml` so the two processes load the
+exact same model and speak the same Milvus wire protocol.
+
+What `api/` still **must not** import:
+
+- `worker.celery_app` / `worker.tasks.*` — those pull pandoc, EbookLib,
+  pypandoc, pymupdf4llm (the extractor deps), and the Celery worker
+  bootstrap. The api process only *enqueues* tasks, never executes them.
+- `worker.ingest`, `worker.chunking`, `worker.dedup`, `worker.extractors`
+  — same rationale: extraction + ingestion is a worker concern.
+
 ## Celery client (`tasks_client.py`)
 
-api/ never imports `worker.celery_app` or `worker.tasks.*` directly —
-that would pull pymilvus, sentence-transformers, pandoc, and the rest of
-the worker dep tree into the api venv. Instead, `tasks_client.py`
-constructs a thin `Celery()` instance against the same Redis broker /
-backend and uses `send_task("tasks.ingest.ingest_book", args=[…])` by
-name. Drift between this module's `RedisSettings` and
-`worker/celery_app.py:RedisSettings` is a silent failure — the api
-enqueues into a queue the worker isn't reading. If you change one, change both.
+api/ enqueues ingest tasks by name via a thin `Celery()` instance
+against the same Redis broker / backend — `send_task(
+"tasks.ingest.ingest_book", args=[…])`. Drift between this module's
+`RedisSettings` and `worker/celery_app.py:RedisSettings` is a silent
+failure — the api enqueues into a queue the worker isn't reading. If
+you change one, change both.
 
-## Phase 10 follow-ups (open trust gaps)
-
-These are known limitations to address in Phase 11+ as the surface grows:
+## Open trust gaps
 
 - **No task ownership table.** `GET /tasks/{task_id}` requires auth but
   doesn't check that the caller enqueued the task — the task_id is the
-  capability (122-bit Celery UUID, computationally unguessable). When
-  Phase 11 lands `user_library` writes from the search path, fold in an
-  `upload_tasks(task_id, user_id)` row and check it.
+  capability (122-bit Celery UUID, computationally unguessable). Fold in
+  an `upload_tasks(task_id, user_id)` row once a later phase needs it;
+  Phase 11's `/search` route doesn't touch upload tasks so this stays
+  open.
 - **Orphan-vector risk from Phase 9.** The Celery pipeline isn't
   crash-safe between Milvus insert and `global_books` commit
   (`worker/AGENTS.md` documents the same caveat). The `/upload` route
-  doesn't yet add a task-id-keyed idempotency token — `/security-review`
-  has flagged this as a Phase 11 task.
+  doesn't yet add a task-id-keyed idempotency token.
+- **No library cap on the search filter.** A user with 10K books
+  produces a ~360 KB `book_id IN [...]` filter expression on every
+  `/search`. Milvus 2.6 accepts this in practice but a Phase 12+ change
+  (BM25 fusion will multiply query work) is the right time to introduce
+  a chunked-filter or partition-key narrowing strategy.
 
 ## Before merging anything in this directory
 

@@ -17,6 +17,7 @@ def test_pyproject_parses() -> None:
 def test_healthz_route_is_registered() -> None:
     """Cheap import-time check that main.app wires the meta route."""
     from fastapi.routing import APIRoute
+
     from main import app
 
     paths = {route.path for route in app.routes if isinstance(route, APIRoute)}

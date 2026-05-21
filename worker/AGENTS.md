@@ -246,15 +246,16 @@ module docstring):
   (with worker PID + hostname) the moment a worker claims the task, so
   Phase 10's `GET /tasks/{id}` can distinguish "queued" from "running".
 
-**Idempotency caveat.** The Phase 6/8 pipeline is *not* crash-safe
-between the Milvus insert and the `global_books` write. A re-delivery
-after a partial-completion crash can produce orphan vectors (rows in
-`library_vectors` with no matching `global_books` row). The dedup gate
-catches *content* re-uploads at the MinHash layer, so most re-runs
-converge to the right end state — the orphan risk is strictly between
-"vectors flushed" and "global_books committed" within a single task
-invocation. Phase 10+ should add a task-id-keyed idempotency token
-before exposing the queue to untrusted upload traffic.
+**Idempotency caveat.** The pipeline is *not* crash-safe between the
+Milvus insert and the Postgres commit. Phase 12 adds `chunks` rows
+alongside `global_books` in a single Postgres transaction (see
+`ingest.py:_insert_book_with_chunks`) so a crash either lands both
+Postgres rows or neither — but a crash *after* the Milvus flush and
+*before* the Postgres commit still leaves orphan vectors (`library_vectors`
+rows with no matching `global_books`/`chunks`). The dedup gate catches
+*content* re-uploads at the MinHash layer, so most re-runs converge to
+the right end state. Phase 10+ should add a task-id-keyed idempotency
+token before exposing the queue to untrusted upload traffic.
 
 ## Dedup
 
@@ -367,6 +368,54 @@ Two pieces ship in `.claude/` for ongoing audits as the codebase grows:
 Run both before merging anything that touches a Milvus or DB query, an
 auth dependency, or the ingestion pipeline. They are checks, not
 fixers — findings halt the audit; the fix is owner-decision territory.
+
+## Retrieval (Phase 12)
+
+`worker/retrieval.py` is the shared hybrid-retrieval kernel — dense
+Milvus COSINE + sparse Postgres BM25, fused via Reciprocal Rank Fusion
+(RRF, k=60). `api/search.py` wraps it for the HTTP layer; the worker
+golden tests (`tests/test_retrieval_golden.py`) drive the same
+primitives to gate retrieval regressions.
+
+Public surface:
+
+- `dense_search(client, query_vec, book_ids, limit)` — sync Milvus
+  filter+search; emits `RetrievalHit`s with `dense_score` set.
+- `bm25_search(session, query, book_ids, limit)` — **async** Postgres
+  variant for the API.
+- `bm25_search_sync(session, query, book_ids, limit)` — sync variant
+  for worker tests + scripts.
+- `rrf_fuse(dense, sparse, *, limit, k=60)` — merges two ranked lists
+  by `(book_id, chunk_index)`, sums `1 / (k + rank)` per arm; returns
+  top-K. Hit identity comes from the `metadata.chunk_index` that
+  `ingest.py:_build_rows` writes into Milvus and the matching
+  `chunks.chunk_index` column.
+- `hybrid_search_sync(client, session, query, query_vec, book_ids, limit)`
+  — convenience that runs both arms sequentially and fuses; used by
+  the goldens. The async API parallelises the two arms via
+  `asyncio.gather`.
+
+**Tenant invariant:** both arms refuse empty `book_ids` (raise
+`ValueError`) — the caller (`api/search.py`) short-circuits empty
+libraries before hitting either index. ADR 0004 covers the BM25 backend
+choice; ARCHITECTURE.md §3.5 is the schema source-of-truth.
+
+### `chunks` table (Phase 12)
+
+`worker/ingest.py` writes one `chunks` row per chunk alongside the
+Milvus vector in the *same* Postgres transaction as `global_books`
+(`_insert_book_with_chunks`). Pre-Phase-12 books need a one-time
+backfill:
+
+```bash
+uv run python -m scripts.backfill_chunks          # all missing books
+uv run python -m scripts.backfill_chunks --dry-run
+uv run python -m scripts.backfill_chunks --book-id <uuid>
+```
+
+Idempotent via the `uq_chunks_book_chunk` unique constraint; safe to
+re-run. The script reads from Milvus (`content_chunk` + `metadata`) so
+it does not re-extract from disk.
 
 ## Milvus client init
 

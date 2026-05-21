@@ -40,6 +40,10 @@ rules are here so the audit isn't your first line of defense.
 - **Every Milvus search MUST include `book_id IN (<set>)` in `expr`.**
   An unfiltered search returns vectors across the whole platform — a
   CVE-class data leak (see `ARCHITECTURE.md` §3 and §7.1).
+- **Every BM25 search MUST include `book_id = ANY(<set>)` in its
+  `WHERE`** (Phase 12; ARCHITECTURE.md §3.5). Same invariant as the
+  dense arm — the sparse arm is just a different index, the tenant
+  scoping rule is identical.
 - **Every SQLAlchemy query against `user_library` / `highlights` /
   `collections` MUST filter by `user_id`** derived from the JWT.
 
@@ -80,11 +84,11 @@ rules are here so the audit isn't your first line of defense.
 
 ## Cross-package imports from `worker/`
 
-`api/` reaches into `../worker` for three things only — `db` (since
-Phase 7), `embedding.embed` and `scripts.bootstrap_milvus`'s
-`COLLECTION_NAME` + `make_client` (added in Phase 11 for the
-`/search` route). The api venv accordingly carries `pymilvus`,
-`sentence-transformers`, `torch` (CPU-only via the same
+`api/` reaches into `../worker` for four things only — `db` (since
+Phase 7), `embedding.embed`, `scripts.bootstrap_milvus`'s
+`COLLECTION_NAME` + `make_client`, and `retrieval` (the hybrid
+dense+sparse+RRF kernel from Phase 12). The api venv accordingly carries
+`pymilvus`, `sentence-transformers`, `torch` (CPU-only via the same
 `[tool.uv.sources]` override `worker/` uses), and `numpy`. Pin them in
 lockstep with `worker/pyproject.toml` so the two processes load the
 exact same model and speak the same Milvus wire protocol.
@@ -120,9 +124,11 @@ you change one, change both.
   doesn't yet add a task-id-keyed idempotency token.
 - **No library cap on the search filter.** A user with 10K books
   produces a ~360 KB `book_id IN [...]` filter expression on every
-  `/search`. Milvus 2.6 accepts this in practice but a Phase 12+ change
-  (BM25 fusion will multiply query work) is the right time to introduce
-  a chunked-filter or partition-key narrowing strategy.
+  `/search`. Phase 12's BM25 arm doubles the per-query work (Milvus
+  filter + Postgres `book_id = ANY(...)`). Both backends still accept
+  it in practice at v0 scale; introducing a chunked-filter or
+  partition-key narrowing strategy is the next phase to do this
+  properly.
 
 ## Before merging anything in this directory
 

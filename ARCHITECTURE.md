@@ -75,6 +75,32 @@ book set (typically ≪ a few million vectors), and exhaustive scan over the
 filtered partitions is both cheaper to operate and gives 100% recall. Revisit
 only if filtered p95 latency exceeds target.
 
+## 3.5 BM25 backend — Postgres `tsvector` on the `chunks` table
+
+The sparse arm of hybrid retrieval (see §2 row "Search (retrieval)")
+lives in Postgres rather than a new search service. Each ingested chunk
+becomes a `chunks` row (see §4) with a `content` TEXT column and a
+`tsv` `GENERATED ALWAYS AS to_tsvector('english', content) STORED`
+column; a GIN index on `tsv` makes lexical lookup fast. Sparse search
+is a single SQL statement that filters by the same JWT-derived
+`book_id` set the dense arm uses:
+
+```sql
+SELECT book_id, chunk_index, content, parent_section, filename,
+       ts_rank_cd(tsv, q) AS rank
+  FROM chunks, websearch_to_tsquery('english', :query) AS q
+ WHERE tsv @@ q
+   AND book_id = ANY(:book_ids)
+ ORDER BY rank DESC
+ LIMIT 30;
+```
+
+Decision rationale and alternatives in [ADR 0004](docs/adr/0004-bm25-backend.md).
+"BM25" is shorthand — `ts_rank_cd` is cover-density ranking, not the
+literal Okapi BM25 formula; RRF fusion cares about ranks, not absolute
+scores, so the difference disappears in practice. An upgrade path to
+true BM25 (ParadeDB's `pg_search` extension) is documented in the ADR.
+
 ## 4. Postgres schema sketch
 
 Five tables. SQLAlchemy models land in `worker/db/models.py` in Phase 7; this
@@ -84,6 +110,7 @@ section is the source of truth for what they look like.
 | ------------- | -------------- | --------------------------------------------------- | -------------------------------------------------------- |
 | `users`       | `user_id`      | `email`, `password_hash`, `created_at`              | bcrypt; one user = one tenant in v0                      |
 | `global_books` | `book_id`     | `isbn?`, `title`, `author`, `minhash_signature`, `text_pointer` | One row per *deduplicated* book; `text_pointer` to R2/B2 |
+| `chunks`      | `chunk_id`     | `book_id`, `chunk_index`, `content`, `parent_section`, `filename`, `tsv` (generated) | One row per ingested chunk; mirrors Milvus `content_chunk` for BM25. Unique on `(book_id, chunk_index)`; GIN index on `tsv` — see §3.5 and [ADR 0004](docs/adr/0004-bm25-backend.md). |
 | `user_library` | `entry_id`    | `user_id`, `book_id`, `category`, `added_at`        | M:N join; this is "user A owns book X"                   |
 | `highlights`  | `highlight_id` | `user_id`, `book_id`, `content`, `vector_id?`       | Doubly-scoped: queries always filter `user_id AND book_id` |
 | `collections` | `collection_id` | `user_id`, `name`, `description`                   | User-defined groupings (e.g. "commentaries", "Reformed") |

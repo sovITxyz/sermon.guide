@@ -7,6 +7,7 @@ dependency-direction rule in the root ``CLAUDE.md``). Tables live at
 
 from db.models import (
     Base,
+    Chunk,
     Collection,
     GlobalBook,
     Highlight,
@@ -22,6 +23,7 @@ from db.session import (
 
 __all__ = [
     "Base",
+    "Chunk",
     "Collection",
     "GlobalBook",
     "Highlight",

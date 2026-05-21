@@ -16,16 +16,18 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Computed,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     String,
     Text,
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -71,6 +73,69 @@ class GlobalBook(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    )
+
+
+class Chunk(Base):
+    """One semantic chunk per ingested book — the BM25 side of hybrid retrieval.
+
+    Phase 12 / ADR 0004. Mirrors what ``worker/ingest.py`` writes into
+    Milvus, so RRF fusion can identify the same retrievable unit on both
+    arms via ``(book_id, chunk_index)``. ``content`` carries the same
+    bytes as the Milvus ``content_chunk`` field; the generated ``tsv``
+    column is what the GIN index serves.
+
+    Tenant scoping lives at the query layer — every sparse search
+    filters ``book_id = ANY(<user's library>)`` the same way the dense
+    arm filters Milvus (ARCHITECTURE.md §7.1, CLAUDE.md).
+    """
+
+    __tablename__ = "chunks"
+
+    chunk_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        # CASCADE: chunks have no value once their global_books row is
+        # gone. user_library still holds the dedup invariant via its own
+        # RESTRICT FK (you can't drop a book that any user owns), so a
+        # CASCADE here only fires when the book is truly being deleted.
+        ForeignKey("global_books.book_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    parent_section: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    # PostgreSQL GENERATED ALWAYS AS … STORED — kept in sync with
+    # ``content`` by the DB; the application never writes it. Declared
+    # ``Mapped[str]`` for the type-checker; the column type is TSVECTOR.
+    tsv: Mapped[str] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', content)", persisted=True),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # (book_id, chunk_index) is the chunk's identity — the same key
+        # the dense arm produces from Milvus metadata. Idempotent ingest
+        # + backfill upserts ON CONFLICT against this constraint.
+        UniqueConstraint("book_id", "chunk_index", name="uq_chunks_book_chunk"),
+        # B-tree on book_id so the ``book_id = ANY(...)`` tenant filter
+        # combines with the GIN-on-tsv via Postgres's bitmap heap scan.
+        Index("ix_chunks_book_id", "book_id"),
+        # GIN over the generated tsvector. ``postgresql_using="gin"`` is
+        # the only thing that makes the tsvector match operator (``@@``)
+        # fast at corpus scale.
+        Index("ix_chunks_tsv_gin", "tsv", postgresql_using="gin"),
     )
 
 

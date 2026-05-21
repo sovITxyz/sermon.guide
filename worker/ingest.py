@@ -58,6 +58,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 import dedup
 from chunking import Chunk, chunk
+from db import Chunk as ChunkRow
 from db import GlobalBook, UserLibraryEntry, get_sync_session_factory
 from dedup import Dedup
 from embedding import embed
@@ -116,15 +117,25 @@ def _build_rows(
     ]
 
 
-def _insert_global_book(
+def _insert_book_with_chunks(
     *,
     book_id: UUID,
     title: str,
     author: str | None,
     signature_bytes: bytes,
     text_pointer: str | None,
+    chunks: list[Chunk],
+    filename: str,
 ) -> None:
-    """Insert a new ``global_books`` row.
+    """Insert ``global_books`` + ``chunks`` rows for a new book in one txn.
+
+    Phase 12 (ADR 0004) introduced the ``chunks`` table for the BM25 arm
+    of hybrid retrieval. Both writes share a transaction: if either
+    fails, neither lands. Splitting them would create a worse failure
+    mode than the existing Milvus/Postgres orphan-vector window — a
+    ``global_books`` row without chunks would survive dedup but be
+    invisible to BM25 forever, since re-ingest of the same content would
+    short-circuit at the MinHash gate.
 
     Sync session bridge so the worker can write without spinning up an
     event loop. See ``db/session.py:get_sync_engine`` for the rationale.
@@ -140,6 +151,19 @@ def _insert_global_book(
                 text_pointer=text_pointer,
             ),
         )
+        if chunks:
+            session.add_all(
+                [
+                    ChunkRow(
+                        book_id=book_id,
+                        chunk_index=i,
+                        content=c.text,
+                        parent_section=c.parent_section,
+                        filename=filename,
+                    )
+                    for i, c in enumerate(chunks)
+                ],
+            )
 
 
 def _upsert_user_library(*, user_id: UUID, book_id: UUID) -> None:
@@ -214,12 +238,14 @@ def ingest_markdown(
         client.load_collection(collection_name=COLLECTION_NAME)
         rows_inserted = len(rows)
 
-    _insert_global_book(
+    _insert_book_with_chunks(
         book_id=book_id,
         title=title,
         author=author,
         signature_bytes=dedup.serialize(sig),
         text_pointer=text_pointer,
+        chunks=chunks,
+        filename=filename,
     )
     _upsert_user_library(user_id=user_id, book_id=book_id)
     index.add(book_id, sig)

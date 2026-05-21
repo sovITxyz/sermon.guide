@@ -5,7 +5,7 @@
 # defaults can be overridden without exporting them in your shell. Pass
 # extra args via `make bootstrap-milvus ARGS=--force`.
 
-.PHONY: lint format format-check typecheck test test-isolation test-retrieval-golden bootstrap-milvus ingest worker enqueue migrate-up migrate-down migrate-new
+.PHONY: lint format format-check typecheck test test-isolation test-retrieval-golden bootstrap-milvus backfill-chunks ingest worker enqueue migrate-up migrate-down migrate-new
 
 lint:
 	uv run ruff check .
@@ -36,6 +36,12 @@ test-retrieval-golden:
 
 bootstrap-milvus:
 	set -a && . ../infra/.env && set +a && uv run python scripts/bootstrap_milvus.py $(ARGS)
+
+# Phase 12 backfill: populate the chunks table from Milvus for books
+# that were ingested before Phase 12. Idempotent; safe to re-run. Pass
+# `--dry-run` via ARGS to preview, or `--book-id <uuid>` to scope to one.
+backfill-chunks:
+	set -a && . ../infra/.env && set +a && uv run python -m scripts.backfill_chunks $(ARGS)
 
 # Single-book dedup-aware ingest CLI (Phase 8):
 #   detect → extract → MinHash dedup → (skip on hit | chunk → embed → insert) →

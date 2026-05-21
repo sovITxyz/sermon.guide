@@ -1,19 +1,30 @@
-"""Golden retrieval regression tests (Phase 11).
+"""Golden retrieval regression tests (Phase 11 + Phase 12 hybrid).
 
 Each row in ``worker/tests/golden/queries.jsonl`` is one parametrized
 test. For each row, the test:
 
 1. Embeds ``row["query"]`` with BGE-Large.
-2. Runs a filtered Milvus COSINE search over the golden test user's
+2. Runs the Phase 12 hybrid pipeline — dense Milvus COSINE + sparse
+   Postgres BM25, fused via RRF (k=60) — over the golden test user's
    library (the union of all corpus ``book_id``s — ranking quality, not
    tenant isolation, is what this test gates).
 3. Asserts at least one ``row["expected_filenames"]`` book appears in
-   top-10 with similarity ≥ ``row["min_score"]``.
+   top-10 with fused score ≥ ``row["min_score"]``.
 
 Hit/miss binary — any one expected book in top-K passes. No fuzzy
 partial credit. The point is to detect *catastrophic* regression when an
-upstream component (embedding model, chunker, index, ranking) changes;
-sub-rank shifts are signal but not gating.
+upstream component (embedding model, chunker, index, ranking, fusion)
+changes; sub-rank shifts are signal but not gating.
+
+``min_score`` semantics in Phase 12: interpreted as a **per-arm**
+score floor against whichever arm contributed to a fused hit. A row
+passes if any expected book lands in top-K of the fused list AND at
+least one arm scored that hit ≥ ``min_score``. That preserves the
+Phase 11 dense-strength rows' ``0.45`` COSINE floor (the dense arm
+still surfaces them well above 0.45 on its own) while letting Phase 12
+BM25-strength rows use ``min_score: 0.0`` — the sparse ``ts_rank_cd``
+scale isn't worth pinning across corpus changes, and "any positive
+arm contribution into top-K" is the right gate for the BM25 arm.
 
 ## Skip-clean policy
 
@@ -29,6 +40,9 @@ distinguishable from a missing-Milvus run in CI logs:
   pytest).
 - NLTK WordNet absent → skip (the dedup gate inside ingest needs it).
 - Collection ``library_vectors`` missing → skip (``make bootstrap-milvus``).
+- Any corpus book missing ``chunks`` rows → skip with a pointer to
+  ``scripts.backfill_chunks`` (Phase 12 introduced the table; pre-existing
+  books need a backfill before hybrid search returns sparse hits).
 
 ## Idempotency
 
@@ -66,9 +80,10 @@ from typing import Any, cast
 
 import pytest
 
-from db import User, get_sync_session_factory
+from db import Chunk, User, get_sync_session_factory
 from db.settings import settings as db_settings
 from embedding import EMBED_DIM, MODEL_NAME, embed
+from retrieval import hybrid_search_sync
 from scripts.bootstrap_milvus import COLLECTION_NAME
 
 SAMPLES_DIR = Path(__file__).resolve().parent / "samples"
@@ -218,22 +233,36 @@ def golden_corpus() -> Iterator[dict[str, uuid.UUID]]:
     yield book_ids
 
 
-def _filter_expr(book_ids: list[uuid.UUID]) -> str:
-    """Mirror of ``api/search.py:_build_filter_expr`` — kept inline to avoid
-    cross-package imports in worker tests (api/ depends on worker, not the
-    other way)."""
-    quoted = ", ".join(f'"{b!s}"' for b in book_ids)
-    return f"book_id in [{quoted}]"
+def _chunks_present_for(book_ids: list[uuid.UUID]) -> bool:
+    """Return True iff every corpus book has at least one ``chunks`` row.
+
+    Phase 12 hybrid search needs the BM25 arm, which reads from
+    ``chunks``. A book that landed in Milvus before the table existed
+    (or before backfill ran) would silently make the sparse arm a no-op
+    for that book. Skip with a clear message rather than failing the
+    rest of the suite.
+    """
+    sf = get_sync_session_factory()
+    with sf() as session:
+        from sqlalchemy import func, select
+
+        stmt = (
+            select(Chunk.book_id, func.count(Chunk.chunk_id))
+            .where(Chunk.book_id.in_(book_ids))
+            .group_by(Chunk.book_id)
+        )
+        present = {row[0] for row in session.execute(stmt).all() if row[1] > 0}
+    return present.issuperset(set(book_ids))
 
 
 class TestRetrievalAccuracy:
     """Retrieval must surface the right book in top-K for each curated query.
 
     A failure here means an upstream change (model, chunking, indexing,
-    ranking) regressed retrieval quality on the same corpus. Inspect the
-    failure's printed top-K + scores against the prior commit's run to
-    decide whether the change is acceptable; do not silence the test
-    without understanding what shifted.
+    ranking, fusion) regressed retrieval quality on the same corpus.
+    Inspect the failure's printed top-K + scores against the prior
+    commit's run to decide whether the change is acceptable; do not
+    silence the test without understanding what shifted.
     """
 
     @pytest.mark.parametrize(
@@ -250,11 +279,15 @@ class TestRetrievalAccuracy:
         the required score floor.
 
         Diagnosis order:
-        1. Is the score floor still calibrated? If model upgrades shifted the
-           absolute scale, recalibrate ``min_score`` per row.
-        2. Did chunk boundaries change (Phase 5)? Section-spanning queries
+        1. Did fusion break? Re-run ``test_search_unit.py::test_rrf_fuse_*``
+           in api/ — those pin the math without infra.
+        2. Is the per-arm score floor still calibrated? If model
+           upgrades shifted the COSINE scale, recalibrate ``min_score``
+           on the dense-strength rows. If a Postgres text-search config
+           change shifted ts_rank_cd, recalibrate the BM25-strength rows.
+        3. Did chunk boundaries change (Phase 5)? Section-spanning queries
            degrade when chunks shrink past the relevant span.
-        3. Did the partition key or filter pushdown regress (Phase 3
+        4. Did the partition key or filter pushdown regress (Phase 3
            covers this)? Re-run ``make test-isolation`` to triangulate.
         """
         from pymilvus import MilvusClient
@@ -271,29 +304,45 @@ class TestRetrievalAccuracy:
         # an unfiltered search would mix in non-corpus vectors and produce
         # noisy scores.
         library = list(golden_corpus.values())
-        query_vec = embed([row["query"]])[0].tolist()
-        results = client.search(
-            collection_name=COLLECTION_NAME,
-            data=[query_vec],
-            filter=_filter_expr(library),
-            limit=TOP_K,
-            output_fields=["book_id"],
-        )
 
-        hits = [(uuid.UUID(hit["entity"]["book_id"]), float(hit["distance"])) for hit in results[0]]
+        if not _chunks_present_for(library):
+            pytest.skip(
+                "Some corpus books lack `chunks` rows — run "
+                "`uv run python -m scripts.backfill_chunks` to populate, "
+                "then re-run the goldens.",
+            )
+
+        query_vec = embed([row["query"]])[0].tolist()
+        sf = get_sync_session_factory()
+        with sf() as session:
+            fused = hybrid_search_sync(
+                client=client,
+                session=session,
+                query=row["query"],
+                query_vec=query_vec,
+                book_ids=library,
+                limit=TOP_K,
+            )
+
+        floor = float(row["min_score"])
         passing = [
-            (bid, score)
-            for bid, score in hits
-            if bid in expected_book_ids and score >= row["min_score"]
+            hit
+            for hit in fused
+            if hit.book_id in expected_book_ids
+            and (
+                (hit.dense_score is not None and hit.dense_score >= floor)
+                or (hit.sparse_score is not None and hit.sparse_score >= floor)
+            )
         ]
 
+        hits_repr = [(hit.book_id, hit.score, hit.dense_score, hit.sparse_score) for hit in fused]
         assert passing, (
             f"RETRIEVAL REGRESSION on golden query.\n"
             f"  query: {row['query']!r}\n"
             f"  expected (any of): {expected_filenames}\n"
             f"  expected book_ids: {sorted(expected_book_ids)}\n"
-            f"  min_score: {row['min_score']}\n"
-            f"  top-{len(hits)} (book_id, score): {hits}\n"
+            f"  per-arm min_score floor: {floor}\n"
+            f"  top-{len(fused)} (book_id, rrf, dense, sparse): {hits_repr}\n"
             f"  note: {row.get('note', '')}\n"
             f"Compare against the prior commit's golden run on the same corpus."
         )

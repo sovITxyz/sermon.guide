@@ -93,6 +93,33 @@ dense+sparse+RRF kernel from Phase 12). The api venv accordingly carries
 lockstep with `worker/pyproject.toml` so the two processes load the
 exact same model and speak the same Milvus wire protocol.
 
+## Models loaded in this process (Phase 11 + Phase 13)
+
+Three sentence-transformers models load lazily on first use — each
+behind a `@lru_cache(maxsize=1)` so import-time / lint / test cost
+stays free until the first /search request:
+
+| File | Class | Model | Approx size | Used for |
+|------|-------|-------|-------------|----------|
+| `worker.embedding._model` | `SentenceTransformer` | `BAAI/bge-large-en-v1.5` | ~1.3 GB | Query embedding (dense arm). |
+| `rerank._model` | `CrossEncoder` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | ~90 MB | Top-30 → top-N rerank (Phase 13). |
+| `highlight._model` | `SentenceTransformer` | `BAAI/bge-m3` | ~2.3 GB | Sentence-level pruning (Phase 13). |
+
+Cold first-reranked-request cost: ~3.7 GB of model loads + cold
+inference. All three live in the HF cache
+(`~/.cache/huggingface/hub`); the worker process shares the BGE-Large
+weights (LlamaIndex Phase 5 + `worker.embedding` Phase 6 both pull the
+same blob), so the api ↔ worker pair has roughly 5 GB of model state
+between them when both are warm.
+
+The rerank + highlight stages run *after* both retrieval arms' tenant
+filters have already executed. They take a `Sequence[RetrievalHit]`
+that was filtered by `book_id` upstream, score (query, chunk) pairs,
+and return a re-ordered + pruned subset. They **never** query the DB or
+Milvus and so introduce no new tenant surface — the cross-encoder and
+BGE-M3 see only chunks the JWT-authenticated user is already
+authorized to see (CLAUDE.md tenant rule, ARCHITECTURE.md §3 + §7.1).
+
 What `api/` still **must not** import:
 
 - `worker.celery_app` / `worker.tasks.*` — those pull pandoc, EbookLib,
@@ -129,6 +156,19 @@ you change one, change both.
   it in practice at v0 scale; introducing a chunked-filter or
   partition-key narrowing strategy is the next phase to do this
   properly.
+- **No graceful degradation when a model load or inference fails.**
+  Phase 12 noted `asyncio.gather` lacks `return_exceptions=True` on the
+  dense/sparse fan-out; Phase 13 adds two more sequential model calls
+  (cross-encoder, BGE-M3) that also raise straight through to a 500.
+  A cold HF cache without network on the first reranked /search after
+  process boot is the only realistic trigger — warm processes are
+  stable. Same posture held over to a future ops-resilience pass.
+- **Rerank wall-time cost.** With rerank=true the warm /search latency
+  on CPU is ~30 s vs the ~1 s Phase 12 baseline (10 chunks × ~30
+  sentences each through BGE-M3 dominates). Acceptable for sermon prep
+  but pushes hard against any future real-time use case; the GPU swap
+  in `worker/embedding.py` plus equivalent moves in `rerank.py` /
+  `highlight.py` are the architecture-locked next step.
 
 ## Before merging anything in this directory
 

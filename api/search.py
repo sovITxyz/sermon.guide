@@ -1,15 +1,18 @@
-"""Authenticated hybrid search over the JWT user's library.
+"""Authenticated hybrid + rerank + highlight search over the JWT user's library.
 
-``POST /search`` runs dense (BGE → Milvus COSINE) and sparse
+``POST /search`` runs dense (BGE-Large → Milvus COSINE) and sparse
 (Postgres ``tsvector`` → ``ts_rank_cd``) retrieval in parallel and
-fuses them via Reciprocal Rank Fusion (RRF, k=60). Returns the top-K
-fused hits as ``{content_chunk, book_id, metadata, score}`` —
-``score`` is the RRF score (sum of reciprocal ranks across arms).
+fuses them via Reciprocal Rank Fusion (RRF, k=60). When
+``payload.rerank`` is true (the default), the top-30 fused hits are
+reranked by a cross-encoder (Phase 13, ``api/rerank.py``) and pruned
+sentence-by-sentence against the query via BGE-M3 semantic
+highlighting (``api/highlight.py``); when false, the raw RRF top-K
+flows through unchanged (Phase 12 behavior).
 
-Algorithm and fusion live in ``worker/retrieval.py``; this module is
-the FastAPI wrapper that handles auth, request validation, and the
-event-loop dance between sync (Milvus, BGE encode) and async
-(SQLAlchemy ``AsyncSession``) call sites.
+The algorithm primitives live elsewhere — this module is the FastAPI
+wrapper that handles auth, request validation, and the event-loop
+dance between sync (Milvus, BGE encode, cross-encoder, BGE-M3) and
+async (SQLAlchemy ``AsyncSession``) call sites.
 
 ## Trust boundary
 
@@ -19,43 +22,78 @@ This is the load-bearing tenant invariant for retrieval (repo-root
 - ``user_id`` is **always** ``current_user.user_id`` from the JWT — never
   read from the request body or query. A search payload field named
   ``user_id`` is an automatic reject.
-- The ``book_id`` set used by both arms is resolved server-side from
-  ``user_library`` for that JWT ``user_id`` on every request. The
-  client cannot widen its own scope by passing ``book_ids: list[UUID]``.
+- The ``book_id`` set used by both retrieval arms is resolved
+  server-side from ``user_library`` for that JWT ``user_id`` on every
+  request. The client cannot widen its own scope by passing
+  ``book_ids: list[UUID]``.
 - Every Milvus search includes ``book_id IN (<set>)`` as the filter
   expression; every BM25 search includes ``book_id = ANY(<set>)`` in
-  the WHERE clause. An empty library short-circuits to an empty response
-  *before* embedding so we don't run the model on a request that can't
-  return anything; we also never issue a ``book_id in []`` filter (some
-  pymilvus builds reject it, and the semantics are ambiguous anyway).
+  the WHERE clause. An empty library short-circuits to an empty
+  response *before* embedding so we don't run the model on a request
+  that can't return anything; we also never issue a ``book_id in []``
+  filter (some pymilvus builds reject it, and the semantics are
+  ambiguous anyway).
+- Rerank + highlight (Phase 13) are post-retrieval stages: they only
+  see hits that already cleared the tenant filter on both arms. They
+  do not query the DB or Milvus, so they introduce no new tenant
+  surface. The cross-encoder + BGE-M3 do consume the user query +
+  chunk content together as model input, but that's text-into-a-
+  transformer — not a SQL / filter-expression injection vector.
 
 ## Parallelism
 
-The async handler kicks off two concurrent tasks via ``asyncio.gather``:
+The async handler kicks off two concurrent retrieval tasks via
+``asyncio.gather``:
 
-1. Embed the query (``asyncio.to_thread`` around the BGE encode), then
-   run the Milvus search (also ``to_thread`` — pymilvus is blocking).
+1. Embed the query (``asyncio.to_thread`` around the BGE-Large encode),
+   then run the Milvus search (also ``to_thread`` — pymilvus is
+   blocking).
 2. Run the BM25 search directly on the request's ``AsyncSession``.
 
-The dense arm is sequential within itself because the Milvus call needs
-the embedded query vector; the two arms run concurrently against each
-other. Total wall time is roughly ``max(embed + milvus, bm25)``.
+After fusion, the rerank + highlight stages run sequentially on the
+fused list, each in ``asyncio.to_thread`` (cross-encoder predict +
+BGE-M3 encode are both blocking). Sequential because highlight depends
+on the post-rerank top-N; parallelism within the post-retrieval
+pipeline would only save the smaller stage's wall time, and the
+implementation cost (model warmup ordering, more failure modes for
+``asyncio.gather`` to fan out) isn't worth it at v0 scale.
 
 ## Process-level singletons
 
-BGE-Large is loaded lazily via ``worker.embedding._model`` (``@lru_cache``);
-the first ``/search`` after process boot pays the ~1.3 GB model load +
-cold inference, every subsequent call is a single encode. The Milvus
-client is also one per process, lazily constructed on first use via
+BGE-Large (query embedding), the cross-encoder reranker, and BGE-M3
+(highlight scoring) are each loaded once per process via ``@lru_cache``
+in their respective modules. First request after process boot pays
+all three model loads (~3.7 GB across the three) plus cold inference;
+every subsequent call is one forward pass per model. The Milvus client
+is also one per process, lazily constructed on first use via
 ``scripts.bootstrap_milvus.make_client``.
 
-## Why ``score`` is RRF and not COSINE
+## Why ``score`` shifts meaning by ``rerank``
 
-Phase 11 surfaced ``score`` as the Milvus COSINE similarity. With
-fusion, the field semantics change to the RRF score (sum of reciprocal
-ranks). The per-arm scores survive on each hit as ``dense_score`` and
-``sparse_score`` for debugging, but they are not in the public
-``SearchHit`` schema — clients see only the fused order.
+The ``score`` field on each returned hit always conveys the ordering
+score of the final ranking stage:
+
+- ``rerank=false`` → RRF score (sum of reciprocal ranks across arms;
+  same as Phase 12).
+- ``rerank=true`` (default) → cross-encoder relevance score (higher =
+  better, unbounded, typical range ``[-15, +15]``).
+
+The previous-stage scores survive on each hit's ``metadata``:
+``rrf_score`` is written by the reranker; ``sentences_kept`` and
+``sentences_total`` are written by the highlighter so callers can see
+how aggressively each chunk was pruned without re-running BGE-M3.
+Per-arm ``dense_score`` and ``sparse_score`` are on the internal
+``RetrievalHit`` but are not in the public ``SearchHit`` schema —
+clients see only the final ordering score and the chunk metadata.
+
+## Failure mode
+
+Same as Phase 12: ``asyncio.gather`` lacks ``return_exceptions=True``
+on the dense/sparse fan-out, and the rerank + highlight stages raise
+through to the handler. A Milvus or Postgres blip becomes a 500; a
+cross-encoder / BGE-M3 model load failure (cold HF cache + offline)
+also 500s. Documented in the Phase 12 audit (docs/PHASES.md row 12)
+and held over to a future ops-resilience pass.
 """
 
 # pymilvus 2.6 ships without `py.typed`; same relaxation as worker/.
@@ -84,6 +122,8 @@ from scripts.bootstrap_milvus import make_client
 from sqlalchemy import select
 
 from auth import CurrentUserDep, SessionDep
+from highlight import highlight
+from rerank import RERANK_FANOUT, rerank
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -109,6 +149,12 @@ class SearchRequest(BaseModel):
 
     query: str = Field(min_length=1, max_length=1024)
     limit: int = Field(default=10, ge=1, le=100)
+    # Phase 13 toggle. Default true so the canonical /search pipeline
+    # matches ARCHITECTURE.md §5 (hybrid → rerank → highlight) and so
+    # Phase 14's summary endpoint can call /search and get pre-pruned
+    # context without an extra flag. Set false to compare against raw
+    # RRF (Phase 12 behavior) — useful for debugging ranking shifts.
+    rerank: bool = Field(default=True)
 
 
 class SearchHit(BaseModel):
@@ -155,7 +201,13 @@ async def search(
     current_user: CurrentUserDep,
     session: SessionDep,
 ) -> SearchResponse:
-    """Top-K hybrid search over the authenticated user's library."""
+    """Top-K hybrid search over the authenticated user's library.
+
+    When ``payload.rerank`` is true (default), the top-30 fused list
+    flows through the cross-encoder reranker (→ top ``limit``) and
+    BGE-M3 sentence-level pruning (drops sentences below threshold
+    0.5). When false, the raw RRF top-K is returned (Phase 12 behavior).
+    """
     stmt = select(UserLibraryEntry.book_id).where(
         UserLibraryEntry.user_id == current_user.user_id,
     )
@@ -172,5 +224,25 @@ async def search(
             limit=SPARSE_FANOUT,
         ),
     )
-    fused = rrf_fuse(dense=dense_hits, sparse=sparse_hits, limit=payload.limit)
-    return SearchResponse(hits=[_to_search_hit(h) for h in fused])
+    # Fan-out depends on whether the post-retrieval stages run: keep 30
+    # so the cross-encoder has the full recall pool to reorder; cap at
+    # `limit` when skipping rerank so we don't ship more rows than the
+    # client asked for.
+    fused_limit = RERANK_FANOUT if payload.rerank else payload.limit
+    fused = rrf_fuse(dense=dense_hits, sparse=sparse_hits, limit=fused_limit)
+
+    if not payload.rerank:
+        return SearchResponse(hits=[_to_search_hit(h) for h in fused])
+
+    reranked = await asyncio.to_thread(
+        rerank,
+        query=payload.query,
+        hits=fused,
+        top_n=payload.limit,
+    )
+    pruned = await asyncio.to_thread(
+        highlight,
+        query=payload.query,
+        hits=reranked,
+    )
+    return SearchResponse(hits=[_to_search_hit(h) for h in pruned])

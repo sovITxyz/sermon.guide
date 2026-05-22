@@ -29,6 +29,15 @@ dependencies = [
   # torch source override below mirrors worker/ for the same reason
   # (Phase 5 row): the default PyPI wheel ships ~2GB of CUDA libraries
   # we'd never use on api hardware.
+  #
+  # Phase 13 adds two more models that ride on the same sentence-transformers
+  # install (no new pyproject entry needed — both classes are exported by
+  # sentence-transformers ≥3): `cross-encoder/ms-marco-MiniLM-L-6-v2`
+  # (~90MB, via `sentence_transformers.CrossEncoder`) for top-30 → top-N
+  # reranking; `BAAI/bge-m3` (~2.3GB, via `sentence_transformers.SentenceTransformer`)
+  # for sentence-level context pruning. Both load lazily per process via
+  # `@lru_cache` so import-time / lint / test cost stays free until the
+  # first reranked /search.
   "pymilvus>=2.6,<3",
   "sentence-transformers>=3,<6",
   "torch>=2.5,<3",
@@ -83,6 +92,6 @@ pythonVersion = "3.12"
 # `db` and friends live in `../worker`; same rationale as the pytest
 # pythonpath above.
 extraPaths = ["../worker"]
-include = ["main.py", "auth.py", "uploads.py", "search.py", "settings.py", "tasks_client.py", "tests"]
+include = ["main.py", "auth.py", "uploads.py", "search.py", "rerank.py", "highlight.py", "settings.py", "tasks_client.py", "tests"]
 venvPath = "."
 venv = ".venv"

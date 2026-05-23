@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +40,14 @@ class ApiSettings(BaseSettings):
     upload_max_bytes: int = 200 * 1024 * 1024
 
     cors_origins: list[str] = ["http://localhost:3000"]
+
+    # Gemini summary agent (Phase 14). The google-genai SDK's own env var is
+    # the *unprefixed* GOOGLE_API_KEY; the explicit ``validation_alias`` makes
+    # this one field bypass the ``SERMON_API_`` prefix above so we read exactly
+    # that name (matches the SDK default + the phase spec + infra/.env.example).
+    # ``None`` until configured — the /search-summary route raises a clear 503
+    # rather than letting an unconfigured key surface as an opaque SDK error.
+    google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY")
 
 
 settings = ApiSettings()

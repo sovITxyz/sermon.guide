@@ -42,6 +42,15 @@ dependencies = [
   "sentence-transformers>=3,<6",
   "torch>=2.5,<3",
   "numpy>=2,<3",
+  # Phase 14: the /search-summary endpoint synthesizes a grounded 1–2
+  # paragraph answer over the reranked + sentence-pruned chunks with Gemini
+  # 1.5 Flash. `google-genai` is Google's unified GenAI SDK
+  # (`from google import genai`); it reads the API key from the *unprefixed*
+  # GOOGLE_API_KEY env var (settings.py threads it through an explicit alias;
+  # infra/.env.example documents it). Unlike the three sentence-transformers
+  # models above, nothing loads in-process — this is a network call to the
+  # Gemini API, so no pin-lockstep-with-worker concern applies.
+  "google-genai>=1,<2",
 ]
 
 [dependency-groups]
@@ -92,6 +101,6 @@ pythonVersion = "3.12"
 # `db` and friends live in `../worker`; same rationale as the pytest
 # pythonpath above.
 extraPaths = ["../worker"]
-include = ["main.py", "auth.py", "uploads.py", "search.py", "rerank.py", "highlight.py", "settings.py", "tasks_client.py", "tests"]
+include = ["main.py", "auth.py", "uploads.py", "search.py", "summary.py", "rerank.py", "highlight.py", "settings.py", "tasks_client.py", "tests"]
 venvPath = "."
 venv = ".venv"

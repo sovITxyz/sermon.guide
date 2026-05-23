@@ -4,8 +4,8 @@ version = "0.0.0"
 description = "sermon.guide FastAPI HTTP layer — auth, upload, task status, search."
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "fastapi>=0.115,<0.120",
-  "uvicorn[standard]>=0.32,<0.40",
+  "fastapi>=0.115,<0.137",
+  "uvicorn[standard]>=0.32,<0.48",
   # `pydantic[email]` pulls email-validator, required by `EmailStr` fields
   # in the auth schemas. Without it pydantic raises on model definition.
   "pydantic[email]>=2,<3",
@@ -14,13 +14,13 @@ dependencies = [
   # removed; the warning is noisy but harmless. Pinning bcrypt<4.1 keeps
   # the runtime clean until passlib ships a fix.
   "passlib[bcrypt]>=1.7,<2",
-  "bcrypt>=4.0,<4.1",
+  "bcrypt>=4.0,<5.1",
   "python-multipart>=0.0.20,<1",
   "sqlalchemy[asyncio]>=2.0,<3",
-  "asyncpg>=0.30,<0.31",
+  "asyncpg>=0.30,<0.32",
   "pydantic-settings>=2.6,<3",
   "celery>=5.4,<6",
-  "redis>=5,<7",
+  "redis>=5,<8",
   # Phase 11: search endpoint embeds queries with BGE-Large and runs a
   # filtered Milvus search in-process. Pins must stay aligned with
   # `worker/pyproject.toml` — both processes load the same model from the
@@ -38,7 +38,7 @@ dependencies = [
   # for sentence-level context pruning. Both load lazily per process via
   # `@lru_cache` so import-time / lint / test cost stays free until the
   # first reranked /search.
-  "pymilvus>=2.6,<3",
+  "pymilvus>=2.6,<4",
   "sentence-transformers>=3,<6",
   "torch>=2.5,<3",
   "numpy>=2,<3",
@@ -58,7 +58,7 @@ dev = [
   "httpx>=0.27,<1",
   "pyright",
   "pytest",
-  "pytest-asyncio>=0.24,<1",
+  "pytest-asyncio>=0.24,<2",
   "ruff",
 ]
 

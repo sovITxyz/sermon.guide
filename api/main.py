@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import auth
 import search
+import summary
 import uploads
 from settings import settings
 
@@ -32,6 +33,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(uploads.router)
 app.include_router(search.router)
+app.include_router(summary.router)
 
 
 @app.get("/healthz", tags=["meta"])

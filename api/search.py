@@ -120,6 +120,7 @@ from retrieval import (
 )
 from scripts.bootstrap_milvus import make_client
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import CurrentUserDep, SessionDep
 from highlight import highlight
@@ -195,6 +196,68 @@ def _to_search_hit(hit: RetrievalHit) -> SearchHit:
     )
 
 
+async def run_search(
+    *,
+    query: str,
+    limit: int,
+    do_rerank: bool,
+    user_id: uuid.UUID,
+    session: AsyncSession,
+) -> list[SearchHit]:
+    """Hybrid → (rerank → highlight) retrieval over *user_id*'s library, minus HTTP.
+
+    The reusable core of ``POST /search``. Phase 14's ``/search-summary``
+    (``api/summary.py``) calls this with ``do_rerank=True`` to feed Gemini
+    the same reranked + sentence-pruned context the canonical pipeline
+    produces (ARCHITECTURE.md §5) — without re-implementing rerank/highlight
+    or round-tripping through the HTTP handler.
+
+    Tenant scoping is identical to the handler and just as load-bearing:
+    *user_id* MUST be the JWT-derived ``current_user.user_id`` (never a
+    client-supplied value), and the ``book_id`` set is resolved server-side
+    from ``user_library`` for that user. An empty library short-circuits to
+    ``[]`` before any embedding or model load.
+    """
+    stmt = select(UserLibraryEntry.book_id).where(
+        UserLibraryEntry.user_id == user_id,
+    )
+    book_ids: list[uuid.UUID] = list((await session.execute(stmt)).scalars().all())
+    if not book_ids:
+        return []
+
+    dense_hits, sparse_hits = await asyncio.gather(
+        _dense_arm(query, book_ids),
+        bm25_search(
+            session=session,
+            query=query,
+            book_ids=book_ids,
+            limit=SPARSE_FANOUT,
+        ),
+    )
+    # Fan-out depends on whether the post-retrieval stages run: keep 30
+    # so the cross-encoder has the full recall pool to reorder; cap at
+    # `limit` when skipping rerank so we don't ship more rows than the
+    # caller asked for.
+    fused_limit = RERANK_FANOUT if do_rerank else limit
+    fused = rrf_fuse(dense=dense_hits, sparse=sparse_hits, limit=fused_limit)
+
+    if not do_rerank:
+        return [_to_search_hit(h) for h in fused]
+
+    reranked = await asyncio.to_thread(
+        rerank,
+        query=query,
+        hits=fused,
+        top_n=limit,
+    )
+    pruned = await asyncio.to_thread(
+        highlight,
+        query=query,
+        hits=reranked,
+    )
+    return [_to_search_hit(h) for h in pruned]
+
+
 @router.post("", response_model=SearchResponse)
 async def search(
     payload: SearchRequest,
@@ -203,46 +266,18 @@ async def search(
 ) -> SearchResponse:
     """Top-K hybrid search over the authenticated user's library.
 
-    When ``payload.rerank`` is true (default), the top-30 fused list
-    flows through the cross-encoder reranker (→ top ``limit``) and
-    BGE-M3 sentence-level pruning (drops sentences below threshold
-    0.5). When false, the raw RRF top-K is returned (Phase 12 behavior).
+    Thin HTTP wrapper over ``run_search`` — see that function for the
+    pipeline and the tenant-scoping contract. When ``payload.rerank`` is
+    true (default), the top-30 fused list flows through the cross-encoder
+    reranker (→ top ``limit``) and BGE-M3 sentence-level pruning (drops
+    sentences below threshold 0.5). When false, the raw RRF top-K is
+    returned (Phase 12 behavior).
     """
-    stmt = select(UserLibraryEntry.book_id).where(
-        UserLibraryEntry.user_id == current_user.user_id,
-    )
-    book_ids: list[uuid.UUID] = list((await session.execute(stmt)).scalars().all())
-    if not book_ids:
-        return SearchResponse(hits=[])
-
-    dense_hits, sparse_hits = await asyncio.gather(
-        _dense_arm(payload.query, book_ids),
-        bm25_search(
-            session=session,
-            query=payload.query,
-            book_ids=book_ids,
-            limit=SPARSE_FANOUT,
-        ),
-    )
-    # Fan-out depends on whether the post-retrieval stages run: keep 30
-    # so the cross-encoder has the full recall pool to reorder; cap at
-    # `limit` when skipping rerank so we don't ship more rows than the
-    # client asked for.
-    fused_limit = RERANK_FANOUT if payload.rerank else payload.limit
-    fused = rrf_fuse(dense=dense_hits, sparse=sparse_hits, limit=fused_limit)
-
-    if not payload.rerank:
-        return SearchResponse(hits=[_to_search_hit(h) for h in fused])
-
-    reranked = await asyncio.to_thread(
-        rerank,
+    hits = await run_search(
         query=payload.query,
-        hits=fused,
-        top_n=payload.limit,
+        limit=payload.limit,
+        do_rerank=payload.rerank,
+        user_id=current_user.user_id,
+        session=session,
     )
-    pruned = await asyncio.to_thread(
-        highlight,
-        query=payload.query,
-        hits=reranked,
-    )
-    return SearchResponse(hits=[_to_search_hit(h) for h in pruned])
+    return SearchResponse(hits=hits)

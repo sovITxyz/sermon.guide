@@ -20,13 +20,13 @@ dependencies = [
   "torch>=2.5,<3",
   "sqlalchemy[asyncio]>=2.0,<3",
   "alembic>=1.13,<2",
-  "asyncpg>=0.30,<0.31",
+  "asyncpg>=0.30,<0.32",
   "pydantic-settings>=2.6,<3",
   "datasketch>=1.10.0",
   "nltk>=3.9.4",
   "psycopg[binary]>=3,<4",
   "celery>=5.4,<6",
-  "redis>=5,<7",
+  "redis>=5,<9",
 ]
 
 [dependency-groups]

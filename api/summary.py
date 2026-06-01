@@ -114,9 +114,7 @@ _MAX_OUTPUT_TOKENS = 768
 # bloat every marker in the prompt.
 _MAX_LABEL_LEN = 80
 
-_NO_CONTEXT_MESSAGE = (
-    "I couldn't find anything in your library that addresses that question."
-)
+_NO_CONTEXT_MESSAGE = "I couldn't find anything in your library that addresses that question."
 
 _SYSTEM_INSTRUCTION = (
     "You are a careful research assistant for a personal theological library. "

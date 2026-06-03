@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import auth
+import library
 import search
 import summary
 import uploads
@@ -31,6 +32,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(library.router)
 app.include_router(uploads.router)
 app.include_router(search.router)
 app.include_router(summary.router)

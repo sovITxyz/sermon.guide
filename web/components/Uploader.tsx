@@ -3,7 +3,7 @@
 import { isTerminal, taskLabel, taskPhase } from "@/lib/tasks";
 import type { TaskStatus, UploadAccepted } from "@/lib/types";
 import Link from "next/link";
-import { type DragEvent, useCallback, useRef, useState } from "react";
+import { type DragEvent, useCallback, useEffect, useRef, useState } from "react";
 
 interface UploadItem {
   id: string;
@@ -20,6 +20,18 @@ export function Uploader() {
   const [dragging, setDragging] = useState(false);
   const seq = useRef(0);
 
+  // Tracks whether the component is still mounted so the recursive poll below
+  // stops when the user navigates away mid-ingest. Without this, the
+  // self-rescheduling setTimeout would keep fetching /api/tasks forever (and
+  // setState on an unmounted component) for any non-terminal task.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   const updateItem = useCallback((id: string, patch: Partial<UploadItem>) => {
     setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   }, []);
@@ -27,13 +39,22 @@ export function Uploader() {
   const poll = useCallback(
     (id: string, taskId: string) => {
       const tick = async (): Promise<void> => {
+        if (!mounted.current) {
+          return;
+        }
         try {
           const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+          if (!mounted.current) {
+            return;
+          }
           if (!res.ok) {
             updateItem(id, { error: "Lost track of this upload." });
             return;
           }
           const data = (await res.json()) as TaskStatus;
+          if (!mounted.current) {
+            return;
+          }
           updateItem(id, {
             status: data.status,
             duplicate: data.result?.was_duplicate ?? false,
@@ -42,7 +63,9 @@ export function Uploader() {
             window.setTimeout(() => void tick(), POLL_MS);
           }
         } catch {
-          updateItem(id, { error: "Network error while polling." });
+          if (mounted.current) {
+            updateItem(id, { error: "Network error while polling." });
+          }
         }
       };
       window.setTimeout(() => void tick(), POLL_MS);

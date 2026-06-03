@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in web/*.ts|web/*.tsx|web/**/*.ts|web/**/*.tsx) echo 'NOTE: web typecheck (pnpm tsc --noEmit) and biome wire in at Phase 15.' ;; esac"
+            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in */web/*.ts|*/web/*.tsx) cd \"${file%%/web/*}/web\" && pnpm tsc --noEmit && pnpm biome check \"$file\" ;; esac"
           }
         ]
       }

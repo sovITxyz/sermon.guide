@@ -178,7 +178,13 @@ you change one, change both.
   sentences each through BGE-M3 dominates). Acceptable for sermon prep
   but pushes hard against any future real-time use case; the GPU swap
   in `worker/embedding.py` plus equivalent moves in `rerank.py` /
-  `highlight.py` are the architecture-locked next step.
+  `highlight.py` are the architecture-locked next step. Phase 14b live
+  numbers (dev box, ppq.ai + `google/gemini-2.5-flash`): warm
+  `/search-summary` E2E ≈ 134 s ≈ 71–76 s retrieval+rerank+highlight
+  (this box runs above the ~30 s figure) + ~58–64 s LLM round-trip —
+  Gemini 2.5 Flash runs thinking by default through the
+  OpenAI-compat layer, so the LLM leg is tens of seconds, not the
+  2–3 s a non-thinking flash model would take.
 
 ## Before merging anything in this directory
 

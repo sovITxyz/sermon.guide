@@ -1,8 +1,8 @@
-"""Unit tests for the Gemini summary agent glue (Phase 14).
+"""Unit tests for the LLM summary agent glue (Phase 14; transport re-cut in Phase 14b).
 
-Live Gemini calls + live retrieval are out of scope here — they need a
-GOOGLE_API_KEY, a populated Milvus/Postgres, and ~30 s of CPU rerank (see the
-Phase 14 verify notes in docs/PHASES.md). This file pins the deterministic
+Live LLM calls + live retrieval are out of scope here — they need a real
+provider key, a populated Milvus/Postgres, and ~30 s of CPU rerank (see the
+Phase 14/14b verify notes in docs/PHASES.md). This file pins the deterministic
 glue with every I/O seam monkeypatched: no network, no key, no DB, no model
 load.
 
@@ -13,11 +13,18 @@ load.
 - `_extract_citations` returns only markers present in the summary, in
   first-appearance order, and never an invented one — markers are
   bracket-delimited, so `[X:1]` cannot match inside `[X:12]`.
-- `_generate_summary` wires the grounding config + prompt and fails loud (502)
-  on an upstream error or empty candidate.
+- `_generate_summary` wires the system+user messages, the sampling knobs, and
+  the active provider's pinned model through `chat.completions.create`, and
+  fails loud (502) on an upstream `openai.APIError`, an empty completion, or
+  a choices-less response.
+- Provider resolution (Phase 14b, ADR 0005): default is google; flipping to
+  ppq picks the ppq base_url/model/key; SERMON_API_LLM_MODEL overrides the
+  model id; the 503 guard names the ACTIVE provider's missing env var and
+  never silently cross-pairs one provider with the other's key.
 - The handler forces the full pipeline (`do_rerank=True`) with the JWT
-  user_id, 503s when GOOGLE_API_KEY is unset *before* retrieval, and returns
-  the deterministic no-context message (no LLM call) when nothing is retrieved.
+  user_id, 503s when the active provider's key is unset *before* retrieval,
+  and returns the deterministic no-context message (no LLM call) when nothing
+  is retrieved.
 """
 
 # Tests reach into module internals on purpose and pass duck-typed fakes where
@@ -30,39 +37,59 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import httpx
+import openai
 import pytest
 from fastapi import HTTPException
-from google.genai import errors
 from pydantic import ValidationError
 
 import summary as summary_module
 from search import SearchHit
+from settings import ApiSettings
 
 # --- fakes -----------------------------------------------------------------
 
 
+class _FakeMessage:
+    def __init__(self, content: str | None) -> None:
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content: str | None) -> None:
+        self.message = _FakeMessage(content)
+
+
 class _FakeResponse:
-    def __init__(self, text: str | None) -> None:
-        self.text = text
+    def __init__(self, content: str | None, *, no_choices: bool = False) -> None:
+        self.choices: list[_FakeChoice] = [] if no_choices else [_FakeChoice(content)]
 
 
-class _FakeModels:
-    """Stand-in for ``client.models``; records calls, returns / raises on demand."""
+class _FakeCompletions:
+    """Stand-in for ``client.chat.completions``; records calls, returns / raises on demand."""
 
     def __init__(
         self,
-        text: str | None = "A grounded answer.",
-        raise_exc: Exception | None = None,
+        text: str | None,
+        raise_exc: Exception | None,
+        *,
+        no_choices: bool,
     ) -> None:
         self._text = text
         self._raise_exc = raise_exc
+        self._no_choices = no_choices
         self.calls: list[dict[str, Any]] = []
 
-    def generate_content(self, *, model: str, contents: str, config: Any) -> _FakeResponse:  # noqa: ANN401
-        self.calls.append({"model": model, "contents": contents, "config": config})
+    def create(self, **kwargs: Any) -> _FakeResponse:  # noqa: ANN401
+        self.calls.append(kwargs)
         if self._raise_exc is not None:
             raise self._raise_exc
-        return _FakeResponse(self._text)
+        return _FakeResponse(self._text, no_choices=self._no_choices)
+
+
+class _FakeChat:
+    def __init__(self, completions: _FakeCompletions) -> None:
+        self.completions = completions
 
 
 class _FakeClient:
@@ -70,8 +97,15 @@ class _FakeClient:
         self,
         text: str | None = "A grounded answer.",
         raise_exc: Exception | None = None,
+        *,
+        no_choices: bool = False,
     ) -> None:
-        self.models = _FakeModels(text, raise_exc)
+        self.chat = _FakeChat(_FakeCompletions(text, raise_exc, no_choices=no_choices))
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        """Recorded ``chat.completions.create`` kwargs."""
+        return self.chat.completions.calls
 
 
 class _FakeUser:
@@ -240,10 +274,12 @@ def test_extract_citations_substring_safety() -> None:
     assert [c.marker for c in cites] == ["[Faith:12]"]
 
 
-# --- gemini call -----------------------------------------------------------
+# --- llm call ----------------------------------------------------------------
 
 
 def test_generate_summary_wires_config_and_returns_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
+    monkeypatch.setattr(summary_module.settings, "llm_model", None)
     fake = _FakeClient(text="  A grounded answer [Faith:0].  ")
     monkeypatch.setattr(summary_module, "_client", lambda: fake)
     sources = summary_module._build_sources(
@@ -254,17 +290,24 @@ def test_generate_summary_wires_config_and_returns_text(monkeypatch: pytest.Monk
     out = summary_module._generate_summary(query="q?", sources=sources)
 
     assert out == "A grounded answer [Faith:0]."  # stripped
-    call = fake.models.calls[0]
-    assert call["model"] == summary_module.GEMINI_MODEL
-    assert call["config"].system_instruction == summary_module._SYSTEM_INSTRUCTION
-    assert call["config"].temperature == summary_module._TEMPERATURE
-    assert call["config"].max_output_tokens == summary_module._MAX_OUTPUT_TOKENS
-    assert "[Faith:0]" in call["contents"]
-    assert "q?" in call["contents"]
+    call = fake.calls[0]
+    # The pinned google-arm default (ADR 0005) — bare id, no "google/" prefix.
+    assert call["model"] == "gemini-2.5-flash"
+    assert call["temperature"] == summary_module._TEMPERATURE
+    assert call["max_tokens"] == summary_module._MAX_OUTPUT_TOKENS
+    system, user = call["messages"]
+    assert system == {"role": "system", "content": summary_module._SYSTEM_INSTRUCTION}
+    assert user["role"] == "user"
+    assert "[Faith:0]" in user["content"]
+    assert "q?" in user["content"]
 
 
 def test_generate_summary_raises_502_on_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    exc = errors.APIError(503, {"error": {"message": "down", "status": "UNAVAILABLE"}})
+    exc = openai.APIError(
+        "down",
+        httpx.Request("POST", "https://api.ppq.ai/v1/chat/completions"),
+        body=None,
+    )
     fake = _FakeClient(raise_exc=exc)
     monkeypatch.setattr(summary_module, "_client", lambda: fake)
     sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
@@ -288,11 +331,23 @@ def test_generate_summary_raises_502_on_empty_text(
     assert excinfo.value.status_code == 502
 
 
+def test_generate_summary_raises_502_on_empty_choices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gateway 200 with no choices (e.g. fully safety-blocked) is a 502, not an IndexError."""
+    fake = _FakeClient(no_choices=True)
+    monkeypatch.setattr(summary_module, "_client", lambda: fake)
+    sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
+
+    with pytest.raises(HTTPException) as excinfo:
+        summary_module._generate_summary(query="q", sources=sources)
+    assert excinfo.value.status_code == 502
+
+
 # --- handler ---------------------------------------------------------------
 
 
 async def test_handler_503_when_key_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing key → 503 *before* retrieval (don't burn ~30s of CPU rerank)."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
     monkeypatch.setattr(summary_module.settings, "google_api_key", None)
     called = {"run_search": False}
 
@@ -311,10 +366,13 @@ async def test_handler_503_when_key_unset(monkeypatch: pytest.MonkeyPatch) -> No
             session=session,
         )
     assert excinfo.value.status_code == 503
+    # The detail names the ACTIVE provider's missing env var (Phase 14b).
+    assert "GOOGLE_API_KEY" in excinfo.value.detail
     assert called["run_search"] is False
 
 
 async def test_handler_no_context_message_when_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
     monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
     gen_called = {"x": False}
 
@@ -343,6 +401,7 @@ async def test_handler_no_context_message_when_empty(monkeypatch: pytest.MonkeyP
 async def test_handler_happy_path_forces_rerank_and_extracts_citations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
     monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
     user = _FakeUser()
     b1 = uuid.UUID(int=1)
@@ -394,3 +453,109 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
     assert resp.citations[0].book_id == b1
     assert resp.citations[0].chunk_index == 7
     assert resp.citations[0].title == "Romans"
+
+
+# --- provider resolution (Phase 14b, ADR 0005) -------------------------------
+
+
+def test_provider_defaults_to_google(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh env (no SERMON_API_LLM_* vars) resolves to the google arm."""
+    monkeypatch.delenv("SERMON_API_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("SERMON_API_LLM_MODEL", raising=False)
+    fresh = ApiSettings()
+    assert fresh.llm_provider == "google"
+    assert fresh.llm_model is None
+
+
+def test_provider_map_pins_endpoints_models_keys() -> None:
+    """``_PROVIDERS`` is the single source of truth — pin every cell (ADR 0005)."""
+    google = summary_module._PROVIDERS["google"]
+    assert google.base_url == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert google.default_model == "gemini-2.5-flash"
+    assert google.key_env_var == "GOOGLE_API_KEY"
+    ppq = summary_module._PROVIDERS["ppq"]
+    assert ppq.base_url == "https://api.ppq.ai/v1"
+    assert ppq.default_model == "google/gemini-2.5-flash"
+    assert ppq.key_env_var == "PPQ_API_KEY"
+
+
+def test_ppq_flip_constructs_client_with_ppq_base_url_and_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """provider=ppq → the real client is built against ppq.ai with PPQ_API_KEY."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "ppq")
+    monkeypatch.setattr(summary_module.settings, "ppq_api_key", "pk-test")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", None)
+    summary_module._client.cache_clear()
+    try:
+        client = summary_module._client()
+        assert str(client.base_url).rstrip("/") == "https://api.ppq.ai/v1"
+        assert client.api_key == "pk-test"
+    finally:
+        # Never leak a cached test client into another test's process state.
+        summary_module._client.cache_clear()
+
+
+def test_ppq_flip_uses_ppq_default_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """provider=ppq → the "google/"-prefixed catalog spelling, not the bare id."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "ppq")
+    monkeypatch.setattr(summary_module.settings, "llm_model", None)
+    fake = _FakeClient()
+    monkeypatch.setattr(summary_module, "_client", lambda: fake)
+    sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
+
+    summary_module._generate_summary(query="q", sources=sources)
+
+    assert fake.calls[0]["model"] == "google/gemini-2.5-flash"
+
+
+def test_llm_model_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SERMON_API_LLM_MODEL beats the active provider's default."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "ppq")
+    monkeypatch.setattr(summary_module.settings, "llm_model", "google/gemini-2.5-flash-lite")
+    fake = _FakeClient()
+    monkeypatch.setattr(summary_module, "_client", lambda: fake)
+    sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
+
+    summary_module._generate_summary(query="q", sources=sources)
+
+    assert fake.calls[0]["model"] == "google/gemini-2.5-flash-lite"
+
+
+async def test_handler_503_detail_names_ppq_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """provider=ppq, key unset → 503 names PPQ_API_KEY; a configured
+    GOOGLE_API_KEY must not satisfy the ppq arm (no silent cross-pairing)."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "ppq")
+    monkeypatch.setattr(summary_module.settings, "ppq_api_key", None)
+    monkeypatch.setattr(summary_module.settings, "google_api_key", "gk")
+    user: Any = _FakeUser()
+    session: Any = object()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await summary_module.search_summary(
+            payload=summary_module.SummaryRequest(query="q"),
+            current_user=user,
+            session=session,
+        )
+    assert excinfo.value.status_code == 503
+    assert "PPQ_API_KEY" in excinfo.value.detail
+
+
+async def test_handler_503_ppq_key_does_not_satisfy_google_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mirror image: provider=google ignores a configured PPQ_API_KEY."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", None)
+    monkeypatch.setattr(summary_module.settings, "ppq_api_key", "pk")
+    user: Any = _FakeUser()
+    session: Any = object()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await summary_module.search_summary(
+            payload=summary_module.SummaryRequest(query="q"),
+            current_user=user,
+            session=session,
+        )
+    assert excinfo.value.status_code == 503
+    assert "GOOGLE_API_KEY" in excinfo.value.detail

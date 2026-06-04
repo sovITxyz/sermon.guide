@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in worker/*.py|*/worker/*.py) uv run --project worker ruff check --fix \"$file\" && uv run --project worker pyright \"$file\" ;; api/*.py|*/api/*.py) uv run --project api ruff check --fix \"$file\" && uv run --project api pyright \"$file\" ;; esac"
+            "command": "file=$(jq -r '.tool_input.file_path // \"\"'); case \"$file\" in worker/*.py|*/worker/*.py) uv run --project worker ruff check --fix \"$file\" && uv run --project worker pyright \"$file\" && uv run --project worker ruff format \"$file\" ;; api/*.py|*/api/*.py) uv run --project api ruff check --fix \"$file\" && uv run --project api pyright \"$file\" && uv run --project api ruff format \"$file\" ;; esac"
           }
         ]
       },

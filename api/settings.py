@@ -15,6 +15,7 @@ default. Keep it required-in-spirit: never ship the default to prod.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -41,13 +42,25 @@ class ApiSettings(BaseSettings):
 
     cors_origins: list[str] = ["http://localhost:3000"]
 
-    # Gemini summary agent (Phase 14). The google-genai SDK's own env var is
-    # the *unprefixed* GOOGLE_API_KEY; the explicit ``validation_alias`` makes
-    # this one field bypass the ``SERMON_API_`` prefix above so we read exactly
-    # that name (matches the SDK default + the phase spec + infra/.env.example).
-    # ``None`` until configured — the /search-summary route raises a clear 503
-    # rather than letting an unconfigured key surface as an opaque SDK error.
+    # LLM summary agent (Phase 14, transport re-cut in Phase 14b / ADR 0005).
+    # ``llm_provider`` picks which OpenAI-compatible endpoint /search-summary
+    # talks to; the per-provider base_url / default model / key live in
+    # ``summary.py:_PROVIDERS`` (single source of truth).
+    llm_provider: Literal["google", "ppq"] = "google"
+
+    # Optional model-id override (SERMON_API_LLM_MODEL); ``None`` → the active
+    # provider's default. Spell it the provider's way — bare ``gemini-2.5-flash``
+    # on google, prefixed ``google/gemini-2.5-flash`` on ppq.
+    llm_model: str | None = None
+
+    # Both keys are read *unprefixed* via an explicit ``validation_alias`` that
+    # bypasses the ``SERMON_API_`` prefix above: GOOGLE_API_KEY is the name
+    # Google's docs and SDKs use, PPQ_API_KEY is the literal name ppq.ai's docs
+    # use (and both match infra/.env.example). ``None`` until configured — the
+    # /search-summary route raises a clear 503 naming the missing var rather
+    # than letting an unconfigured key surface as an opaque SDK error.
     google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY")
+    ppq_api_key: str | None = Field(default=None, validation_alias="PPQ_API_KEY")
 
 
 settings = ApiSettings()

@@ -42,15 +42,18 @@ dependencies = [
   "sentence-transformers>=3,<6",
   "torch>=2.5,<3",
   "numpy>=2,<3",
-  # Phase 14: the /search-summary endpoint synthesizes a grounded 1–2
-  # paragraph answer over the reranked + sentence-pruned chunks with Gemini
-  # 1.5 Flash. `google-genai` is Google's unified GenAI SDK
-  # (`from google import genai`); it reads the API key from the *unprefixed*
-  # GOOGLE_API_KEY env var (settings.py threads it through an explicit alias;
-  # infra/.env.example documents it). Unlike the three sentence-transformers
-  # models above, nothing loads in-process — this is a network call to the
-  # Gemini API, so no pin-lockstep-with-worker concern applies.
-  "google-genai>=1,<2",
+  # Phase 14 (transport re-cut in Phase 14b / ADR 0005): the /search-summary
+  # endpoint synthesizes a grounded 1–2 paragraph answer over the reranked +
+  # sentence-pruned chunks with Gemini Flash, reached through the `openai`
+  # SDK as a config-driven OpenAI-compatible chat-completions transport —
+  # Google's compat endpoint (default) or the ppq.ai gateway, selected by
+  # SERMON_API_LLM_PROVIDER (summary.py:_PROVIDERS is the provider map; the
+  # unprefixed GOOGLE_API_KEY / PPQ_API_KEY env vars thread through explicit
+  # aliases in settings.py; infra/.env.example documents all of it). Unlike
+  # the three sentence-transformers models above, nothing loads in-process —
+  # this is a network call either way, so no pin-lockstep-with-worker
+  # concern applies.
+  "openai>=2,<3",
 ]
 
 [dependency-groups]

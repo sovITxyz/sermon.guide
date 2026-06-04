@@ -21,7 +21,7 @@ chunks in their own books.
 | Aggregate vectors      | low billions across all tenants             |
 | p95 search latency     | < 50ms (vector) / < 1s (search-summary E2E) |
 | Cost (base infra, v0)  | ~$50/mo on a small K8s cluster              |
-| LLM inference          | Pay-per-token (Gemini 1.5 Flash)            |
+| LLM inference          | Pay-per-token (Gemini Flash)                |
 
 These are the numbers the architecture is designed for. v0 will not actually be
 deployed at this scale; the point is that no decision below should preclude
@@ -46,7 +46,7 @@ either an [Open Question](#7-open-questions) or out of scope for v0.
 | Search (retrieval)    | Hybrid: dense BGE + sparse BM25, fused via RRF (k=60)   | Themes via dense, names/refs via sparse; RRF avoids score normalization |
 | Reranking             | Cross-encoder (ms-marco-MiniLM-L-6-v2) on top-30 → top-10 | Precision pass before LLM context; cheap                              |
 | Context pruning       | BGE-M3 semantic highlighting, sentence-level, threshold 0.5 | 70–80% token reduction into the LLM                                  |
-| LLM                   | Gemini 1.5 Flash                                        | Cheapest high-context model; 2M token window for synthesis              |
+| LLM                   | Gemini Flash (2.5 at v0) over an OpenAI-compatible transport (ADR 0005) | Cheapest high-context model; provider-portable chat-completions shape   |
 | Frontend              | Next.js 15 (app router) + Tailwind, TypeScript strict   | Server components keep JWT in HttpOnly cookies, never in browser JS     |
 | Raw file storage      | Cloudflare R2 or Backblaze B2 (S3-compatible)           | Cheap object storage for the originals; Postgres only stores pointers   |
 
@@ -147,7 +147,7 @@ search-summary:
     → RRF fuse                                        → top-30
     → cross-encoder rerank                            → top-10
     → BGE-M3 sentence highlighting (drop < 0.5)       → pruned context
-    → Gemini 1.5 Flash with citation prompt           → {summary, citations}
+    → Gemini Flash with citation prompt (ADR 0005)    → {summary, citations}
 ```
 
 ## 6. Out of scope for v0

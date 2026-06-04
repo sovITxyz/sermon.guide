@@ -22,6 +22,7 @@ After each phase commit, tick the box and append: completion date, branch name, 
 - [x] Phase 13 — Cross-encoder rerank + semantic highlighting (completed 2026-05-22, branch `phase-13/rerank-highlight`. `api/rerank.py` ships a `cross-encoder/ms-marco-MiniLM-L-6-v2` reranker (~90 MB, lazy `@lru_cache` like `worker.embedding._model`) that takes a `Sequence[RetrievalHit]` from the Phase 12 hybrid arm and reorders top-30 → top-N by cross-encoder relevance score. `api/highlight.py` ships a `BAAI/bge-m3` dense-head highlighter (~2.3 GB, same lazy singleton pattern) that splits each retained chunk into sentences via regex (`(?<=[.!?])\s+(?=[A-Z\"'“‘])` — see module docstring on tradeoffs vs `pysbd` / NLTK `punkt_tab`), scores sentences against the query in one batched encode, and drops sentences below threshold 0.5 (architecture-locked). `api/search.py` rewired: dense + sparse → `asyncio.gather` → `rrf_fuse(limit=RERANK_FANOUT if rerank else payload.limit)` → if rerank=true, `await asyncio.to_thread(rerank)` → `await asyncio.to_thread(highlight)`. New `rerank: bool = True` payload field — default true so the /search pipeline matches ARCHITECTURE.md §5 canonical lifecycle (hybrid → rerank → highlight) and Phase 14's `/search-summary` will get pre-pruned context without a flag; set false to compare against raw RRF for debugging. `SearchHit.score` semantics shifted again (Phase 11 COSINE → Phase 12 RRF → Phase 13 cross-encoder relevance when rerank=true, RRF when false); previous-stage scores survive on `metadata["rrf_score"]` (added by reranker) and `metadata["sentences_kept" / "sentences_total"]` (added by highlighter). Per-arm `dense_score` / `sparse_score` remain on the internal `RetrievalHit` but are not in the public schema. No new pyproject deps — both new classes (`CrossEncoder`, `SentenceTransformer`) are exported by the existing `sentence-transformers>=3` install; `api/AGENTS.md` carries the model surface (a table of three models + ~3.7 GB cold-load cost, plus a new Open Trust Gap noting the missing graceful degradation if any of the three models fail) and confirms the new modules are post-retrieval (no DB/Milvus surface). 19 new unit tests (api/tests/test_rerank_unit.py + test_highlight_unit.py) pin the deterministic glue with a monkeypatched `_model`: empty-input short-circuits (model is never loaded), top-N truncation, stable tiebreak on equal scores, RRF→metadata preservation, threshold inclusivity, whole-chunk-pruned hits dropped from output, unsplittable-chunk passthrough, sentence order preservation, prune-ratio metadata, existing-metadata-key preservation. Verify: `make test-isolation` 3/3 PASSED post-Phase-13 (load-bearing — Phase 3 hard gate); `make test-retrieval-golden` 9/9 PASSED in 4:42 wall (faster than Phase 12's 11:25 cold-ingest because the 5-book corpus is already in Milvus + chunks + Postgres); 34/34 api unit tests PASSED (19 new + 15 existing). The golden harness exercises the Phase 12 hybrid path (`hybrid_search_sync`), **not** rerank/highlight, so "reranking should improve hit rate, not degrade it" was checked separately: all 8 golden queries were re-run through the live rerank=true /search pipeline as phase12-a (owns the full corpus) — **8/8 still surface the expected book, and the expected book is rank 1 for 7 of 8 (rank 2 for the trilemma)**, i.e. rerank *tightens* precision rather than dropping recall. Result counts shrink under highlight pruning (trilemma 9, Groeschel 3, the rest 8–10) but no expected book is pruned out; the earlier "grace → 1 hit" collapse was specific to weak-match queries, not the strong-match goldens. Live API e2e against `phase12-a@example.com` (5-book corpus): (a) Lewis trilemma paraphrase — rerank=false returned top-3 [Mere Christianity 15407c, Mere Christianity 2220c, Groeschel 216c (false positive)] at RRF 0.0287/0.0164/0.0161; rerank=true returned top-3 [Mere Christianity 110c / 497c / 281c, all kept ratios 1/9, 9/186, 4/20] at cross-encoder relevance -3.37/-3.63/-3.73. Token reduction 17843 → 888 chars = **95% drop** (well past the 70–80% architecture target). The Groeschel false-positive at #3 was demoted out of the top-K and replaced with on-topic Mere Christianity chunks. (b) Theodore Roosevelt no-corpus-match query — rerank=false returned 5 garbage hits (copyright boilerplate, "ed." (4 chars), HTML frontmatter, tangential Alexander the Great mention, apologetics references) at RRF 0.0154–0.0164; rerank=true returned **0 hits** (cross-encoder scored every chunk so low that BGE-M3 highlighting then pruned every sentence below 0.5). This is the audit-flagged "dense FPs at 0.5–0.6 COSINE that RRF cannot suppress" failure mode from Phase 12; rerank + highlight is the architectural fix and it works as designed. (c) BM25-strength query "Groeschel" — rerank=true returned 2 hits, both correctly from the Groeschel book at cross-encoder relevance 4.30 / 1.55. (d) Tenant widening attempt — phase12-b (empty library) injected `user_id` + `book_ids` fields targeting phase12-a's data; returned `hits=[]`, JWT-derived user_id wins, Pydantic silently dropped extras. Tenant audit clean (`tenant-auditor` subagent walkthrough + isolation test re-verified inside the audit); `/security-review` clean (no HIGH or MEDIUM findings). Latency cost: warm /search with rerank=true is ~30 s vs ~1 s for rerank=false on CPU — BGE-M3 sentence scoring dominates (10 chunks × ~30 sentences). Acceptable for sermon prep (user is reading, not chatting); architecture-locked GPU swap is the path forward. Phase 12 carry-forwards revisited: (i) `asyncio.gather` graceful-degradation still deferred — Phase 13 adds two more sequential model calls that also raise to 500 on failure; same fail-loud posture, documented in the new "Open trust gap" row. (ii) Orphan rows (`13b3bd17` + 3 orphan Milvus book_ids) — not tenant-reachable; left as-is, no Phase 13 reason to touch them. (iii) The "Theodore Roosevelt" scenario explicitly tested — rerank+highlight is the answer, see verify (b) above.)
 - [x] Phase 14 — Gemini 1.5 Flash summary agent (completed 2026-05-23, branch `phase-14/summary-agent`. New `api/summary.py` ships `POST /search-summary` → `{query, limit_chunks=20}`. Dep added: `google-genai` 1.75.0 (network SDK, no in-process model — so unlike the three sentence-transformers models there is no api↔worker pin-lockstep concern). Retrieval is **reused, not re-implemented**: the Phase 13 `search()` handler body was extracted into `search.run_search(*, query, limit, do_rerank, user_id, session) -> list[SearchHit]` (boolean param named `do_rerank` to avoid shadowing the imported `rerank` fn), and both `/search` and `/search-summary` delegate to it — behavior byte-identical, confirmed by the unchanged retrieval goldens + isolation suite. `/search-summary` calls it with `do_rerank=True` so Gemini receives the full hybrid → RRF → cross-encoder → BGE-M3-pruned context (ARCHITECTURE.md §5). Citation markers are `[book:chunk]`: `book` = `global_books.title` with `[`/`]`/`:` stripped + whitespace collapsed (filename-stem then `book-<id8>` fallbacks), de-collided with `(2)`/`(3)` suffixes so every `(book_id, chunk_index)` maps to exactly one marker; `chunk` = `chunk_index`. Title lookup is a new shared-table query (`select(GlobalBook.book_id, GlobalBook.title).where(book_id.in_(ids))`) keyed only by already-tenant-filtered book_ids — no new tenant surface (`global_books` is shared-by-design, §3/§4; a title is not user-scoped). Grounding system instruction enforces "1–2 paragraphs, cite [book:chunk] inline, use only provided context, say so if it doesn't answer"; temperature 0.2, max_output_tokens 768. Response `{summary, citations}` where `citations` is the subset of source markers that actually appear in the summary text (first-appearance order, de-duped) — invented/paraphrased markers never resolve, so no hallucinated citation is ever returned. Hallucination guard is two-layer: (1) deterministic — empty retrieval (empty library, or every chunk pruned below the highlight threshold for an off-corpus query, e.g. the Phase 12/13 "Theodore Roosevelt" case) returns a fixed "nothing found" message with `citations=[]` and **no LLM call**; (2) instructed — the grounding prompt for weak-but-nonempty context. `GOOGLE_API_KEY` is read *unprefixed* via `Field(validation_alias="GOOGLE_API_KEY")` in `settings.py` (verified empirically that the alias bypasses the `SERMON_API_` prefix); a missing key → 503 **before** the ~30s rerank, not after. The Gemini client is a lazy `@lru_cache` (no key/network at import/lint/test, mirroring the model loaders); `errors.APIError` or an empty candidate → 502; `GEMINI_MODEL = "gemini-1.5-flash"` is the single swap point. `infra/.env.example` documents the key (unprefixed, with rationale); `.claude/settings.json` deny list left **unchanged** — `Read(.env)` + `Read(.env.*)` already cover it (which is also why that template can only be edited by append, not the Read/Edit tools). 22 new unit tests (`api/tests/test_summary_unit.py`, every I/O seam monkeypatched — no key/network/DB/model): marker sanitization + collision de-dup + fallbacks, source ordering, prompt assembly, citation extraction (present-only, first-appearance order, ignores unknown markers, `[X:1]` not matched inside `[X:12]`), Gemini config wiring, 502 on API-error / empty candidate, handler 503-before-retrieval, no-context-no-LLM short-circuit, and a happy path asserting `do_rerank=True` + the JWT `user_id` are passed straight through. Verify: 56/56 api unit tests PASS (34 existing + 22 new), ruff + pyright(strict) clean; `make test-isolation` 3/3 PASS (Phase 3 hard gate, Milvus live); `/check-tenant-leak` grep sweep clean (the request-sourced-id check is empty; the only new query is the shared `global_books` lookup); `tenant-auditor` subagent — no findings; `/security-review` — no findings. **Deviation:** the phase's *live* Verify (real "what does this say about faith" query → grounded output with mapping citations; nothing-in-corpus → no confabulation) was **not run end-to-end** — no `GOOGLE_API_KEY` is set in this environment, so the Gemini round-trip is exercised only by mocked unit tests. The retrieval half is covered live by the Phase 13 goldens + isolation suite; the LLM half needs a key before this can be ticked as live-verified. Latency: warm E2E ≈ ~30 s reranked retrieval (CPU, per the §1 `<1s` target / api/AGENTS.md open gap) + the Gemini round-trip; the architecture-locked GPU swap is the path forward.)
 - [x] Phase 15 — Next.js: auth + library + web/AGENTS.md (completed 2026-06-03, branch `phase-15/web-auth-library`. Stack: Next.js 15.5 App Router, React 19, TypeScript strict (+ `noUncheckedIndexedAccess`, `noImplicitOverride`, `exactOptionalPropertyTypes`), Tailwind v3, Biome, pnpm 9, Vitest. `web/` is fully independent — talks to `api/` over HTTP only, zero Python imports. **Auth model:** the JWT is stored in an **HttpOnly + SameSite=Lax** cookie set by Next route handlers (`app/api/auth/{signup,login,logout}/route.ts`) and never reaches client JS (verified live: the cookie jar marks it `#HttpOnly_`). Every authenticated API call is proxied **server-side** — client components only ever hit same-origin `/api/*` route handlers (login/logout/upload/tasks), and the library is fetched in a server component via `lib/api-server.ts:getLibrary` — with the bearer attached from the cookie. `API_BASE_URL` is server-only (no `NEXT_PUBLIC_`); `lib/config.ts` + `lib/api-server.ts` carry `import "server-only"` so neither the origin nor the token can be inlined into a client bundle. `middleware.ts` is a **presence-only** gate over `/library` + `/upload`; real authorization is the API's 401 → `UnauthenticatedError` → redirect to `/login`. Open-redirect guard `lib/validation.ts:safeRedirectPath` rejects protocol-relative (`//evil`) and backslash (`/\evil`) targets, unit-tested. **Pages:** `/signup`, `/login` (honors `?next=` + `?registered=1`), `/library` (server component → table), `/upload` (drag-drop, optimistic pending row, polls `/api/tasks/{id}`, dedup-aware status labels). Root layout nav reflects auth state + logout. **Cross-package addition:** the library page needed a backend listing that did not exist, so this phase also adds `GET /library` to `api/` (`api/library.py`) — tenant-scoped `user_library ⋈ global_books` by JWT-derived `user_id`, mirroring the audited `search.py` resolve; the `_library_stmt` builder is pinned by a no-DB unit test (`api/tests/test_library_unit.py`) and the path added to `test_smoke.py`. `api/AGENTS.md` unchanged (only new cross-import is `db`, already allowed; route is `CurrentUserDep`-protected). **Tests:** 25 Vitest unit tests over pure helpers (cookie policy, email/password validation, Celery→UI status mapping, redirect guard) — components are covered by the live verify, not jsdom, to keep the dep surface small; 3 api unit tests for the library statement. **CI:** the pre-wired `web` job activates on `web/package.json` (pnpm 9 `--frozen-lockfile` → `tsc --noEmit` → `biome check` → `vitest run`); **no `packageManager` field** in `package.json` (it conflicts with `pnpm/action-setup@v6`'s `version: 9` pin). `next-env.d.ts` is committed at **two** references on purpose — CI runs bare `tsc` without a build, so the `/// <reference path="./.next/types/routes.d.ts" />` line that `next dev`/`next build` appends is intentionally not committed (tsconfig globs `.next/types/**/*.ts` instead, so typed routes load locally and are absent in CI). **Verify:** `pnpm tsc --noEmit` + `pnpm biome check` + `pnpm vitest run` all clean — also re-run with `.next/` removed to mirror a fresh CI checkout; `next build` compiles all 12 routes + middleware. Live e2e against the running stack (Postgres/Redis/Milvus/MinIO healthy; api via `make dev`; web dev server bound `:3001` because an unrelated service held `:3000`): signup→**201**, login→**200** with HttpOnly `sg_session`, `/library` page with cookie→**200** (empty-state), without cookie→**307** `/login?next=%2Flibrary`, upload sample EPUB→**202** `{task_id,…}` (filename sanitized to `10_Answers_for_Atheists.epub`), task poll with cookie→**200** `{PENDING}`, task/upload without cookie→**401**. Direct API check: new user `GET /library`→`{"books":[]}`, no-auth→401. `make test-isolation` 3/3 PASS (Milvus live). `tenant-auditor` subagent — no findings; `/security-review` — no findings (reviewer fuzzed the redirect guard across six bypass variants). **Deviations / follow-ups:** (i) The `web` PostToolUse hook in `.claude/settings.json` was activated after explicit user authorization — the auto-mode classifier first blocked the edit as self-modification of agent startup config (the same block Phase 10 hit for its api hook), then allowed it once the user authorized this specific change. Final command: `cd "${file%%/web/*}/web" && pnpm tsc --noEmit && pnpm biome check "$file"` on `*/web/*.{ts,tsx}` edits — the web dir is derived from the edited file's absolute path because the hook's cwd is not the repo root (an initial `cd web` failed). Verified live: a deliberate `TS2322` probe made the hook block, and a clean tree passes. (ii) The full upload→ingest→**done** status flip was not waited out live — no Celery worker was running and CPU BGE-Large ingest is tens of minutes (unchanged Phase 9/11 behavior); the enqueue + task-status proxy are verified, the ingest itself is the same worker code. (iii) Tailwind v3 (not v4) chosen for setup stability.)
+- [ ] Phase 14b — OpenAI-compatible LLM transport (ppq.ai) + Phase 14 live verify (closes issue #24; must precede Phase 16)
 - [ ] Phase 16 — Next.js: search + summary UI
 
 ---
@@ -596,6 +597,127 @@ Goal: minimal frontend for the auth/upload/library flow. Search UI is Phase 16.
 - Run `/security-review` — fix any reported issues.
 
 Commit. Stop.
+```
+
+---
+
+## Phase 14b — OpenAI-compatible LLM transport (ppq.ai) + Phase 14 live verify
+
+```
+cd to sermon.guide. Read ARCHITECTURE.md §2 + §5, api/AGENTS.md, api/summary.py,
+api/settings.py, and GitHub issue #24 before doing anything.
+
+This phase closes Phase 14's open deviation — the /search-summary LLM
+round-trip has never run live (issue #24) — and MUST land before Phase 16 puts
+UI on top of that endpoint.
+
+## Pre-flight
+- Standard hygiene: git stash list, sync main, branch phase-14b/ppq-llm-transport.
+- Note: the phases-row-flipped CI gate only matches phase-<digits>/ branches,
+  so it skips on 14b — tick the Phase 14b row manually before merging.
+- If the Phase 14b row/section is missing from docs/PHASES.md on main, the
+  planning PR hasn't merged — merge it (docs-only) before branching.
+
+## Researched context (2026-06-04 — re-verify anything that smells stale)
+- ppq.ai (PayPerQ) = pay-as-you-go OpenAI-compatible gateway (card/crypto,
+  ~2¢/query, 10¢ minimum top-up; no Google account needed).
+  - base_url https://api.ppq.ai/v1, auth "Authorization: Bearer <PPQ_API_KEY>",
+    standard chat-completions shape (docs: https://ppq.ai/api-docs).
+  - Public model catalog, no key needed: curl -s https://api.ppq.ai/v1/models
+  - Catalog as of 2026-06-04: google/gemini-2.5-flash ($0.21/$1.75 per 1M
+    in/out), google/gemini-2.5-flash-lite ($0.07/$0.28), google/gemini-2.5-pro,
+    gemini-3-flash-preview, and ~google/gemini-flash-latest (drifting alias —
+    do not pin). All support temperature + max_tokens.
+  - There are NO gemini-1.5-* models anywhere: Gemini 1.5 Flash is retired
+    industry-wide, so Phase 14's GEMINI_MODEL = "gemini-1.5-flash" is dead
+    regardless of transport. That retirement is the forcing function for this
+    phase touching the LLM layer at all.
+- Google's own OpenAI-compatible endpoint also exists:
+  https://generativelanguage.googleapis.com/v1beta/openai/ with bare model ids
+  (gemini-2.5-flash) and the same GOOGLE_API_KEY
+  (docs: https://ai.google.dev/gemini-api/docs/openai). One transport therefore
+  serves both providers.
+
+## Decision — write docs/adr/0005-llm-transport.md (MADR)
+Replace the google-genai SDK with the openai SDK as a single config-driven
+OpenAI-compatible chat-completions transport. Rationale: ppq.ai is OpenAI-shaped
+(google-genai cannot speak to it); Google-direct stays available via its
+OpenAI-compat endpoint, so prod runs the SAME code path the PPQ live-verify
+exercises; the gemini-1.5-flash retirement forces the model constant to change
+anyway. Alternatives to record: two-SDK provider switch (rejected: two error
+paths, and the google-genai arm would stay forever-unverified); raw httpx
+(rejected: hand-rolled retries/types for no gain). Update ARCHITECTURE.md §2
+LLM row: "Gemini 1.5 Flash" → "Gemini Flash (2.5 at v0) over an
+OpenAI-compatible transport (ADR 0005)".
+
+## Build
+- api/settings.py:
+  - llm_provider: Literal["google", "ppq"] = "google" (SERMON_API_LLM_PROVIDER).
+  - Provider map (single source of truth, e.g. a small _PROVIDERS dict in
+    summary.py): google → (https://generativelanguage.googleapis.com/v1beta/openai/,
+    "gemini-2.5-flash", GOOGLE_API_KEY); ppq → (https://api.ppq.ai/v1,
+    "google/gemini-2.5-flash", PPQ_API_KEY).
+  - ppq_api_key read unprefixed via validation_alias="PPQ_API_KEY" (same
+    pattern + rationale as GOOGLE_API_KEY; it is the literal name PPQ's docs
+    use).
+  - llm_model: str | None = None override (SERMON_API_LLM_MODEL); None → the
+    provider default above.
+- api/summary.py: _client() → lazy lru_cache'd openai.OpenAI(base_url=...,
+  api_key=...); _generate_summary → client.chat.completions.create(
+  model=..., messages=[{"role": "system", ...}, {"role": "user", ...}],
+  temperature=0.2, max_tokens=768); map openai.APIError → 502, and None/empty
+  choices[0].message.content → 502. The handler's 503-before-retrieval guard
+  now keys on the ACTIVE provider's key, and its detail names the missing env
+  var (e.g. "...set PPQ_API_KEY"). Grounding prompt, citation contract, and
+  the no-context short-circuit are unchanged.
+- api/pyproject.toml: drop google-genai, add openai (current major, pinned in
+  style with neighbors); rewrite the Phase 14 dep comment block.
+- infra/.env.example: document PPQ_API_KEY + SERMON_API_LLM_PROVIDER +
+  SERMON_API_LLM_MODEL (append-only — deny rules block Read/Edit on .env*).
+- Tests (api/tests/test_summary_unit.py): re-seam the 22 Phase 14 tests from
+  models.generate_content → chat.completions.create, preserving every pinned
+  behavior; add provider-resolution tests: default=google; ppq flip picks PPQ
+  base_url/model/key; llm_model override wins; per-provider 503 detail;
+  "PPQ_API_KEY set but provider=google still 503s" (no silent cross-pairing).
+- api/AGENTS.md: model-surface table row + any google-genai mentions →
+  openai-SDK transport (still a network call; no in-process model; no
+  api↔worker pin-lockstep).
+- Aside while in api/ (own commit): the .claude/settings.json api PostToolUse
+  hook runs `ruff check --fix` but NOT `ruff format` — exactly how Phase 14's
+  format-only CI failure shipped. Append `&& uv run --project api ruff format
+  "$file"` (and the worker analog). Phase 15 hit the auto-mode classifier on
+  settings.json edits — expect to ask the operator to authorize.
+
+## Verify
+- Unit: cd api && uv run pytest; uv run ruff check; uv run ruff format
+  --check .; uv run pyright. All clean.
+- Catalog pre-check (no key): curl -s https://api.ppq.ai/v1/models | grep -o
+  '"google/gemini-2.5-flash"' | head -1 — confirm the pinned id still exists.
+- LIVE (the point of the phase — needs the operator's PPQ_API_KEY in
+  infra/.env + SERMON_API_LLM_PROVIDER=ppq; ~2¢ total; stack via make up, api
+  via cd api && make dev):
+  1. Grounded: as phase12-a (owns the 5-book corpus), POST /search-summary
+     {"query": "what does this say about faith"} → 1–2 paragraphs, inline
+     [book:chunk] markers that resolve, citations ⊆ prompt sources.
+  2. No-confabulation: {"query": "who was Theodore Roosevelt"} → the fixed
+     no-context message, citations=[], and NO LLM call (prove it: control run
+     with the key unset must behave identically on this query).
+  3. Record warm E2E latency (retrieval + LLM round-trip) for the
+     api/AGENTS.md open-gap row.
+- make test-isolation (Phase 3 hard gate) + /check-tenant-leak +
+  tenant-auditor (summary.py touched; transport adds no query surface) +
+  /security-review (key handling changed).
+
+## Close out
+- Tick the Phase 14b row in docs/PHASES.md (date, branch, deviations — note
+  explicitly that the google-direct arm is config-verified only until a
+  GOOGLE_API_KEY exists; the transport code is identical either way).
+- Edit Phase 14's row: append "(live verify closed by Phase 14b)" to its
+  Deviation sentence. Do not rewrite the rest.
+- Close issue #24 with the verify transcript. Update the project memory note
+  (phase-14-live-verify-deferred) — it gates Phase 16 on this work.
+- Conventional commits: docs(adr) → feat(api) → test(api) → chore(hooks) →
+  docs(phases). Stop. Phase 16 is a separate session.
 ```
 
 ---

@@ -17,6 +17,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+# web/lib is Next.js app source, not a Python build dir — re-include it.
+!web/lib/
 lib64/
 parts/
 sdist/

@@ -112,6 +112,16 @@ weights (LlamaIndex Phase 5 + `worker.embedding` Phase 6 both pull the
 same blob), so the api ↔ worker pair has roughly 5 GB of model state
 between them when both are warm.
 
+The `/search-summary` LLM (Phase 14; transport re-cut in Phase 14b,
+[ADR 0005](../docs/adr/0005-llm-transport.md)) is deliberately **not**
+in that table: it is a network call through the `openai` SDK to an
+OpenAI-compatible endpoint — Google's compat endpoint by default,
+ppq.ai via `SERMON_API_LLM_PROVIDER=ppq`, with `summary.py:_PROVIDERS`
+as the single provider map and the unprefixed `GOOGLE_API_KEY` /
+`PPQ_API_KEY` as keys. No in-process model, no HF-cache footprint, and
+no api↔worker pin-lockstep concern — the `openai` pin rides alone in
+`api/pyproject.toml`.
+
 The rerank + highlight stages run *after* both retrieval arms' tenant
 filters have already executed. They take a `Sequence[RetrievalHit]`
 that was filtered by `book_id` upstream, score (query, chunk) pairs,

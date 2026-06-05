@@ -64,8 +64,21 @@ This is load-bearing; do not weaken it.
   `biome-ignore` for a rule that actually fires — an unused suppression is itself
   an error.
 
+## Long-running proxies
+
+`app/api/search-summary/route.ts` is the one proxy whose upstream call runs
+minutes, not milliseconds (~134s warm E2E on the dev box: CPU rerank + LLM
+round-trip). It carries an explicit `AbortSignal.timeout` (300s → 504) so a
+wedged upstream can't hold the handler forever — copy that pattern for any
+future long-running proxy. The UI side (`SearchPanel`) shows an elapsed-time
+affordance instead of a bare spinner; citation markers the model merges into
+one bracket (`[A:70, A:51]`, Phase 14b finding) render as plain text via
+`lib/summary.ts:segmentSummary` — only standalone markers resolve to cards.
+
 ## Cross-package note
 
 Phase 15 added `GET /library` to `api/` (the listing this frontend renders).
-Any new screen that needs backend data needs a corresponding `api/` route — the
-frontend never reaches into Postgres/Milvus, only HTTP.
+Phase 16 added `content` to `POST /search-summary` citations (the chunk
+preview the citation cards render). Any new screen that needs backend data
+needs a corresponding `api/` route — the frontend never reaches into
+Postgres/Milvus, only HTTP.

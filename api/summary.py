@@ -196,12 +196,19 @@ class SummaryRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    """One resolvable source behind the summary — maps a marker to its chunk."""
+    """One resolvable source behind the summary — maps a marker to its chunk.
+
+    ``content`` is the pruned chunk text that grounded the summary (Phase 16:
+    the citation cards render it as a preview). It is exactly the passage the
+    LLM saw — already tenant-filtered by ``run_search`` — so returning it adds
+    no new tenant surface.
+    """
 
     marker: str
     book_id: uuid.UUID
     title: str
     chunk_index: int
+    content: str
     filename: str | None = None
     parent_section: str | None = None
 
@@ -368,6 +375,7 @@ def _to_citation(source: _Source) -> Citation:
         book_id=source.book_id,
         title=source.title,
         chunk_index=source.chunk_index,
+        content=source.content,
         filename=source.filename,
         parent_section=source.parent_section,
     )

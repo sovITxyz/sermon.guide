@@ -25,6 +25,23 @@ After each phase commit, tick the box and append: completion date, branch name, 
 - [x] Phase 14b — OpenAI-compatible LLM transport (ppq.ai) + Phase 14 live verify (completed 2026-06-04, branch `phase-14b/ppq-llm-transport`, closes issue #24. **ADR 0005** locks the transport: `google-genai` out, `openai` SDK (2.41.0, pinned `>=2,<3`) in as a single config-driven chat-completions transport over OpenAI-compatible endpoints — forced by the industry-wide `gemini-1.5-flash` retirement (Phase 14's pin was dead regardless of transport) and by ppq.ai being OpenAI-shaped (google-genai cannot speak to it); Google-direct stays reachable through its own compat endpoint, so prod runs the **same code path** the ppq live-verify exercises. `summary.py:_PROVIDERS` is the single source of truth: `google` (default) → `https://generativelanguage.googleapis.com/v1beta/openai/` + `gemini-2.5-flash` + `GOOGLE_API_KEY`; `ppq` → `https://api.ppq.ai/v1` + `google/gemini-2.5-flash` + `PPQ_API_KEY` (ids pinned, not alias-tracking — `gemini-flash-latest` drifts; catalog pre-check `curl -s https://api.ppq.ai/v1/models` confirmed the pinned id). `settings.py` adds `llm_provider` (SERMON_API_LLM_PROVIDER, Literal), `llm_model` override (SERMON_API_LLM_MODEL — spell it the active provider's way: bare on google, `google/`-prefixed on ppq), and `ppq_api_key` via unprefixed `PPQ_API_KEY` alias (same pattern + rationale as GOOGLE_API_KEY); `infra/.env.example` documents all three (append-only — deny rules). `_client()` is a lazy `@lru_cache` `openai.OpenAI(base_url=…, api_key=…)`; `_generate_summary` → `chat.completions.create(model, [system,user], temperature=0.2, max_tokens=768)`; `openai.APIError` → 502, empty choices/content → 502 (gateway-200-with-zero-choices pinned as 502-not-IndexError); the 503-before-retrieval guard keys on the **active** provider's key and names the missing env var. Grounding prompt, `[book:chunk]` citation contract, and the no-context short-circuit unchanged; `api/AGENTS.md` notes the LLM is a network call (no in-process model, no api↔worker pin-lockstep). Tests: the 22 Phase 14 units re-seamed to the chat.completions shape preserving every pinned behavior, + 8 provider-resolution pins (default=google; `_PROVIDERS` cells; ppq flip builds the real client against api.ppq.ai/v1 with PPQ_API_KEY + the `google/` model spelling; `llm_model` override wins; per-provider 503 detail; no silent key cross-pairing) — 67/67 api suite, ruff + format + pyright(strict) clean. Hook aside (own commit): the api/worker PostToolUse hooks now run `ruff format` after `check --fix` — the gap behind Phase 14's format-only CI failure; the auto-mode classifier blocked the settings.json self-edit as predicted and it was applied after explicit operator authorization. **LIVE verify (ppq.ai, `google/gemini-2.5-flash`, ~6¢):** (1) Grounded — as `phase12-a` (5-book corpus), "what does this say about faith" → 200 in 146.9 s cold / ~134 s warm ×2; two coherent paragraphs with inline `[book:chunk]` markers; 4–5 returned citations per run, all resolving to real corpus chunks (Mere Christianity 82/85/114, 10 Answers for Atheists 23/51/70/71 across runs); citations ⊆ prompt sources. **Live contract finding for Phase 16:** the model sometimes merges adjacent citations into one bracket (`[A:70, A:51]`) — the conservative extractor drops merged-only members while standalone appearances resolve, so returned citations stay 100% resolvable (no fakes, the documented v0 trade-off), but the UI must expect comma-merged inline brackets that render as plain text. (2) No-confabulation — "who was Theodore Roosevelt" → 200 with the byte-exact fixed no-context message + `citations=[]` (235 s; rerank+highlight prunes all 30 fan-out chunks before the short-circuit). The NO-LLM-call proof ran as a control triad because the spec's literal "key unset behaves identically" is impossible under the (correct, unit-pinned) 503-before-retrieval guard: unset-key control → 503 "set PPQ_API_KEY" in 0.095 s pre-retrieval; invalid-key control → **byte-identical** no-context 200 on Roosevelt (an attempted call would 502); invalid-key + faith → 502 "Summary generation failed upstream." (proves the control catches real calls and live-verifies the APIError→502 map). Latency (api/AGENTS.md row updated): warm `/search-summary` E2E ≈ 134 s = ~71–76 s retrieval/rerank/highlight on this box + **~58–64 s LLM round-trip** (gemini-2.5-flash runs thinking by default through the compat layer). Gates: `make test-isolation` 3/3 PASS; `/check-tenant-leak` sweep clean; `tenant-auditor` PASS ×4 (transport adds no query surface; key flows env→Authorization header only); `/security-review` — no findings. **Deviations:** (i) the `google` arm is **config-verified only** — no GOOGLE_API_KEY exists in this env; the transport code is identical either way (same client construction, same call, different `_PROVIDERS` row), so the residual google-arm risk is configuration-shaped, not code-shaped. (ii) the no-LLM-call control deviated from the spec's literal "unset" wording as above — replaced with the strictly stronger invalid-key triad. (iii) `phase12-a`'s dev password was reset via a direct `users.password_hash` UPDATE to run the scenarios (Phase 12 never persisted creds — correctly).)
 - [x] Phase 16 — Next.js: search + summary UI (completed 2026-06-05, branch `phase-16/web-search`. **v0 done.** `/search` page = server-component shell (`app/search/page.tsx`) + `"use client"` `SearchPanel`: query input → POST same-origin `/api/search-summary` → summary panel with inline `[n]` chips anchor-linked to citation cards (title, cleaned section, chunk index, line-clamped chunk preview with Show more/less) → loading/empty/error states. Route added to the presence-gate middleware matcher and the authed nav. **Long-request UX** (Phase 14b carry-forward): the proxy (`app/api/search-summary/route.ts`) holds the upstream call with an explicit `AbortSignal.timeout(300s)` → 504 (first timeout convention in web/ — documented in `web/AGENTS.md` "Long-running proxies"), and the UI shows an elapsed `m:ss` ticker + expectation-setting copy instead of a bare spinner. The proxy forwards **only** `{query}` — `limit_chunks`/`user_id`/`book_ids` are structurally dropped, so the client cannot widen scope or fan-out. **Marker rendering** (Phase 14b carry-forward): `lib/summary.ts:segmentSummary` resolves only the exact standalone markers the API returned; comma-merged brackets and invented markers stay plain prose — and the merged case **occurred live** (`[10 Answers for Atheists:70, 10 Answers for Atheists:51]` in the verify summary, rendered as text while `[…:51]` standalone resolved to a card). **Cross-package addition** (Phase 15 precedent): `Citation.content` added to `api/summary.py` — the citation cards need a chunk preview and the text was already in `_Source.content` (the exact tenant-filtered passage the LLM saw), so no new tenant surface and no second round-trip; pinned in `test_summary_unit.py`. **Live verify** (cookie-jar drive of the real dev stack — api `make dev` :8000, web `pnpm dev` :3001, infra healthy; as `phase12-a` / 5-book corpus): no-cookie `/search` → 307 `/login?next=%2Fsearch`; no-cookie POST → 401; login → HttpOnly `sg_session`; page 200 with form + nav link; empty/malformed-body proxy validation → 400. Grounded path: **"what does this say about faith" → 200 in 138.9s warm** (matches Phase 14b ~134s), 2-paragraph summary, 3 citations (Mere Christianity 82/85, 10 Answers 51) all markers resolving, all carrying content (157–3352 chars) for previews. Empty-library: fresh user `phase16-empty@example.com` → byte-exact no-context message + `citations=[]` in **0.20s** (pre-LLM short-circuit). Gates: web `tsc`/`biome`/`vitest` 42/42 clean (28 new tests; re-run with `.next/` removed; `next build` compiles all 13 routes + middleware); api 67/67 + ruff/format/pyright(strict) clean; `make test-isolation` 3/3 PASS ×2; `/check-tenant-leak` sweep clean (no new query surface in the diff); `tenant-auditor` PASS (content provenance traced end-to-end to the JWT-scoped `user_library` filter); `/security-review` — no findings (LLM/EPUB-derived text reaches the DOM only as React-escaped JSX text nodes; no `dangerouslySetInnerHTML`). **Deviations:** (i) the spec's verify query "what does this say about grace" returns the no-context message on this corpus — the Phase 13 "grace → 1 hit" weak-match collapse now prunes to 0 under rerank+highlight — so it live-verified the empty state instead; the grounded path used Phase 14b's known-good faith query (174.9s cold for grace, full pipeline, no error). (ii) Upload+ingest of a *new* book was not re-run in-browser — the flow reuses the `phase12-a` corpus; upload UI was live-verified in Phase 15 and CPU ingest is tens of minutes (same rationale as Phase 15 deviation ii). (iii) No headless browser on the box, so "full browser flow" = HTTP drive of the rendered pages + route handlers with a cookie jar (Phase 15 precedent; components covered by the 28 pure-helper unit tests). (iv) Live finding → fix in-phase: EPUB `parent_section` metadata can be raw HTML debris (`<a href="part0002…`) — React escapes it (no XSS) but it's tag soup in a card header, so `displaySection()` drops labels containing `<`; worker-side metadata cleanup left as a post-v0 item. (v) `web/next-env.d.ts` was dirtied by the dev server appending the `.next/types` reference and restored before commit, per the Phase 15 two-reference rule.)
 
+v1 (planned 2026-06-05 — see the **v1 Plan — Beyond Phase 16** section below for milestones, per-phase prompts, dependencies, and the parked/trigger-gated list):
+
+- [ ] Phase 17 — CI service containers + model cache: make the gates run for real
+- [ ] Phase 18 — JWT-secret startup guard + Pydantic extra='forbid' + /readyz
+- [ ] Phase 19 — Edge rate limiting (signup/login/search-summary) + CORS prod-origin guard
+- [ ] Phase 20 — Upload idempotency + upload_tasks ownership + content-type posture
+- [ ] Phase 21 — parent_section HTML strip at ingest + backfill + orphan-debris sweep
+- [ ] Phase 22 — Graceful degradation across retrieval arms + model loads
+- [ ] Phase 23 — Production corpus seeding plan + idempotent bulk-ingest runbook
+- [ ] Phase 24 — Comma-merged citation extraction + library-size search-filter cap
+- [ ] Phase 25 — Web component + Playwright E2E coverage for search/citations/upload
+- [ ] Phase 26 — Doc-rot sweep (README status, shipped-gate phrasing, :3000 workaround)
+- [ ] Phase 27 — Structured logging + metrics + error tracking
+- [ ] Phase 28 — Backup + restore tooling (Postgres, Milvus, MinIO)
+- [ ] Phase 29 — App Dockerfiles + image-build CI (models baked, HF offline)
+- [ ] Phase 30 — KEDA + k8s manifests gated on /readyz
+
 ---
 
 Each phase is **one new Claude Code session**. Phases are intentionally small to keep context tight and reduce drift / errors. Run sequentially; verify each deliverable before moving on.
@@ -747,17 +764,530 @@ Commit. Stop. v0 done.
 
 ---
 
-## Beyond Phase 16
+## v1 Plan — Beyond Phase 16
 
-Future work, not in v0:
-- R2/B2 raw file storage (replace local).
-- KEDA + k8s manifests (replace docker-compose).
-- Highlight/note import (Kindle, Logos exports).
-- Hierarchical / parent-document retrieval.
-- Semantic query caching.
-- Per-tenant rate limits.
-- Graph RAG.
-- Postmortem dir (`agent_docs/postmortems/`) — populate as AI mistakes surface in real work.
-- Additional MCP servers (GitHub MCP, Context7) — opt in deliberately, keep `enableAllProjectMcpServers: false`.
+Planned 2026-06-05 from a full-repo audit (phase deviations, ARCHITECTURE/ADR
+consequences, AGENTS.md "Open trust gaps", CI, code, GitHub tracker) followed by a
+three-draft design pass (security-first / ops-first / product-first) that was judged,
+merged, and adversarially dependency-checked. v0 shipped the pipeline; v1 makes it
+**trustworthy** (M1), **resilient with real content** (M2), and **deployable** (M3).
 
-Plan these phases when v0 is in your hands and you know what's actually missing.
+Rules — same as v0, plus one that bit during planning:
+
+- One phase = one Claude Code session = one `phase-N/short-slug` branch off main.
+  Conventional commits, atomic.
+- **Every phase must flip its own `- [x] Phase N — …` row in this file** — the
+  `phases-row-flipped` CI job fails any `phase-N/*` PR whose row is unchecked. This
+  applies to "pure docs" phases too; the row flip is the one expected edit even when a
+  phase claims "no source changes".
+- Tenant gates (`make test-isolation`, `/check-tenant-leak`, `tenant-auditor`,
+  `/security-review`, `schema-reviewer` on migrations) re-run per phase as listed.
+  Until Phase 17 lands, remember the gates are dev-box-only — CI skip-passes them.
+- Ordering: milestones are sequential; within them, Phase 26 (docs) is free-floating
+  and Phase 29 may run in parallel with 27/28 (its only hard dependency is Phase 18).
+
+### Milestone 1 — Make the safety net real & lock auth trust (Phases 17–21)
+
+The "tenant isolation is not negotiable" gate actually executes in CI instead of
+skip-passing; JWTs cannot be forged from a shipped default secret; request bodies
+reject smuggled fields instead of silently dropping them; the auth/search edge is not
+a free DoS; ingest metadata is clean at the root. After M1, every downstream "tenant
+gates pass" claim is trustworthy.
+
+### Milestone 2 — Resilience & a corpus a pastor can trust (Phases 22–25)
+
+The retrieval path degrades gracefully instead of returning bare 500s; a real
+seedable theological corpus replaces the 5 synthetic dev books; citations survive the
+live-observed comma-merge; the search filter survives a 10K-book library; the
+hand-verified web flows become regression tests.
+
+### Milestone 3 — Observable, recoverable, deployable (Phases 26–30)
+
+Docs stop lying; structured logs + metrics + error tracking make the §1 latency
+targets observable; backups make disk loss survivable; baked offline-capable images
+build in CI; readiness-gated k8s/KEDA manifests land the locked deploy direction.
+
+---
+
+## Phase 17 — CI service containers + model cache: make the gates run for real
+
+```
+cd to sermon.guide. Read .github/workflows/ci.yml and the skipif guards in
+worker/tests/test_tenant_isolation.py, test_retrieval_golden.py, test_ingest.py.
+
+Goal: the CI gates stop skip-passing. Today ci.yml provisions no Postgres/Milvus/Redis
+and no model cache, so the load-bearing suites hit their skip guards and pass
+vacuously — tenant isolation has only ever been enforced on the dev box. This phase is
+first because every later phase re-runs gates that are currently green-but-vacuous.
+
+## Build
+- Branch: phase-17/ci-real-gates off main.
+- Bring real infra to CI. Simplest path: a job step running the existing
+  infra/docker-compose.yml (`make -C infra up` already --wait's on healthchecks)
+  rather than hand-rolling GH `services:` blocks — Milvus needs its etcd + MinIO
+  siblings anyway. Path-filter so the infra boot only runs for worker/api changes
+  (the filter job exists).
+- Wire the env vars each skip-guard keys off; bootstrap the Milvus collection so
+  test_tenant_isolation.py executes its body. The isolation suite is synthetic (two
+  tenants, disjoint book_id sets) — no corpus, no embedding models needed. Make it a
+  REQUIRED blocking check.
+- Golden/ingest jobs: the local 5-book corpus is copyrighted and must NOT be
+  committed. Either (a) seed a tiny public-domain CI corpus (Gutenberg/CCEL texts)
+  with its own golden rows + actions/cache on HF_HOME (~3.7 GB models; consider a
+  nightly job if PR latency is unacceptable), or (b) keep them local-gated but make
+  skipping LOUD — a CI step that fails if those suites report SKIPPED without an
+  explicit local-only marker. Choose (a) if the cache restore stays under ~3 min;
+  record the choice in this phase's row.
+
+## Verify
+- Mutation proof IN CI, not just locally: a throwaway branch dropping the `filter=`
+  from the Milvus search turns the CI isolation job RED (FAILED, not SKIPPED). Revert.
+- CI logs show real pass counts; zero "SKIPPED (Milvus unreachable)" lines in the
+  required job.
+
+## Close out
+- Flip this row; record the golden/ingest option chosen and the CI wall-clock delta.
+```
+
+---
+
+## Phase 18 — JWT-secret startup guard + Pydantic extra='forbid' + /readyz
+
+```
+cd to sermon.guide. Read api/settings.py, api/main.py, api/auth.py.
+
+Goal: close the two cheapest total-isolation defeats, and give orchestrators a
+readiness signal every later deploy phase needs.
+
+## Build
+- Branch: phase-18/jwt-guard-readyz off main.
+- JWT-secret startup guard: api/settings.py:27 defaults jwt_secret to a
+  publicly-known dev string, and the module docstring CLAIMS a startup assertion
+  exists — it does not (api/main.py has no lifespan hook). Add a FastAPI lifespan
+  hook that refuses to boot when the secret is unset or equals the dev default,
+  unless an explicit dev opt-out (e.g. SERMON_API_ENV=dev) is set. Fix the lying
+  docstring. A deployment that forgets SERMON_API_JWT_SECRET must fail loudly, not
+  serve forgeable JWTs.
+- extra="forbid" on every inbound request model (search, summary, auth bodies): a
+  smuggled user_id/book_ids becomes a hard 422 instead of a silently-dropped field
+  backed by a reviewer-enforced rule (Phase 12 deviation d). Check the web/ proxies
+  first — they forward {query} only, so nothing legitimate breaks.
+- GET /readyz: Postgres + Milvus + Redis connectivity with per-dep status and short
+  timeouts; /healthz stays cheap and dependency-free. Phases 29/30 wire container
+  HEALTHCHECK and k8s readiness to this route.
+
+## Verify
+- App refuses boot with default/unset secret; boots with a real one and with the dev
+  opt-out. POST /search with an extra user_id field → 422. /readyz → 200 only when
+  all three deps are reachable, 503 with per-dep breakdown when one is stopped;
+  /healthz unaffected.
+- Gates: make test-isolation 3/3 (now real in CI) + /check-tenant-leak +
+  tenant-auditor + /security-review (auth surface changed).
+```
+
+---
+
+## Phase 19 — Edge rate limiting (signup/login/search-summary) + CORS prod-origin guard
+
+```
+cd to sermon.guide. Read api/auth.py, api/main.py:26-32 (CORS), api/settings.py.
+
+Goal: the public edge stops being free to abuse. /auth/signup takes any
+email+password with no throttle, /auth/login is open to credential stuffing, and
+/search-summary burns ~134 s of CPU per call. No rate limiting exists anywhere.
+
+## Build
+- Branch: phase-19/edge-rate-limits off main.
+- Redis-backed rate limiting (broker Redis is already in the stack; works across
+  replicas — pick slowapi or a small middleware, record the choice in api/AGENTS.md):
+  per-IP limits on /auth/signup + /auth/login; a stricter per-user limit on
+  /search-summary (the most expensive route in the system). 429 + Retry-After.
+- CORS prod-origin guard in the Phase 18 lifespan hook: refuse boot when
+  allow_credentials=True pairs with a wildcard/unset origin outside dev. Document
+  SERMON_API_CORS_ORIGINS for prod in infra/.env.example (append-only — deny rules).
+- Explicitly out of scope (parked): email verification / CAPTCHA, per-tenant quotas.
+
+## Verify
+- Scripted burst: /auth/login and /search-summary return 429 past the threshold,
+  enforced across two api processes sharing one Redis. Limits documented.
+- CORS guard blocks boot on a credentials+wildcard misconfig; dev boot unaffected.
+- Gates: make test-isolation + /check-tenant-leak + /security-review.
+```
+
+---
+
+## Phase 20 — Upload idempotency + upload_tasks ownership + content-type posture
+
+```
+cd to sermon.guide. Read api/uploads.py INCLUDING its "Security choices" docstring,
+worker/AGENTS.md "Idempotency caveat", api/AGENTS.md "Open trust gaps".
+
+Goal: uploads survive crashes and tasks have owners — the oldest deferred trust gaps
+(Phases 9–11). All three items below touch api/uploads.py + one migration; they are
+one session.
+
+## Build
+- Branch: phase-20/upload-integrity off main.
+- upload_tasks(task_id, user_id, …) table + Alembic migration (schema-reviewer gate):
+  GET /tasks/{task_id} authorizes by JWT-derived user_id — another user's task
+  returns 404 (don't leak existence) — instead of treating the 122-bit Celery UUID
+  as an unguessable capability.
+- Task-id-keyed idempotency token on /upload → worker, so a worker death between the
+  Milvus insert and the Postgres commit converges to one consistent record on
+  redelivery instead of orphan vectors (the documented Phase 9 window,
+  worker/AGENTS.md "Idempotency caveat").
+- Content-type posture — do NOT silently contradict the repo: api/uploads.py's
+  docstring deliberately argues AGAINST API-edge format trust ("refusing here would
+  just push attackers to a different content-type header"; the worker libmagic-sniffs
+  via worker/extractors). Decide in-phase: (a) implement early libmagic rejection
+  with a NEW rationale (don't stage attacker bytes to disk; don't burn a
+  tens-of-minutes doomed ingest) AND rewrite that docstring to match; or (b) close
+  the deferred-since-Phase-4 item as deliberate-wontfix recorded in api/AGENTS.md.
+  Either way, code and stated design must agree afterwards.
+
+## Verify
+- Re-POST of the same upload/task token → no second ingest, no duplicate vectors.
+  kill -9 the worker mid-insert (the Phase 9 drill) → redelivery reconciles to one
+  record, zero orphan vectors.
+- GET /tasks/{id} as another user → 404; own task unchanged.
+- If (a): a script renamed .epub is rejected at the edge. If (b): the wontfix and its
+  rationale are in api/AGENTS.md.
+- Gates: make test-isolation + /check-tenant-leak + tenant-auditor +
+  /security-review + schema-reviewer on the migration.
+```
+
+---
+
+## Phase 21 — parent_section HTML strip at ingest + backfill + orphan-debris sweep
+
+```
+cd to sermon.guide. Read worker/chunking.py (the ATX-heading capture),
+worker/extractors/epub.py, worker/scripts/backfill_chunks.py, and Phase 16
+deviation iv above.
+
+Goal: kill the parent_section HTML debris at the root. Today the web UI masks it
+(displaySection() drops any label containing '<') while worker/chunking.py keeps
+capturing raw pandoc heading text — tag soup like '<a href="part0002…' persists in
+chunks.parent_section and Milvus metadata. The post-v0 cleanup was previously tracked
+nowhere in-repo; this phase is that item.
+
+## Build
+- Branch: phase-21/parent-section-clean off main.
+- Strip markup from headings at capture time in worker/chunking.py (pandoc gfm emits
+  inline HTML anchors/spans — strip tags, collapse whitespace; avoid a new heavyweight
+  dep if existing tooling covers it).
+- Backfill: extend the worker/scripts/backfill_chunks.py pattern to rewrite
+  parent_section on existing chunks rows AND re-sync the matching Milvus metadata.
+- Same data pass: delete the known dev test debris — 1 orphan global_books row
+  (_test_phase8_synthetic) + 3 orphan Milvus book_ids (b_mere_christianity,
+  b_1_thess, 88ba2fe2…). Verify none are tenant-reachable BEFORE deleting.
+- web/lib/summary.ts displaySection() stays as belt-and-suspenders; do not remove.
+
+## Verify
+- Fresh EPUB ingest → zero '<' in parent_section in both Postgres and Milvus; the
+  backfill leaves zero dirty rows; orphans gone and only those rows touched.
+- Gates: make test-retrieval-golden + make test-isolation; /check-tenant-leak (light
+  — no query-shape change).
+```
+
+---
+
+## Phase 22 — Graceful degradation across retrieval arms + model loads
+
+```
+cd to sermon.guide. Read api/search.py (the dense/sparse asyncio.gather),
+api/rerank.py, api/highlight.py, and the Phase 12 pre-merge audit above.
+
+Goal: a single dependency blip stops meaning a bare 500. Today one-arm-down ⇒ 500
+(Milvus-down burns ~12 s of pymilvus retries first); any rerank/highlight model-load
+or inference failure raises straight through (realistic trigger: cold HF cache
+without network on the first reranked /search after boot).
+
+## Build
+- Branch: phase-22/graceful-degradation off main.
+- The dense/sparse fan-out IS a gather: add return_exceptions=True + per-arm handling
+  so one arm down degrades to the surviving arm with a partial-result signal in the
+  response (e.g. degraded: ["dense"]). Bound the Milvus-down case to a fast typed
+  error via client timeout config instead of the 12 s retry long-tail.
+- Rerank + highlight are NOT a fan-out — they run sequentially after fusion: wrap
+  each in try/except so a cross-encoder/BGE-M3 failure falls back to raw RRF top-K
+  (also flagged in the response), not a 500.
+- /search-summary inherits the posture via run_search; decide and document what a
+  degraded-retrieval summary does (proceed-with-flag vs 503).
+- Degradation must NEVER widen scope: every fallback path still filters by the
+  JWT-derived user_library set.
+
+## Verify
+- Stop Milvus → fast degraded BM25-only response with the flag (not a 12 s 500);
+  force a reranker load failure → RRF results + flag; each failure mode unit-tested.
+- Gates: make test-isolation + /check-tenant-leak + tenant-auditor (fallback paths
+  are new query paths).
+```
+
+---
+
+## Phase 23 — Production corpus seeding plan + idempotent bulk-ingest runbook
+
+```
+cd to sermon.guide. Read worker/tests/golden/queries.jsonl, the enqueue target in
+worker/Makefile, ADR 0003 (English-first corpus note).
+
+Goal: a corpus a pastor can actually use. The dev corpus is 5 synthetic books owned
+by a dev user; the spec's own "grace" query prunes to zero on it. No corpus plan
+exists anywhere.
+
+## Build
+- Branch: phase-23/production-corpus off main.
+- Sourcing/licensing policy (short doc in docs/): public-domain seeding
+  (Gutenberg/CCEL classics — Augustine, Calvin, Spurgeon, Wesley, …); user-owned
+  uploads remain the tenant path; no gray-area content.
+- Seed manifest + idempotent bulk-ingest script: point at a directory of
+  legally-held ebooks, enqueue through the existing Celery + dedup path using the
+  Phase 20 idempotency token so re-runs are safe. CPU ingest is slow (~40 min/book)
+  — the runbook documents expected wall-clock and worker parallelism.
+- Extend the golden query set with rows against the seeded books so retrieval
+  quality is measurable on real content — including a "grace" row that actually has
+  corpus support.
+- Runbook in docs/: clean infra → seeded corpus, reproducible.
+
+## Verify
+- Seed run ingests the manifest; dedup converges on re-run (no duplicate vectors);
+  the new golden rows pass; "grace" returns grounded results on the seeded corpus.
+- Gates (bulk ingest exercises dedup + library scoping): make test-isolation 3/3 +
+  /check-tenant-leak AFTER the seed — seeded books must not contaminate any existing
+  tenant's user_library, and dedup must not cross-link libraries.
+```
+
+---
+
+## Phase 24 — Comma-merged citation extraction + library-size search-filter cap
+
+```
+cd to sermon.guide. Read api/summary.py (_extract_citations), web/lib/summary.ts
+(segmentSummary), api/AGENTS.md "No library cap" row, ADR 0002 consequences.
+
+Goal: two known correctness/scale items on the search path. No hard dependency on
+Phase 23 — multi-citation summaries already occur on the 5-book corpus, and the
+filter cap is testable synthetically.
+
+## Build
+- Branch: phase-24/citations-filter-cap off main.
+- Comma-merged citations: _extract_citations does summary_text.find(marker) on the
+  exact bracketed string, so "[A:70, A:51]" silently drops the merged-only member
+  (the documented v0 trade-off; observed live in Phases 14b and 16). Parse merged
+  brackets into their individual markers — members must still resolve against the
+  prompt-source set (never fabricate a citation). Update web/lib/summary.ts
+  segmentSummary to render merged brackets as linked chips; carry the contract
+  change through its unit tests.
+- Library-size filter cap: a 10K-book library generates a ~360 KB book_id IN (...)
+  expr per arm (doubled by the BM25 arm). Implement the chunked-filter or capped
+  strategy from api/AGENTS.md + ADR 0002's revisit note. Test with SYNTHETIC data:
+  insert 10K dummy user_library rows for a test user — no real ingest needed.
+
+## Verify
+- A summary containing a merged bracket yields each member as a resolved citation
+  chip, zero fabricated markers; single-marker behavior unchanged (unit-pinned).
+- The synthetic 10K-book user's /search executes without expr rejection or blowup;
+  record the latency.
+- Gates: make test-retrieval-golden + make test-isolation + /check-tenant-leak +
+  tenant-auditor (the filter builder IS the tenant boundary).
+```
+
+---
+
+## Phase 25 — Web component + Playwright E2E coverage for search/citations/upload
+
+```
+cd to sermon.guide. Read web/AGENTS.md, web/test/, and the Phase 15/16 deviation
+notes above (no headless browser; verifies were cookie-jar HTTP drives).
+
+Goal: the hand-verified Phase 15/16 flows become regression tests. web/test/ covers
+only pure lib helpers; SearchPanel, citation chips, and the upload flow have zero
+automated coverage.
+
+## Build
+- Branch: phase-25/web-e2e off main.
+- Component tests (@testing-library/react or Playwright component mode — record the
+  choice in web/AGENTS.md): SearchPanel states (loading ticker, empty, error,
+  grounded), citation chip resolution including the Phase 24 merged-bracket
+  contract, upload form.
+- Playwright E2E against a booted dev stack: login → search → grounded summary with
+  resolving citations; login → upload → task status. The upload E2E asserts the
+  POST-Phase-20 contract (own task → 200, another user's task → 404). Stub or
+  short-circuit the ~134 s LLM round-trip for CI (e.g. a test provider row) — the
+  live LLM path stays a manual/nightly concern.
+- Wire into the web CI job; bind the dev server to an explicit free port (the :3000
+  conflict on the dev box is real — see web/AGENTS.md once Phase 26 lands).
+
+## Verify
+- Suite passes locally + in CI; deliberately breaking the citation chip renderer or
+  the search submit turns it red; E2E runs headless in CI against the seeded stack.
+- Gates: none (web-only; talks to api over HTTP).
+```
+
+---
+
+## Phase 26 — Doc-rot sweep (README status, shipped-gate phrasing, :3000 workaround)
+
+```
+cd to sermon.guide.
+
+Goal: docs stop lying. Cheap, high-confusion fixes in one pass. Free-floating — can
+land any time.
+
+## Build
+- Branch: phase-26/doc-rot off main.
+- README.md: "Status: Phase 0 (repo skeleton)" → v0 complete + link the v1 plan; fix
+  the "Quick start (when phases land)" annotations for phases that landed.
+- CONTRIBUTING.md + root AGENTS.md: "/test-isolation (ships in Phase 3)" and
+  "/check-tenant-leak (ships in Phase 6)" → present tense; they shipped.
+- web/AGENTS.md: document the :3000 port conflict + `pnpm dev --port 3001`
+  workaround and the "never pkill -f 'next dev' unqualified" rule (memory-only until
+  now).
+- Anything else `grep -rn "Phase 0\|ships in Phase" --include="*.md"` surfaces.
+
+## Verify
+- The greps come back clean. No source files changed — the ONLY non-doc edit is this
+  file's own Phase 26 row flip (required by the phases-row-flipped CI gate).
+```
+
+---
+
+## Phase 27 — Structured logging + metrics + error tracking
+
+```
+cd to sermon.guide. Read api/AGENTS.md latency rows, ARCHITECTURE.md §1 targets.
+
+Goal: the system stops being unobservable. No service has structured logging,
+metrics, or error tracking; the §1 latency targets and the ~134 s reality cannot be
+seen in production.
+
+## Build
+- Branch: phase-27/observability off main.
+- Structured JSON logging with a per-request correlation id across api/ and worker/
+  (an upload traceable enqueue → ingest → searchable). JWTs/secrets/PII never logged.
+- Metrics endpoint (Prometheus shape): p50/p95 per route on the hot paths (/search,
+  /search-summary, /upload); per-stage retrieval timings (embed / dense / sparse /
+  rerank / highlight / LLM); ingest stage timings; Celery queue depth. Emit the
+  Phase 22 degraded-arm signals as counters.
+- Error tracking (Sentry-compatible, env-driven DSN, off by default in dev) for
+  api/ + worker/.
+
+## Verify
+- One /search-summary call → correlated logs with stage timings; the metrics
+  endpoint exposes per-route histograms; a deliberately raised error reaches the
+  tracker; a log audit shows zero JWT/secret/PII.
+- Gates: /check-tenant-leak sanity (no query-shape change).
+```
+
+---
+
+## Phase 28 — Backup + restore tooling (Postgres, Milvus, MinIO)
+
+```
+cd to sermon.guide. Read infra/Makefile, infra/docker-compose.yml.
+
+Goal: losing the box stops meaning losing everything. No backup tooling exists for
+any of the three stateful stores (infra targets are up/down/logs/ps/nuke).
+
+## Build
+- Branch: phase-28/backups off main.
+- make backup / make restore targets: pg_dump/pg_restore for Postgres (users,
+  library, chunks); the supported Milvus 2.6 path for collections (e.g. the
+  milvus-backup tool — its data lives in the compose MinIO + etcd); MinIO bucket
+  sync. Artifacts to a configurable target dir; off-box rsync documented.
+- Restore drill runbook in docs/: backup → make nuke → restore → verify.
+
+## Verify
+- The drill, actually run: a previously-ingested book + its vectors + user_library
+  rows round-trip backup → nuke → restore; /search finds it afterwards.
+- Gates: make test-isolation 3/3 AFTER restore (tenant scoping survives recovery).
+```
+
+---
+
+## Phase 29 — App Dockerfiles + image-build CI (models baked, HF offline)
+
+```
+cd to sermon.guide. Read worker/AGENTS.md "Offline mode" + NLTK pre-warm notes,
+api/AGENTS.md model table (~3.7 GB), .github/workflows/ci.yml.
+
+Goal: the apps become shippable artifacts. Lint/test CI + CodeQL exist; zero
+application Dockerfiles do. Hard dependency: Phase 18's /readyz only. Phase 27's
+logging is recommended-not-required — rebuild images when it lands; do NOT serialize
+packaging behind observability.
+
+## Build
+- Branch: phase-29/app-images off main.
+- Dockerfiles: api/ (uvicorn, HEALTHCHECK → /readyz); worker/ (Celery; bake
+  BGE-Large + cross-encoder + BGE-M3 + NLTK WordNet at build time per
+  worker/AGENTS.md, set HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1); web/ (Next
+  standalone). Multi-stage, uv- and pnpm-native, pinned bases; .dockerignore keeps
+  model caches/venvs out of context.
+- CI image-build job on main: build all three, tag (sha + latest), push to GHCR.
+  Path-filtered like the existing jobs.
+
+## Verify
+- docker run of each image works against the compose stack; the worker container
+  ingests a book with HF network access disabled (offline proof); CI publishes
+  tagged images; the api container HEALTHCHECK flips unhealthy when Postgres stops.
+- Gates: /security-review on the image surface (secrets, base images); no
+  query-path changes.
+```
+
+---
+
+## Phase 30 — KEDA + k8s manifests gated on /readyz
+
+```
+cd to sermon.guide. Read ARCHITECTURE.md §2 (ingestion runtime row) + §6.
+
+Goal: the locked deploy direction exists as manifests. Last v1 phase by design — it
+sits on images (29), readiness (18), observability (27), and recoverability (28,
+recommended before real traffic).
+
+## Build
+- Branch: phase-30/k8s-keda off main.
+- infra/k8s/: provider-portable manifests (or a Helm chart — if Helm, record it in
+  an ADR) for api/worker/web consuming the Phase 29 GHCR images. Postgres/Redis/
+  Milvus as external services or operator-managed — document the trade-off; the
+  compose stack stays for local dev. Readiness gates on /readyz, liveness on
+  /healthz. Secrets via k8s Secrets — SERMON_API_JWT_SECRET is required (the
+  Phase 18 guard refuses the default). Resource requests honest about CPU model
+  costs.
+- KEDA ScaledObject: worker scales on Redis queue depth (the §2 locked decision).
+- Update the Phase 0 locked-decisions row above + ARCHITECTURE.md §6 so "K8s w/
+  KEDA" stops describing unbuilt infra once this lands.
+
+## Verify
+- kind/minikube: manifests apply; pods Ready only when /readyz is green; KEDA
+  scales the worker deployment up under a queue burst and back down; a rollout with
+  a dead dependency is held by the readiness gate.
+- Gates: /security-review (exposed services, secrets handling).
+```
+
+---
+
+## Parked — trigger-gated, blocked, or v2+
+
+Deliberately NOT scheduled. Each has a written unblock trigger; when one fires,
+plan it as the next phase number.
+
+| Item | Why parked | Unblock trigger |
+|---|---|---|
+| GPU swap (embedding/rerank/highlight → cuda) | No GPU hardware exists; this is the real latency lever (~30 s rerank, ~134 s summary E2E) | GPU runtime provisioned → swap the device pins per ADR 0003 + api/AGENTS.md |
+| google LLM arm live verify | Config-verified only; byte-identical code path to the live-verified ppq arm (ADR 0005) | GOOGLE_API_KEY provisioned → run the Phase 14b verify triad |
+| R2/B2 object storage | /tmp staging + Phase 20 idempotency + Phase 28 backups cover single-box risk; couples to the deploy provider | Multi-node k8s (post-Phase 30) makes shared object storage mandatory |
+| Email verification / CAPTCHA on signup | Phase 19 throttling covers abuse pre-launch | Real public signups |
+| Highlight/note import (Kindle, Logos) | Blocked on ARCHITECTURE.md §7.2 (separate collection vs content_type) — deliberately deferred | Real highlight queries exist → decide §7.2 (ADR), then schedule |
+| Hierarchical / parent-document retrieval | Quality enhancement; no correctness pressure | Phase 27 query logs show flat retrieval failing |
+| Semantic query caching | Premature without a real query distribution | Repeated-query data from Phase 27 metrics justifies it |
+| Per-tenant rate limits / quotas | Needs a usage/billing model; Phase 19 covers the abuse edge | Tenancy/billing model decided |
+| Graph RAG | Research-grade; official v2 backlog | Deliberate product decision |
+| Multilingual BM25 (language column + per-row regconfig) | English-only corpus; ADR 0004 names the path | A non-English corpus lands |
+| ParadeDB pg_search (true BM25) | ts_rank_cd passes all goldens | A golden regression attributable to ranking |
+| Postmortems dir (agent_docs/postmortems/) | Empty-dir busywork | First real postmortem (create the dir with it) |
+| Additional MCP servers (GitHub MCP, Context7) | Opt-in dev tooling; enableAllProjectMcpServers stays false | Explicit per-tool need |
+
+When Phases 17–30 are done, re-audit the repo and plan v2 here — same drill as
+2026-06-05.

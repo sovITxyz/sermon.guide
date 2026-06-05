@@ -250,6 +250,9 @@ def test_extract_citations_returns_only_present_markers() -> None:
     cites = summary_module._extract_citations("Faith matters [Faith:0]. Hope unused.", sources)
     assert [c.marker for c in cites] == ["[Faith:0]"]
     assert cites[0].book_id == b1
+    # Phase 16: the citation carries the pruned chunk text so the UI can
+    # render a preview without a second round-trip.
+    assert cites[0].content == "passage"
 
 
 def test_extract_citations_first_appearance_order() -> None:
@@ -453,6 +456,7 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
     assert resp.citations[0].book_id == b1
     assert resp.citations[0].chunk_index == 7
     assert resp.citations[0].title == "Romans"
+    assert resp.citations[0].content == "grace abounds"
 
 
 # --- provider resolution (Phase 14b, ADR 0005) -------------------------------

@@ -16,6 +16,21 @@ export interface LibraryResponse {
   books: LibraryBook[];
 }
 
+export interface SummaryCitation {
+  marker: string;
+  book_id: string;
+  title: string;
+  chunk_index: number;
+  content: string;
+  filename: string | null;
+  parent_section: string | null;
+}
+
+export interface SummaryResponse {
+  summary: string;
+  citations: SummaryCitation[];
+}
+
 export interface UploadAccepted {
   task_id: string;
   upload_id: string;

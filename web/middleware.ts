@@ -20,5 +20,5 @@ export function middleware(req: NextRequest): NextResponse {
 }
 
 export const config = {
-  matcher: ["/library/:path*", "/upload/:path*"],
+  matcher: ["/library/:path*", "/search/:path*", "/upload/:path*"],
 };

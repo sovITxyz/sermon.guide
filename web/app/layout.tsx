@@ -26,6 +26,9 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
             </Link>
             {authed ? (
               <div className="flex items-center gap-4 text-sm">
+                <Link href="/search" className="hover:underline">
+                  Search
+                </Link>
                 <Link href="/library" className="hover:underline">
                   Library
                 </Link>

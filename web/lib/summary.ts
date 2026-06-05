@@ -83,6 +83,23 @@ export function segmentSummary(
   return segments;
 }
 
+/**
+ * Presentational guard for `parent_section`: EPUB extraction sometimes leaves
+ * raw HTML fragments in the section metadata (seen live in Phase 16's verify:
+ * `<a href="part0002.html#pt03ch_11" …`). React escapes them — no XSS — but a
+ * tag soup header is worse than none, so anything containing `<` is dropped.
+ */
+export function displaySection(section: string | null): string | null {
+  if (!section) {
+    return null;
+  }
+  const trimmed = section.trim();
+  if (trimmed.length === 0 || trimmed.includes("<")) {
+    return null;
+  }
+  return trimmed;
+}
+
 /** `134` → `"2:14"` — the elapsed label shown while a search is in flight. */
 export function formatElapsed(totalSeconds: number): string {
   const whole = Math.max(0, Math.floor(totalSeconds));

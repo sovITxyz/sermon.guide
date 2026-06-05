@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_QUERY_LENGTH,
   type SummarySegment,
+  displaySection,
   formatElapsed,
   searchQueryProblem,
   segmentSummary,
@@ -99,6 +100,23 @@ describe("segmentSummary", () => {
 
   it("returns no segments for an empty summary", () => {
     expect(segmentSummary("", [])).toEqual([]);
+  });
+});
+
+describe("displaySection", () => {
+  it("passes a clean section label through, trimmed", () => {
+    expect(displaySection("  Book III, Chapter 11  ")).toBe("Book III, Chapter 11");
+  });
+
+  it("drops null, empty, and whitespace-only sections", () => {
+    expect(displaySection(null)).toBeNull();
+    expect(displaySection("")).toBeNull();
+    expect(displaySection("   ")).toBeNull();
+  });
+
+  it("drops EPUB-extraction HTML debris (Phase 16 live finding)", () => {
+    expect(displaySection('<a href="part0002.html#pt03ch_11" class="calibre4"><span')).toBeNull();
+    expect(displaySection("Faith <b>and</b> Works")).toBeNull();
   });
 });
 

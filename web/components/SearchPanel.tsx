@@ -1,6 +1,6 @@
 "use client";
 
-import { formatElapsed, searchQueryProblem, segmentSummary } from "@/lib/summary";
+import { displaySection, formatElapsed, searchQueryProblem, segmentSummary } from "@/lib/summary";
 import type { SummaryResponse } from "@/lib/types";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
@@ -165,38 +165,41 @@ export function SearchPanel() {
           <div>
             <h2 className="mb-3 font-semibold text-lg">Sources</h2>
             <ol className="space-y-3">
-              {result.citations.map((citation, index) => (
-                <li
-                  key={citation.marker}
-                  id={`citation-${index + 1}`}
-                  className="rounded-lg border border-gray-200 p-4 target:border-blue-300"
-                >
-                  <div className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                    <span className="font-medium text-blue-700 text-xs">[{index + 1}]</span>
-                    <span className="font-medium text-sm">{citation.title}</span>
-                    <span className="text-gray-500 text-xs">
-                      {citation.parent_section ? `${citation.parent_section} · ` : ""}
-                      chunk {citation.chunk_index}
-                    </span>
-                  </div>
-                  <p
-                    className={`whitespace-pre-wrap text-gray-600 text-sm ${
-                      expanded.has(index) ? "" : "line-clamp-4"
-                    }`}
+              {result.citations.map((citation, index) => {
+                const section = displaySection(citation.parent_section);
+                return (
+                  <li
+                    key={citation.marker}
+                    id={`citation-${index + 1}`}
+                    className="rounded-lg border border-gray-200 p-4 target:border-blue-300"
                   >
-                    {citation.content}
-                  </p>
-                  {citation.content.length > PREVIEW_TOGGLE_CHARS ? (
-                    <button
-                      type="button"
-                      onClick={() => toggleExpanded(index)}
-                      className="mt-2 text-blue-600 text-xs hover:underline"
+                    <div className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                      <span className="font-medium text-blue-700 text-xs">[{index + 1}]</span>
+                      <span className="font-medium text-sm">{citation.title}</span>
+                      <span className="text-gray-500 text-xs">
+                        {section ? `${section} · ` : ""}
+                        chunk {citation.chunk_index}
+                      </span>
+                    </div>
+                    <p
+                      className={`whitespace-pre-wrap text-gray-600 text-sm ${
+                        expanded.has(index) ? "" : "line-clamp-4"
+                      }`}
                     >
-                      {expanded.has(index) ? "Show less" : "Show more"}
-                    </button>
-                  ) : null}
-                </li>
-              ))}
+                      {citation.content}
+                    </p>
+                    {citation.content.length > PREVIEW_TOGGLE_CHARS ? (
+                      <button
+                        type="button"
+                        onClick={() => toggleExpanded(index)}
+                        className="mt-2 text-blue-600 text-xs hover:underline"
+                      >
+                        {expanded.has(index) ? "Show less" : "Show more"}
+                      </button>
+                    ) : null}
+                  </li>
+                );
+              })}
             </ol>
           </div>
         </div>

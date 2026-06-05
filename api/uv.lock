@@ -1215,11 +1215,11 @@ requires-dist = [
     { name = "pymilvus", specifier = ">=2.6,<4" },
     { name = "python-jose", extras = ["cryptography"], specifier = ">=3.3,<4" },
     { name = "python-multipart", specifier = ">=0.0.20,<1" },
-    { name = "redis", specifier = ">=5,<8" },
+    { name = "redis", specifier = ">=5,<9" },
     { name = "sentence-transformers", specifier = ">=3,<6" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3" },
     { name = "torch", specifier = ">=2.5,<3", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32,<0.48" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32,<0.50" },
 ]
 
 [package.metadata.requires-dev]

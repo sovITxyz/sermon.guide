@@ -27,6 +27,7 @@ After each phase commit, tick the box and append: completion date, branch name, 
 
 v1 (planned 2026-06-05 — see the **v1 Plan — Beyond Phase 16** section below for milestones, per-phase prompts, dependencies, and the parked/trigger-gated list):
 
+- [ ] Phase 16b — **PRIORITY: implement before Phase 17.** Remote inference — kill in-process models: embeddings/rerank/highlight via hosted APIs (DeepInfra, exact-weights BGE so existing vectors stay valid), summary LLM stays on ppq per ADR 0005; delete torch/sentence-transformers, drop the HF cache + prewarm, downsize the prod box (planned 2026-06-05; ppq catalog live-probed — chat-completions only, zero embedders, so the embeddings transport stays env-portable for the day ppq ships /v1/embeddings)
 - [ ] Phase 17 — CI service containers + model cache: make the gates run for real
 - [ ] Phase 18 — JWT-secret startup guard + Pydantic extra='forbid' + /readyz
 - [ ] Phase 19 — Edge rate limiting (signup/login/search-summary) + CORS prod-origin guard
@@ -806,6 +807,98 @@ hand-verified web flows become regression tests.
 Docs stop lying; structured logs + metrics + error tracking make the §1 latency
 targets observable; backups make disk loss survivable; baked offline-capable images
 build in CI; readiness-gated k8s/KEDA manifests land the locked deploy direction.
+
+---
+
+## Phase 16b — Remote inference: kill in-process models (PRIORITY — before Phase 17)
+
+```
+cd to sermon.guide. Read ARCHITECTURE.md §2/§5, docs/adr/0005-llm-transport.md,
+api/search.py, api/rerank.py, api/highlight.py, api/summary.py,
+worker/embedding.py, worker/chunking.py, infra/docker-compose.prod.yml.
+
+Goal: NO model weights load in-process anywhere — every inference leg becomes a
+remote API call. Kills ~3.7GB resident RAM in the api (+ ~3GB worker spikes),
+~75s/query of CPU model time, and the ~40min/book ingest wall; shrinks both
+Python images by ~1.5GB; lets the AWS box downsize t3a.xlarge → t3a.large
+(~$55/mo, us-east-1 verified 2026-06-05).
+
+Decisions locked by the 2026-06-05 research pass (re-verify prices on the live
+pages before pinning ids):
+- Embeddings (query + ingest chunks + semantic-chunking boundaries): DeepInfra
+  BAAI/bge-large-en-v1.5 — EXACT same weights as today, so every existing
+  Milvus vector stays valid (no re-embed, goldens keep their calibration).
+  OpenAI-embeddings-compatible (https://api.deepinfra.com/v1/openai),
+  $0.01/1M tokens, zero-retention by default (matters: users' private
+  libraries). ppq.ai was the preferred vendor but is chat-completions ONLY
+  (catalog live-probed 2026-06-05: 331 models, zero embedders/rerankers) —
+  keep base_url/model/key env-driven so a future ppq /v1/embeddings is an
+  env flip, no code.
+- Rerank: replace the in-process cross-encoder with DeepInfra
+  BAAI/bge-reranker-v2-m3 (~$0.01/1M, sub-200ms for 30 docs, beats the
+  2021 MiniLM on BEIR-class benchmarks). Same query+passages→scores shape.
+- Highlight: KEEP the stage and the 0.5 threshold — the no-context →
+  no-LLM-call anti-confabulation contract (Phases 14/16 live verifies)
+  depends on it. Swap in-process BGE-M3 for DeepInfra BAAI/bge-m3 dense,
+  one batched call per query (~300 sentences ≈ $0.000075).
+- Summary LLM: unchanged — ppq/google via the ADR 0005 transport. Latency
+  bonus IF the active provider exposes it: reasoning_effort "none"/minimal
+  (verified on Google's OpenAI-compat layer for 2.5-era models; ppq only
+  documents reasoning.effort on /v1/responses, not chat.completions) —
+  probe and take the win (~60s thinking → ~5-10s non-thinking).
+
+## Build
+- Branch: phase-16b/remote-inference off main.
+- ADR 0006: remote inference transport — vendor matrix, the
+  vector-compatibility argument (same weights => zero migration), privacy
+  posture (DeepInfra zero-retention default; ppq policy re-checked), and the
+  ppq-embeddings gap + env-portability story.
+- Shared transport lives in worker/ (api already imports worker modules):
+  OpenAI-compatible embeddings client + thin rerank client. Env (unprefixed
+  key alias per the GOOGLE_API_KEY/PPQ_API_KEY precedent):
+  SERMON_EMBEDDINGS_BASE_URL / SERMON_EMBEDDINGS_MODEL / DEEPINFRA_API_KEY /
+  SERMON_RERANK_MODEL. Timeouts + one retry; failure → 502 naming the
+  provider (the 14b pattern). Batch <= provider max, preserve input order.
+- Space-consistency guard: record the embedding model id once at bootstrap
+  (Postgres meta row or Milvus collection description); embed/search refuse
+  to run when env model != recorded model. Silent provider/model drift would
+  mix embedding spaces and quietly destroy retrieval — make it loud.
+- worker/embedding.py: embed() keeps its signature; body becomes the API
+  call. worker/chunking.py: swap HuggingFaceEmbedding for the same transport
+  (llama-index OpenAI-compatible embedding class), same model id.
+- api/rerank.py + api/highlight.py: same public shapes, thresholds, and
+  metadata keys (rrf_score, sentences_kept/total) — bodies become API calls.
+- Delete: torch + sentence-transformers from BOTH pyprojects (regenerate
+  uv locks); HF cache volume + prewarm one-shot + HF_HUB_OFFLINE/HF_HOME
+  from infra/docker-compose.prod.yml and both Dockerfiles;
+  infra/scripts/prewarm_models.py.
+- ARCHITECTURE.md §2 rows (embedding/rerank/pruning) + §5 lifecycle updated;
+  api/AGENTS.md model table → remote-call table (no pin-lockstep concern).
+
+## Verify
+- Unit suites green with transports mocked — every existing rerank/highlight
+  behavioral pin (truncation, tiebreak, threshold inclusivity, metadata
+  preservation) must survive the seam swap unchanged.
+- make test-retrieval-golden 9/9 against live DeepInfra (same weights => same
+  thresholds, re-ingest NOT required). Spot-check one query's vector against
+  the local model's output within float tolerance.
+- make test-isolation 3/3 (hard gate; no tenant surface changed).
+- Live prod timing before/after: /search-summary warm E2E — target <=15s with
+  reasoning off, <=70s if thinking stays. Record both in the row.
+- RAM: api + worker resident <1GB combined warm (was ~7GB). Then stop the
+  box → modify-instance-attribute t3a.xlarge → t3a.large → start → re-run
+  deploy smoke.
+- Cost reconciliation: one EPUB ingest + 10 searches against the DeepInfra +
+  ppq dashboards (~$0.006/book, ~$0.001-0.004/search expected).
+- Gates: /check-tenant-leak + tenant-auditor + /security-review — new
+  outbound calls carry chunk text to DeepInfra: confirm no user_id/JWT/email
+  ever leaves, keys flow env → Authorization header only.
+
+## Close out
+- Flip this row with: pinned model ids + prices, measured E2E latency delta,
+  RAM delta, instance downsize done/deferred, and any ppq capability changes
+  (embeddings endpoint? reasoning knobs on chat.completions?).
+```
 
 ---
 

@@ -2,7 +2,7 @@
 
 The api/ process never runs the ingest pipeline; it only *enqueues* by
 task name (``tasks.ingest.ingest_book``) so the api venv stays free of
-pymilvus / sentence-transformers / pandoc — those are worker concerns.
+the extractor stack (pandoc / EbookLib / pymupdf4llm) — worker concerns.
 A separate ``Celery()`` instance against the same Redis broker + result
 backend is enough for ``send_task`` + ``AsyncResult``.
 

@@ -1,18 +1,21 @@
-"""Unit tests for BGE-M3 sentence-level highlighting glue (Phase 13).
+"""Unit tests for BGE-M3 sentence-level highlighting glue (Phase 13; remote
+seam since Phase 16b).
 
 Live BGE-M3 inference is exercised by the goldens + manual e2e; this
 file pins the deterministic glue:
 
-- Empty input short-circuits without loading the model.
+- Empty input short-circuits without any remote call.
 - Sentence splitter handles common boundaries + abbreviation edge cases.
 - Below-threshold sentences are dropped; above-threshold survive.
 - Whole-chunk-pruned hits are removed from output.
 - Unsplittable chunks pass through unchanged.
 - ``metadata["sentences_kept" / "sentences_total"]`` records the prune ratio.
+- The query and every sentence ride ONE batched call (Phase 16b: that
+  batch is a single network round-trip per request).
 
-We monkeypatch ``highlight._model`` so no HF cache, no torch, no
-network. The real BGE-M3 is exercised by the manual e2e against the
-5-book corpus (see Phase 13 verify in docs/PHASES.md).
+We monkeypatch ``highlight._embed_batch`` — the seam in front of
+``worker/inference.py:embed_texts`` — so no key, no network. Every
+behavioral pin from the in-process era survives the seam swap unchanged.
 """
 
 # Tests reach into module internals on purpose. pytest.approx + numpy
@@ -22,7 +25,6 @@ network. The real BGE-M3 is exercised by the manual e2e against the
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 import numpy as np
 import pytest
@@ -31,24 +33,23 @@ from retrieval import RetrievalHit
 import highlight as highlight_module
 
 
-class _FakeBGEM3:
-    """In-process stand-in for ``SentenceTransformer`` returning unit vectors.
+class _FakeEmbedder:
+    """In-process stand-in for ``highlight._embed_batch`` returning unit vectors.
 
-    ``encode`` returns an array whose i-th row is constructed so that
-    its inner product with a chosen ``query_vec`` equals a chosen
-    per-sentence score. The test driver builds the score plan; the
-    fake reverse-engineers the right vectors.
+    Returns an array whose i-th row is constructed so that its inner
+    product with the query row equals a chosen per-sentence score. The
+    test driver builds the score plan; the fake reverse-engineers the
+    right vectors. ``calls`` records every batch for assertions about
+    call elision and single-batch behavior.
     """
 
     def __init__(self, query_score_plan: dict[str, float]) -> None:
         """``query_score_plan`` maps sentence text → desired cosine-vs-query score."""
         self._plan = query_score_plan
+        self.calls: list[list[str]] = []
 
-    def encode(
-        self,
-        texts: list[str],
-        **_: Any,  # noqa: ANN401 — match SentenceTransformer.encode loosely
-    ) -> np.ndarray:
+    def __call__(self, texts: list[str]) -> np.ndarray:
+        self.calls.append(list(texts))
         # Two-dim space is enough: the query is (1, 0); each sentence is
         # (score, sqrt(1-score^2)) so query·sentence = score. Off-plan
         # sentences default to 0.0.
@@ -78,22 +79,38 @@ def _hit(book_idx: int, chunk_index: int, content: str, *, score: float = 0.1) -
     )
 
 
-def test_highlight_empty_hits_returns_empty_without_model_load(
+def test_highlight_empty_hits_returns_empty_without_remote_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Empty input must not load BGE-M3.
+    """Empty input must not reach the remote embedder.
 
-    BGE-M3 is ~2.3GB; an empty-library /search should never pay the
-    model load. Mirrors the same guarantee in test_rerank_unit.py.
+    An empty-library /search should never pay a network round-trip (or
+    require a key). Mirrors the same guarantee in test_rerank_unit.py.
     """
 
-    def _explode() -> None:
-        msg = "model should not be loaded for empty input"
+    def _explode(_texts: list[str]) -> np.ndarray:
+        msg = "remote embedder should not be called for empty input"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(highlight_module, "_model", _explode)
+    monkeypatch.setattr(highlight_module, "_embed_batch", _explode)
     out = highlight_module.highlight(query=_QUERY, hits=[])
     assert out == []
+
+
+def test_highlight_no_splittable_sentences_makes_no_remote_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All-whitespace chunks score nothing — pass through, zero network."""
+
+    def _explode(_texts: list[str]) -> np.ndarray:
+        msg = "remote embedder should not be called when nothing splits"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(highlight_module, "_embed_batch", _explode)
+    out = highlight_module.highlight(query=_QUERY, hits=[_hit(1, 0, "   \n\t ")])
+    assert len(out) == 1
+    assert out[0].metadata["sentences_kept"] == 0
+    assert out[0].metadata["sentences_total"] == 0
 
 
 def test_split_sentences_handles_basic_boundaries() -> None:
@@ -134,13 +151,43 @@ def test_highlight_drops_below_threshold_sentences(monkeypatch: pytest.MonkeyPat
         "Grace abounds throughout scripture.": 0.8,
         "The weather report is sunny today.": 0.2,
     }
-    monkeypatch.setattr(highlight_module, "_model", lambda: _FakeBGEM3(score_plan))
+    monkeypatch.setattr(highlight_module, "_embed_batch", _FakeEmbedder(score_plan))
 
     out = highlight_module.highlight(query=_QUERY, hits=[_hit(1, 0, content)])
     assert len(out) == 1
     assert out[0].content_chunk == "Grace abounds throughout scripture."
     assert out[0].metadata["sentences_kept"] == 1
     assert out[0].metadata["sentences_total"] == 2
+
+
+def test_highlight_scores_query_and_sentences_in_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The query rides as row 0 of a SINGLE batched call (Phase 16b contract).
+
+    One network round-trip per request however many chunks survived the
+    rerank — N+1 per-sentence calls would multiply provider latency into
+    the user-facing path.
+    """
+    content_a = "Grace abounds throughout scripture. The weather report is sunny today."
+    content_b = "Another chunk entirely."
+    fake = _FakeEmbedder(
+        {
+            "Grace abounds throughout scripture.": 0.8,
+            "The weather report is sunny today.": 0.2,
+            "Another chunk entirely.": 0.6,
+        },
+    )
+    monkeypatch.setattr(highlight_module, "_embed_batch", fake)
+
+    highlight_module.highlight(query=_QUERY, hits=[_hit(1, 0, content_a), _hit(2, 0, content_b)])
+    assert len(fake.calls) == 1
+    assert fake.calls[0] == [
+        _QUERY,
+        "Grace abounds throughout scripture.",
+        "The weather report is sunny today.",
+        "Another chunk entirely.",
+    ]
 
 
 def test_highlight_drops_entire_chunk_when_all_below_threshold(
@@ -155,7 +202,7 @@ def test_highlight_drops_entire_chunk_when_all_below_threshold(
         "Completely unrelated narrative.": 0.2,
         "Off-topic filler text.": 0.1,
     }
-    monkeypatch.setattr(highlight_module, "_model", lambda: _FakeBGEM3(score_plan))
+    monkeypatch.setattr(highlight_module, "_embed_batch", _FakeEmbedder(score_plan))
 
     out = highlight_module.highlight(
         query=_QUERY,
@@ -174,7 +221,7 @@ def test_highlight_preserves_sentence_order(monkeypatch: pytest.MonkeyPatch) -> 
         "Off-topic middle.": 0.1,
         "Second on-topic.": 0.6,
     }
-    monkeypatch.setattr(highlight_module, "_model", lambda: _FakeBGEM3(score_plan))
+    monkeypatch.setattr(highlight_module, "_embed_batch", _FakeEmbedder(score_plan))
 
     out = highlight_module.highlight(query=_QUERY, hits=[_hit(1, 0, content)])
     assert out[0].content_chunk == "First on-topic. Second on-topic."
@@ -184,7 +231,7 @@ def test_highlight_threshold_boundary_is_inclusive(monkeypatch: pytest.MonkeyPat
     """A sentence scoring exactly at threshold is kept (>= threshold)."""
     content = "Boundary sentence."
     score_plan = {"Boundary sentence.": 0.5}
-    monkeypatch.setattr(highlight_module, "_model", lambda: _FakeBGEM3(score_plan))
+    monkeypatch.setattr(highlight_module, "_embed_batch", _FakeEmbedder(score_plan))
 
     out = highlight_module.highlight(query=_QUERY, hits=[_hit(1, 0, content)], threshold=0.5)
     assert len(out) == 1
@@ -199,13 +246,13 @@ def test_highlight_unsplittable_chunk_passes_through_unchanged(
     the metadata records ``sentences_total=1`` (it's one pseudo-sentence)."""
     content = "fragment without sentence boundaries that still got retrieved"
     score_plan = {content: 0.9}
-    monkeypatch.setattr(highlight_module, "_model", lambda: _FakeBGEM3(score_plan))
+    monkeypatch.setattr(highlight_module, "_embed_batch", _FakeEmbedder(score_plan))
 
     out = highlight_module.highlight(query=_QUERY, hits=[_hit(1, 0, content)])
     assert len(out) == 1
     assert out[0].content_chunk == content
-    # _split_sentences returns 1 element (the whole fragment); BGE-M3
-    # scores it 0.9, so it survives as one "kept" sentence.
+    # _split_sentences returns 1 element (the whole fragment); the remote
+    # scorer rates it 0.9, so it survives as one "kept" sentence.
     assert out[0].metadata["sentences_kept"] == 1
     assert out[0].metadata["sentences_total"] == 1
 
@@ -219,7 +266,7 @@ def test_highlight_records_prune_ratio_metadata(monkeypatch: pytest.MonkeyPatch)
         "Drop two.": 0.1,
         "Keep two.": 0.7,
     }
-    monkeypatch.setattr(highlight_module, "_model", lambda: _FakeBGEM3(score_plan))
+    monkeypatch.setattr(highlight_module, "_embed_batch", _FakeEmbedder(score_plan))
 
     out = highlight_module.highlight(query=_QUERY, hits=[_hit(1, 0, content)])
     assert len(out) == 1
@@ -233,7 +280,7 @@ def test_highlight_preserves_existing_metadata_keys(monkeypatch: pytest.MonkeyPa
     from a rerank pass) is preserved when highlight adds its own keys."""
     content = "Survives. Drops."
     score_plan = {"Survives.": 0.9, "Drops.": 0.1}
-    monkeypatch.setattr(highlight_module, "_model", lambda: _FakeBGEM3(score_plan))
+    monkeypatch.setattr(highlight_module, "_embed_batch", _FakeEmbedder(score_plan))
 
     hit = RetrievalHit(
         book_id=uuid.UUID(int=1),

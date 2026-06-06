@@ -1,0 +1,87 @@
+# Caddy edge config for the single-box AWS deploy.
+#
+# SITE_HOST comes from the environment (set in /opt/sermon/.env.prod by
+# infra/aws/deploy.sh) and is a BARE host — an IP for now, a domain later:
+#   - IP-only deploy:  SITE_HOST=<elastic-ip>  → Caddy's internal CA
+#     self-signs for the IP (browser shows a one-time warning).
+#   - Domain later:    SITE_HOST=sermon.guide  → also REMOVE the
+#     `tls internal` line below so automatic Let's Encrypt takes over,
+#     and consider adding HSTS then (deliberately NOT set now: HSTS + a
+#     self-signed IP cert would lock browsers out with no bypass).
+#
+# default_sni is LOAD-BEARING for the IP deploy: browsers do not send SNI
+# when the URL host is an IP address (RFC 6066), and without it Caddy can't
+# pick a certificate and aborts the handshake ("tlsv1 alert internal
+# error") — verified empirically against this exact image. The internal-CA
+# IP cert is correct on this box because it has a single interface/EIP; do
+# not add on_demand_tls here (known wrong-SAN failure modes on multi-IP
+# hosts — caddy#5479).
+#
+# Only web:3000 is proxied. The api is NOT publicly exposed at all — every
+# browser call goes through the Next.js same-origin route handlers, which
+# attach the JWT server-side (web/AGENTS.md auth model). Postgres/Redis/
+# Milvus/MinIO/etcd publish no host ports (see docker-compose.prod.yml).
+
+{
+	admin off
+	# rate_limit is a non-standard directive; give it an explicit slot.
+	order rate_limit before basic_auth
+	default_sni {$SITE_HOST}
+}
+
+https://{$SITE_HOST}
+
+tls internal
+
+encode zstd gzip
+
+# Body caps at the edge. Two request_body handlers NEST MaxBytesReaders, so
+# the smallest matching cap wins: JSON routes are capped at 1MB even though
+# the catch-all also matches. The catch-all is 200MB (decimal), deliberately
+# BELOW the api's 200MiB (209,715,200-byte) streamed cap, so oversized
+# uploads are rejected here before the Next proxy buffers them via
+# req.formData() — the api stays authoritative for everything smaller.
+@json_routes path /api/auth/* /api/search-summary /api/tasks/*
+request_body @json_routes {
+	max_size 1MB
+}
+request_body {
+	max_size 200MB
+}
+
+# Per-IP rate limits (HTTP 429 + Retry-After when exceeded). Keyed on
+# {remote_host} = the TCP peer address — Caddy ignores client-supplied
+# X-Forwarded-For unless trusted_proxies is configured, so the buckets
+# can't be spoofed sideways.
+#   auth:  blunt credential stuffing / mass signup (Phase 19 gap).
+#   heavy: /search-summary is ~2min of CPU + a paid LLM call; /upload
+#          triggers tens of minutes of CPU ingest. Keep them scarce.
+#   general: per-IP flood backstop for everything else.
+rate_limit {
+	zone auth {
+		match {
+			path /api/auth/*
+		}
+		key {remote_host}
+		events 10
+		window 1m
+	}
+	zone heavy {
+		match {
+			path /api/search-summary /api/upload
+		}
+		key {remote_host}
+		events 6
+		window 1m
+	}
+	zone general {
+		key {remote_host}
+		events 600
+		window 1m
+	}
+}
+
+# No response timeout overrides: /search-summary legitimately holds the
+# connection ~130-300s (web's own upstream AbortSignal is 300s); Caddy's
+# defaults don't time out upstream reads, so leave them alone.
+reverse_proxy web:3000

@@ -34,68 +34,71 @@
 	fallback_sni {$SITE_HOST}
 }
 
-https://{$SITE_HOST}
+https://{$SITE_HOST} {
 
-tls internal
+	tls internal
 
-encode zstd gzip
+	encode zstd gzip
 
-# Body caps at the edge. Two request_body handlers NEST MaxBytesReaders, so
-# the smallest matching cap wins: JSON routes are capped at 1MB even though
-# the catch-all also matches. The catch-all is 200MB (decimal), deliberately
-# BELOW the api's 200MiB (209,715,200-byte) streamed cap, so oversized
-# uploads are rejected here before the Next proxy buffers them via
-# req.formData() — the api stays authoritative for everything smaller.
-@json_routes path /api/auth/* /api/search-summary /api/tasks/*
-request_body @json_routes {
-	max_size 1MB
-}
-request_body {
-	max_size 200MB
-}
+	# Body caps at the edge. Two request_body handlers NEST MaxBytesReaders, so
+	# the smallest matching cap wins: JSON routes are capped at 1MB even though
+	# the catch-all also matches. The catch-all is 200MB (decimal), deliberately
+	# BELOW the api's 200MiB (209,715,200-byte) streamed cap, so oversized
+	# uploads are rejected here before the Next proxy buffers them via
+	# req.formData() — the api stays authoritative for everything smaller.
+	@json_routes path /api/auth/* /api/search-summary /api/tasks/*
+	request_body @json_routes {
+		max_size 1MB
+	}
+	request_body {
+		max_size 200MB
+	}
 
-# Per-IP rate limits (HTTP 429 + Retry-After when exceeded). Keyed on
-# {remote_host} = the TCP peer address — Caddy ignores client-supplied
-# X-Forwarded-For unless trusted_proxies is configured, so the buckets
-# can't be spoofed sideways.
-#   auth:  blunt credential stuffing / mass signup (Phase 19 gap).
-#   heavy: /search-summary is ~2min of CPU + a paid LLM call; /upload
-#          triggers tens of minutes of CPU ingest. Keep them scarce.
-#   general: per-IP flood backstop for everything else.
-rate_limit {
-	zone auth {
-		match {
-			path /api/auth/*
+	# Per-IP rate limits (HTTP 429 + Retry-After when exceeded). Keyed on
+	# {remote_host} = the TCP peer address — Caddy ignores client-supplied
+	# X-Forwarded-For unless trusted_proxies is configured, so the buckets
+	# can't be spoofed sideways.
+	#   auth:  blunt credential stuffing / mass signup (Phase 19 gap).
+	#   heavy: /search-summary is ~2min of CPU + a paid LLM call; /upload
+	#          triggers tens of minutes of CPU ingest. Keep them scarce.
+	#   general: per-IP flood backstop for everything else.
+	rate_limit {
+		zone auth {
+			match {
+				path /api/auth/*
+			}
+			key {remote_host}
+			events 10
+			window 1m
 		}
-		key {remote_host}
-		events 10
-		window 1m
-	}
-	zone heavy {
-		match {
-			path /api/search-summary /api/upload
+		zone heavy {
+			match {
+				path /api/search-summary /api/upload
+			}
+			key {remote_host}
+			events 6
+			window 1m
 		}
-		key {remote_host}
-		events 6
-		window 1m
+		zone general {
+			key {remote_host}
+			events 600
+			window 1m
+		}
 	}
-	zone general {
-		key {remote_host}
-		events 600
-		window 1m
-	}
-}
 
-# No response timeout overrides: /search-summary legitimately holds the
-# connection ~130-300s (web's own upstream AbortSignal is 300s); Caddy's
-# defaults don't time out upstream reads, so leave them alone.
-reverse_proxy web:3000
+	# No response timeout overrides: /search-summary legitimately holds the
+	# connection ~130-300s (web's own upstream AbortSignal is 300s); Caddy's
+	# defaults don't time out upstream reads, so leave them alone.
+	reverse_proxy web:3000
+}
 
 # Container-internal health listener (loopback-only, NOT host-published).
 # The compose healthcheck probes this instead of the TLS site: it proves
 # caddy is up AND the proxy→web chain works, without depending on busybox
 # wget's TLS/SNI quirks. The real TLS path is exercised by deploy.sh's
-# external smoke test.
+# external smoke test. NOTE: a second site block requires the braced
+# multi-site Caddyfile form — a bare-address single site swallows later
+# blocks as unknown directives (broke the previous deploy).
 http://127.0.0.1:8081 {
 	reverse_proxy web:3000
 }

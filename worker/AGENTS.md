@@ -107,12 +107,14 @@ on shifts in meaning rather than fixed token windows
 ([`ARCHITECTURE.md` §2](../ARCHITECTURE.md#2-locked-decisions)).
 
 The boundary-detection embedder is **`BAAI/bge-large-en-v1.5`** — the same
-1024-d model Phase 6 will use for the chunk embeddings written to Milvus.
-Reusing one model keeps ingestion to a single ~1.3GB download. The first
-`chunk()` call after a cold venv triggers that download via HuggingFace
-Hub; subsequent calls hit the `HF_HOME` cache and the load is millisecond.
-The end-to-end test gates on `~/.cache/huggingface/hub/models--BAAI--bge-large-en-v1.5/`
-and skips when absent so CI doesn't block on a model fetch.
+1024-d model Phase 6 uses for the chunk embeddings written to Milvus. Since
+Phase 16b ([ADR 0006](../docs/adr/0006-remote-inference.md)) it is a
+**remote call**: `chunking.py` constructs a llama-index
+`OpenAILikeEmbedding` against the same env-driven endpoint + model id
+`worker/inference.py` uses (`SERMON_EMBEDDINGS_*`, `DEEPINFRA_API_KEY`),
+so boundary detection and chunk embedding can never disagree on weights.
+No model downloads, no HF cache; the end-to-end test gates on
+`DEEPINFRA_API_KEY` and skips when absent so CI doesn't fail on a 503.
 
 `Chunk` carries `(text, start_idx, end_idx, parent_section)`. `start_idx`
 and `end_idx` are character offsets into the source markdown — they are
@@ -130,47 +132,45 @@ runs it as `__main__` from the worker cwd (same pattern as `extractors`).
 
 ## Embedding
 
-`worker/embedding.py` wraps `sentence-transformers` with the
-**`BAAI/bge-large-en-v1.5`** model (locked in
-[`ARCHITECTURE.md` §2](../ARCHITECTURE.md#2-locked-decisions)). `embed(texts)`
-returns a `(N, 1024)` float32 array with each row L2-normalized — the
-precondition for Milvus' `COSINE` metric to be inner-product in disguise
-([§3](../ARCHITECTURE.md#3-milvus-schema--library_vectors)).
+`worker/embedding.py` produces **`BAAI/bge-large-en-v1.5`** embeddings
+(locked in [`ARCHITECTURE.md` §2](../ARCHITECTURE.md#2-locked-decisions))
+via the remote transport in `worker/inference.py` — since Phase 16b
+([ADR 0006](../docs/adr/0006-remote-inference.md)) no model weights load
+in-process anywhere. `embed(texts)` keeps its Phase 6 contract: a
+`(N, 1024)` float32 array with each row L2-normalized — the precondition
+for Milvus' `COSINE` metric to be inner-product in disguise
+([§3](../ARCHITECTURE.md#3-milvus-schema--library_vectors)). Empty input
+returns a `(0, 1024)` array without touching the network, the database,
+or the key.
 
-The model loads once per process via `@lru_cache`. First call after a cold
-venv pulls ~1.3GB from HuggingFace Hub; subsequent calls hit `HF_HOME` and
-load in a few seconds. Empty input returns a `(0, 1024)` array without
-touching the model — CI's empty-input path never triggers a download.
+**The transport (`worker/inference.py`)** is the shared seam both
+packages use (api/ imports it for query embedding, rerank, and highlight
+scoring): an OpenAI-compatible embeddings client (`openai` SDK,
+`SERMON_EMBEDDINGS_BASE_URL`/`SERMON_EMBEDDINGS_MODEL`) plus a thin
+`httpx` rerank client (`SERMON_RERANK_BASE_URL`/`SERMON_RERANK_MODEL` —
+DeepInfra's reranker endpoint is not OpenAI-shaped), both keyed by the
+unprefixed `DEEPINFRA_API_KEY`. Explicit timeouts, exactly one retry;
+unset key → `MissingInferenceKeyError`, upstream failure →
+`RemoteInferenceError` naming the provider + leg (api/ maps them to
+503/502). Requests carry only already-authorized chunk/query text — no
+`user_id`, JWT, or email ever leaves the process.
 
-Device is pinned to `"cpu"` for Phase 6; swap to `"cuda"` once a GPU
-runtime exists. `torch` is sourced CPU-only in `pyproject.toml` for the
-same reason — see the comment on the `torch` dep.
+**Embedding-space guard.** A deployment's vectors live in exactly one
+model's space. Migration 0003 seeds Postgres `meta('embedding_model_id')`
+with the v0 model; before the first real embed of a process,
+`embedding.py` compares `SERMON_EMBEDDINGS_MODEL` against that row and
+**refuses to run on a mismatch** — silent provider/model drift would mix
+embedding spaces and quietly destroy retrieval. Changing embedders is a
+deliberate migration (re-embed the corpus, recalibrate thresholds, update
+the row), never an env flip.
 
-The Phase 5 semantic chunker (`chunking.py`) also loads BGE-Large for
-boundary detection, via `llama-index-embeddings-huggingface`. The model
-*file* is shared (one HF Hub cache entry); each loader keeps its own
-in-memory copy. Consolidating to a single loader is a future micro-opt,
-not Phase 6 scope.
-
-**Offline mode.** Even with the cache warm, `sentence-transformers` makes
-a HEAD request to HuggingFace Hub on load to check for PEFT adapter
-files (BGE-Large has none) and to revalidate metadata. A DNS hiccup
-during that call surfaces as `RuntimeError: Cannot send a request, as
-the client has been closed.` mid-load — not the friendliest failure.
-
-Set `HF_HUB_OFFLINE=1` (and `TRANSFORMERS_OFFLINE=1` for the inner
-`transformers` calls) when you know the cache is warm and want a
-deterministic, network-free load:
-
-```bash
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-make ingest FILE=... USER=... BOOK=...
-```
-
-CI on GitHub Actions has full network access, so this is a local-dev /
-flaky-Wi-Fi hint, not a default. Production Celery workers (Phase 9)
-should set these in their pod env once the model is baked into the
-image.
+**Weight parity.** The point of pinning DeepInfra's `BAAI/bge-large-en-v1.5`
+is that it serves the EXACT weights the in-process era used: every stored
+Milvus vector stays valid and every calibrated threshold keeps its meaning.
+`tests/test_embedding.py` pins this live — remote vectors must match the
+committed local-model reference (`tests/golden/local_model_refvecs.npz`)
+within float tolerance. If that test fails, do not loosen it; the provider
+drifted and retrieval is suspect.
 
 ## Ingest
 

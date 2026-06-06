@@ -12,7 +12,7 @@ KEDA/k8s shape stays Phase 30.
 aws configure                       # once: credentials + region
 cd infra/aws
 ./provision.sh                      # EC2 t3a.xlarge + EIP + SG (~2min)
-./deploy.sh                         # clone, build, migrate, bootstrap, prewarm, smoke (~20min first run)
+./deploy.sh                         # clone, build, migrate, bootstrap, smoke (first run ~minutes)
                                     #   deploys your CURRENT branch — it must be pushed to origin
                                     #   (deploy.sh preflights this and tells you if not)
 ./stop.sh                           # done for the day → compute billing off
@@ -40,8 +40,10 @@ whole library. **Set a billing alarm** (Billing → Budgets) — nothing in this
 stack does it for you.
 
 LLM spend is separate (per-query, via `GOOGLE_API_KEY`/`PPQ_API_KEY`); a
-warm `/search-summary` was ~6¢ in the Phase 14b live verify. Set a spend cap
-at the provider.
+warm `/search-summary` was ~6¢ in the Phase 14b live verify. Remote
+inference spend (Phase 16b, `DEEPINFRA_API_KEY`) is per-call too:
+~$0.006/book ingest, well under a cent per search. Set spend caps at both
+providers.
 
 ## What deploy.sh actually does
 
@@ -52,15 +54,17 @@ at the provider.
    so a missing secret refuses to boot rather than falling back to the
    dev defaults baked into the code (the Phase 18 startup-guard gap, mitigated
    at the compose layer).
-3. **LLM keys** → if `GOOGLE_API_KEY`/`PPQ_API_KEY` are set in your local
-   shell when you run `./deploy.sh`, they're forwarded into the box's env
-   file (PPQ also flips the provider). Without one, everything works except
-   `/search-summary`, which 503s naming the missing var.
-4. **Build** → all four images build on the instance (first run ~10–20min).
+3. **API keys** → if `GOOGLE_API_KEY`/`PPQ_API_KEY`/`DEEPINFRA_API_KEY` are
+   set in your local shell when you run `./deploy.sh`, they're forwarded into
+   the box's env file (PPQ also flips the provider). Without an LLM key,
+   everything works except `/search-summary`, which 503s naming the missing
+   var. `DEEPINFRA_API_KEY` is REQUIRED (Phase 16b: every search and ingest
+   runs remote inference) — deploy.sh aborts before the build if it's neither
+   on the box nor forwarded.
+4. **Build** → all four images build on the instance (first build is minutes
+   now — Phase 16b removed the torch wheels; Next + xcaddy dominate).
 5. **Bootstrap** → `alembic upgrade head`, `bootstrap_milvus.py` (both
-   idempotent), then the `prewarm` one-shot downloads the three models
-   (~3.7GB) into the shared `sermon-hf-cache` volume — the only moment the
-   stack talks to HuggingFace. Runtime containers run `HF_HUB_OFFLINE=1`.
+   idempotent). No model downloads: all inference is remote (ADR 0006).
 6. **Up + smoke** → `up -d --wait`, then an outside-in signup→login→/library
    pass through Caddy with a cookie jar.
 
@@ -125,8 +129,9 @@ aws ec2 create-snapshot --volume-id $(aws ec2 describe-instances \
 ## Known deltas vs the phase plan
 
 - This is operator tooling on branch `deploy/aws-v0`, not Phase 29/30:
-  images build on the box (no registry/CI), models live in a volume rather
-  than baked into images. When Phase 29 lands proper image-build CI, these
-  Dockerfiles are its starting point and `prewarm` becomes a build step.
+  images build on the box (no registry/CI). When Phase 29 lands proper
+  image-build CI, these Dockerfiles are its starting point. (The model
+  volume + `prewarm` step this bullet used to describe were removed by
+  Phase 16b — all inference is remote now, ADR 0006.)
 - `web/next.config.ts` gained `output: "standalone"` (required for the slim
   web image; dev/CI behavior unchanged).

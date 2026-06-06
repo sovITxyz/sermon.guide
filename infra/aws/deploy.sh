@@ -115,13 +115,19 @@ compose() {
 compose build
 
 # --- 5. data plane up → one-shots ---
+# NOTE: every `compose run` below MUST have stdin redirected (</dev/null).
+# This whole script arrives on the box via `bash -s` reading ssh stdin, and
+# `docker compose run` attaches the container's stdin by default — without
+# the redirect the one-shot container EATS THE REST OF THIS SCRIPT off the
+# stream and bash silently exits 0 after that line (observed on the first
+# real deploy: everything after `migrate` vanished).
 compose up -d --wait postgres redis etcd minio milvus
-compose run --rm migrate
+compose run --rm migrate </dev/null
 # Milvus's :9091 healthz can report healthy moments before the :19530 gRPC
 # path accepts queries on a cold standalone — retry instead of aborting the
 # whole deploy on that race.
 for attempt in 1 2 3; do
-  if compose run --rm bootstrap-milvus; then
+  if compose run --rm bootstrap-milvus </dev/null; then
     break
   fi
   if [ "\${attempt}" = 3 ]; then
@@ -135,7 +141,7 @@ done
 # Prewarm only when the heaviest model isn't cached yet (~3.7GB once).
 if ! docker run --rm -v sermon_sermon-hf-cache:/hf-cache alpine:3.20 \
     test -d /hf-cache/hub/models--BAAI--bge-m3 2>/dev/null; then
-  compose run --rm prewarm
+  compose run --rm prewarm </dev/null
 else
   echo "hf-cache already warm — skipping prewarm"
 fi

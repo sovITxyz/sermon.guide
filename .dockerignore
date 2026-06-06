@@ -1,0 +1,18 @@
+# Build-context filter for the api/ and worker/ images (context = repo root,
+# because api/ imports worker.db — see api/Dockerfile). web/ builds from its
+# own context (web/) with its own .dockerignore.
+.git
+.github
+.claude
+docs
+infra
+web
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/node_modules
+**/tests/samples
+.env
+.env.*

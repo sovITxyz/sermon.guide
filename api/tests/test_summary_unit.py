@@ -305,6 +305,44 @@ def test_generate_summary_wires_config_and_returns_text(monkeypatch: pytest.Monk
     assert "q?" in user["content"]
 
 
+def test_generate_summary_omits_reasoning_effort_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset SERMON_API_LLM_REASONING_EFFORT → nothing extra on the wire.
+
+    Phase 16b: the knob must be opt-in — gateways that reject unknown
+    params (or models that error on them) keep working untouched.
+    """
+    monkeypatch.setattr(summary_module.settings, "llm_reasoning_effort", None)
+    fake = _FakeClient(text="ok")
+    monkeypatch.setattr(summary_module, "_client", lambda: fake)
+    sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
+
+    summary_module._generate_summary(query="q", sources=sources)
+
+    assert fake.calls[0]["extra_body"] is None
+
+
+def test_generate_summary_sends_reasoning_effort_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SERMON_API_LLM_REASONING_EFFORT=none rides extra_body verbatim.
+
+    Phase 16b latency lever — Google's OpenAI-compat layer accepts
+    "none" to disable Gemini 2.5 Flash thinking (~60s → seconds).
+    extra_body (not the SDK's typed param) so values the SDK literal
+    hasn't caught up to still pass through.
+    """
+    monkeypatch.setattr(summary_module.settings, "llm_reasoning_effort", "none")
+    fake = _FakeClient(text="ok")
+    monkeypatch.setattr(summary_module, "_client", lambda: fake)
+    sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
+
+    summary_module._generate_summary(query="q", sources=sources)
+
+    assert fake.calls[0]["extra_body"] == {"reasoning_effort": "none"}
+
+
 def test_generate_summary_raises_502_on_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
     exc = openai.APIError(
         "down",
@@ -511,6 +549,21 @@ def test_ppq_flip_uses_ppq_default_model(monkeypatch: pytest.MonkeyPatch) -> Non
     summary_module._generate_summary(query="q", sources=sources)
 
     assert fake.calls[0]["model"] == "google/gemini-2.5-flash"
+
+
+def test_reasoning_effort_empty_env_means_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compose's ``${VAR:-}`` delivers "" — must validate to None, not explode.
+
+    The prod compose passes SERMON_API_LLM_REASONING_EFFORT through with an
+    empty default; without the before-validator an empty string would fail
+    the Literal validation at boot.
+    """
+    from settings import ApiSettings
+
+    monkeypatch.setenv("SERMON_API_LLM_REASONING_EFFORT", "")
+    assert ApiSettings().llm_reasoning_effort is None
+    monkeypatch.setenv("SERMON_API_LLM_REASONING_EFFORT", "none")
+    assert ApiSettings().llm_reasoning_effort == "none"
 
 
 def test_llm_model_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -52,6 +52,25 @@ class ApiSettings(BaseSettings):
     # provider's default. Spell it the provider's way — bare ``gemini-2.5-flash``
     # on google, prefixed ``google/gemini-2.5-flash`` on ppq.
     llm_model: str | None = None
+
+    # Optional reasoning-effort knob (SERMON_API_LLM_REASONING_EFFORT); ``None``
+    # → not sent, provider default applies. Phase 16b latency lever: Gemini 2.5
+    # Flash runs thinking by default through the OpenAI-compat layer (~60s of
+    # the /search-summary round-trip); Google's compat endpoint accepts
+    # ``"none"`` to disable it. Sent verbatim via ``extra_body`` — whether a
+    # gateway (ppq) forwards it is a provider property, probed live per phase
+    # row, not assumed.
+    llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
+
+    @field_validator("llm_reasoning_effort", mode="before")
+    @classmethod
+    def _empty_reasoning_effort_is_unset(cls, value: object) -> object:
+        """Compose's ``${VAR:-}`` pattern delivers ``""`` for unset — treat as None.
+
+        Same pattern the prod compose uses for SERMON_API_LLM_MODEL; without
+        this, an empty env var would fail the Literal validation at boot.
+        """
+        return None if value == "" else value
 
     # Both keys are read *unprefixed* via an explicit ``validation_alias`` that
     # bypasses the ``SERMON_API_`` prefix above: GOOGLE_API_KEY is the name

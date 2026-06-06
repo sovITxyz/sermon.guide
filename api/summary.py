@@ -83,8 +83,7 @@ sermon prep; the architecture-locked GPU swap is the documented path.
 """
 
 # The openai SDK ships py.typed with fully-typed chat completions, so this
-# module needs no stub relaxation like the pymilvus / sentence-transformers
-# modules do.
+# module needs no stub relaxation like the pymilvus-touching modules do.
 
 from __future__ import annotations
 
@@ -342,6 +341,11 @@ def _generate_summary(*, query: str, sources: Sequence[_Source]) -> str:
     completion — FastAPI re-raises it from the worker thread into the handler.
     """
     provider = _active_provider()
+    # Phase 16b: optionally disable/cap thinking (SERMON_API_LLM_REASONING_EFFORT).
+    # Sent via extra_body so the knob is provider-agnostic and forward-compatible
+    # with values the SDK's typed literal hasn't caught up to (e.g. "none").
+    reasoning = settings.llm_reasoning_effort
+    extra_body = {"reasoning_effort": reasoning} if reasoning is not None else None
     try:
         response = _client().chat.completions.create(
             model=settings.llm_model or provider.default_model,
@@ -351,6 +355,7 @@ def _generate_summary(*, query: str, sources: Sequence[_Source]) -> str:
             ],
             temperature=_TEMPERATURE,
             max_tokens=_MAX_OUTPUT_TOKENS,
+            extra_body=extra_body,
         )
     except openai.APIError as exc:
         raise HTTPException(

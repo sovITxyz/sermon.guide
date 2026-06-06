@@ -1,0 +1,5 @@
+# Build-context filter for the web image (context = web/).
+node_modules
+.next
+.env
+.env.*

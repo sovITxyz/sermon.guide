@@ -19,7 +19,6 @@ sermon.guide. The k8s/KEDA shape stays post-v0
   [docs/DEPLOY_AWS.md](../docs/DEPLOY_AWS.md).
 - `caddy/` — TLS edge (Dockerfile + Caddyfile: rate limits, body caps,
   default_sni for bare-IP deploys).
-- `scripts/` — deploy-time one-shots (model prewarm into the shared HF cache).
 - `aws/` — provision/deploy/start/stop/status/destroy lifecycle scripts.
   Tag-based and re-runnable; secrets are generated ON the instance, never
   committed.

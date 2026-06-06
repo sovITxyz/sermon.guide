@@ -24,7 +24,10 @@
 # One-shots live behind the "ops" profile so `up` never starts them:
 #   docker compose … run --rm migrate            # alembic upgrade head
 #   docker compose … run --rm bootstrap-milvus   # create library_vectors
-#   docker compose … run --rm prewarm            # models → hf-cache volume
+#
+# Phase 16b (ADR 0006): no model weights load in-process anywhere — all
+# inference is remote (DeepInfra embeddings/rerank, ppq/google LLM), so the
+# hf-cache volume, the prewarm one-shot, and the HF_* offline env are gone.
 #
 # NOTE: do not run this file on a machine that also runs the dev compose —
 # same project name + container names (one box, one stack).
@@ -56,9 +59,18 @@ x-backend-env: &backend-env
   # absolute paths from the api), but keeping api and worker agreed on the
   # value makes the shared-volume contract explicit and refactor-safe.
   SERMON_API_UPLOAD_DIR: /data/uploads
-  HF_HOME: /hf-cache
-  HF_HUB_OFFLINE: "1"
-  TRANSFORMERS_OFFLINE: "1"
+  # Remote inference (Phase 16b, ADR 0006). Both tiers call DeepInfra: the
+  # api embeds queries + reranks + highlights, the worker embeds chunks +
+  # chunking boundaries. The key is REQUIRED — without it every search and
+  # ingest 503s/fails. Base URL + model ids ride the code defaults unless
+  # overridden here; the model id is additionally pinned by the Postgres
+  # meta row (migration 0003) — changing it is a deliberate migration, not
+  # an env flip.
+  DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:?create at deepinfra.com → API Keys}
+  SERMON_EMBEDDINGS_BASE_URL: ${SERMON_EMBEDDINGS_BASE_URL:-https://api.deepinfra.com/v1/openai}
+  SERMON_EMBEDDINGS_MODEL: ${SERMON_EMBEDDINGS_MODEL:-BAAI/bge-large-en-v1.5}
+  SERMON_RERANK_BASE_URL: ${SERMON_RERANK_BASE_URL:-https://api.deepinfra.com/v1/inference}
+  SERMON_RERANK_MODEL: ${SERMON_RERANK_MODEL:-Qwen/Qwen3-Reranker-8B}
 
 services:
 
@@ -184,11 +196,14 @@ services:
       SERMON_API_CORS_ORIGINS: ${SERMON_API_CORS_ORIGINS:?JSON list, e.g. ["https://1.2.3.4"]}
       SERMON_API_LLM_PROVIDER: ${SERMON_API_LLM_PROVIDER:-google}
       SERMON_API_LLM_MODEL: ${SERMON_API_LLM_MODEL:-}
+      # Phase 16b latency lever: "none" disables Gemini 2.5 Flash thinking on
+      # Google's OpenAI-compat endpoint (~60s LLM leg → seconds). Empty → not
+      # sent (gateway-safe default).
+      SERMON_API_LLM_REASONING_EFFORT: ${SERMON_API_LLM_REASONING_EFFORT:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       PPQ_API_KEY: ${PPQ_API_KEY:-}
     volumes:
       - sermon-uploads:/data/uploads
-      - sermon-hf-cache:/hf-cache
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
       interval: 15s
@@ -214,11 +229,10 @@ services:
     environment:
       <<: *backend-env
     volumes:
-      # Same mount points as the api: the upload handoff is filesystem-based
+      # Same mount point as the api: the upload handoff is filesystem-based
       # (api writes under SERMON_API_UPLOAD_DIR, the Celery task gets that
-      # absolute path), and both tiers lazy-load models from one HF cache.
+      # absolute path).
       - sermon-uploads:/data/uploads
-      - sermon-hf-cache:/hf-cache
     # Warm shutdown grace before SIGKILL. A killed mid-ingest task is
     # requeued by the broker after celery_app.py's 300s visibility timeout
     # (acks_late + reject_on_worker_lost), and MinHash dedup makes the
@@ -319,23 +333,6 @@ services:
       milvus:
         condition: service_healthy
 
-  prewarm:
-    image: sermon-api:v0
-    profiles: ["ops"]
-    <<: *logging
-    environment:
-      # Only place the stack is allowed to talk to HuggingFace: populate the
-      # shared cache volume, then everything else runs OFFLINE=1 against it.
-      HF_HOME: /hf-cache
-      HF_HUB_OFFLINE: "0"
-      TRANSFORMERS_OFFLINE: "0"
-    volumes:
-      - sermon-hf-cache:/hf-cache
-      # Bind source is compose-file-relative (infra/), unlike the ..-relative
-      # build contexts above.
-      - ./scripts/prewarm_models.py:/prewarm_models.py:ro
-    command: ["python", "/prewarm_models.py"]
-
 volumes:
   sermon-postgres:
   sermon-redis:
@@ -343,6 +340,5 @@ volumes:
   sermon-minio:
   sermon-milvus:
   sermon-uploads:
-  sermon-hf-cache:
   sermon-caddy-data:
   sermon-caddy-config:

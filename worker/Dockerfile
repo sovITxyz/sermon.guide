@@ -11,9 +11,12 @@
 # non-packaged ([tool.uv] package = false): `from extractors import …`,
 # `import dedup`, `celery -A celery_app` all resolve off the working dir.
 #
-# BGE-Large (~1.3GB) is NOT baked — it lives in the shared `sermon-hf-cache`
-# volume (see api/Dockerfile rationale). NLTK WordNet (~40MB) IS baked, so
-# the first dedup signature() never does a runtime download.
+# Phase 16b (ADR 0006): NO model weights load in this image — chunk +
+# boundary embeddings are remote DeepInfra calls (worker/inference.py +
+# the llama-index OpenAI-compatible embedder), which dropped the ~1.5GB
+# torch/sentence-transformers layer and the hf-cache volume. NLTK WordNet
+# (~40MB) IS still baked, so the first dedup signature() never does a
+# runtime download.
 
 FROM python:3.12-slim AS deps
 COPY --from=ghcr.io/astral-sh/uv:0.11.19 /uv /usr/local/bin/uv
@@ -28,9 +31,9 @@ FROM python:3.12-slim
 # pandoc:    EPUB extraction shells out via pypandoc (extractors/epub.py).
 # libmagic1: MIME sniffing via python-magic (extractors/extract.py) — NOT
 #            preinstalled on -slim images.
-# libgomp1:  OpenMP runtime for torch-CPU / sentence-transformers wheels.
+# ca-certificates: HTTPS to the remote inference endpoint (api.deepinfra.com).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pandoc libmagic1 libgomp1 ca-certificates \
+    && apt-get install -y --no-install-recommends pandoc libmagic1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/worker/.venv /app/worker/.venv
 COPY worker/ /app/worker/
@@ -47,11 +50,13 @@ RUN python -m nltk.downloader -d /usr/share/nltk_data wordnet omw-1.4 \
 [(zipfile.ZipFile(z).extractall(z.parent), z.unlink()) \
  for z in pathlib.Path('/usr/share/nltk_data/corpora').glob('*.zip')]"
 WORKDIR /app/worker
-# --concurrency=1: each prefork child that ingests a new book loads BGE-Large
-# up to TWICE (chunking boundary-embedder + chunk embedder) ≈ 3-4GB resident;
-# the shared 16GB box can't afford parallel ingests alongside the api's models.
+# --concurrency=1: ingest is network-bound now (remote embeddings), not the
+# 3-4GB-resident model loads of the in-process era, but one-at-a-time keeps
+# pandoc/pymupdf CPU spikes and provider request bursts predictable on the
+# small shared box; raise deliberately when throughput data demands it.
 # --time-limit: hard kill any single ingest at 1h (soft at 55min) so one
-# poisoned/oversized upload can't pin the CPU forever (celery_app.py already
-# sets acks_late + reject_on_worker_lost, so a killed task is not silently lost).
+# poisoned/oversized upload can't pin the worker forever (celery_app.py
+# already sets acks_late + reject_on_worker_lost, so a killed task is not
+# silently lost).
 CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", \
      "--concurrency=1", "--time-limit=3600", "--soft-time-limit=3300"]

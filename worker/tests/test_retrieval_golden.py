@@ -36,8 +36,8 @@ distinguishable from a missing-Milvus run in CI logs:
 - Any referenced sample missing from ``worker/tests/samples/`` → skip
   with the missing filename(s) listed.
 - Milvus or Postgres unreachable → skip with the host:port.
-- BGE-Large not in the HF cache → skip (we never download 1.3 GB inside
-  pytest).
+- ``DEEPINFRA_API_KEY`` unset → skip (Phase 16b: query + ingest
+  embeddings are remote calls; the suite IS the live-DeepInfra gate).
 - NLTK WordNet absent → skip (the dedup gate inside ingest needs it).
 - Collection ``library_vectors`` missing → skip (``make bootstrap-milvus``).
 - Any corpus book missing ``chunks`` rows → skip with a pointer to
@@ -82,7 +82,7 @@ import pytest
 
 from db import Chunk, User, get_sync_session_factory
 from db.settings import settings as db_settings
-from embedding import EMBED_DIM, MODEL_NAME, embed
+from embedding import EMBED_DIM, embed
 from retrieval import hybrid_search_sync
 from scripts.bootstrap_milvus import COLLECTION_NAME
 
@@ -145,12 +145,9 @@ def _postgres_reachable() -> bool:
         return False
 
 
-def _model_available() -> bool:
-    if os.environ.get("HF_HUB_OFFLINE") == "1":
-        return False
-    cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    slug = MODEL_NAME.replace("/", "--")
-    return (cache / "hub" / f"models--{slug}").is_dir()
+def _remote_embeddings_available() -> bool:
+    """Phase 16b: query + ingest embeddings are remote DeepInfra calls."""
+    return bool(os.environ.get("DEEPINFRA_API_KEY"))
 
 
 def _wordnet_available() -> bool:
@@ -206,8 +203,8 @@ def golden_corpus() -> Iterator[dict[str, uuid.UUID]]:
         pytest.skip(
             f"Postgres unreachable at {db_settings.host}:{db_settings.port}; run `make up`.",
         )
-    if not _model_available():
-        pytest.skip("BGE-Large not in HF cache — prewarm or set HF_HOME.")
+    if not _remote_embeddings_available():
+        pytest.skip("DEEPINFRA_API_KEY unset — remote embeddings unavailable.")
     if not _wordnet_available():
         pytest.skip("NLTK WordNet corpus missing; run `nltk.download('wordnet')`.")
 
@@ -351,7 +348,12 @@ class TestRetrievalAccuracy:
         """Sanity gate — query embeddings must be 1024-D or every Milvus
         search above is a type error masquerading as a retrieval miss.
         """
-        if not _model_available():
-            pytest.skip("BGE-Large not in HF cache — prewarm or set HF_HOME.")
+        if not _remote_embeddings_available():
+            pytest.skip("DEEPINFRA_API_KEY unset — remote embeddings unavailable.")
+        if not _postgres_reachable():
+            pytest.skip(
+                f"Postgres unreachable at {db_settings.host}:{db_settings.port}; "
+                "the embedding-space guard needs the meta row.",
+            )
         out = embed(["dimension check"])
         assert out.shape == (1, EMBED_DIM), out.shape

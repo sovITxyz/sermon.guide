@@ -7,8 +7,11 @@ a percentile threshold — see LlamaIndex `SemanticSplitterNodeParser`.
 
 The boundary-detection embedder is `BAAI/bge-large-en-v1.5`, the same model
 used downstream in Phase 6 for the chunk embeddings that land in Milvus
-(ARCHITECTURE.md §2). Reusing one model keeps the ingestion pipeline to a
-single ~1.3GB download instead of two.
+(ARCHITECTURE.md §2). Since Phase 16b (ADR 0006) it is a remote call: the
+llama-index OpenAI-compatible embedding class talks to the same endpoint +
+model id `worker/inference.py` uses, so boundary placement stays calibrated
+to the exact weights that embed the chunks — and ingest no longer loads a
+~1.3GB model (or spikes ~3GB RSS) in-process.
 
 `parent_section` is a best-effort lookup: for each chunk, find the most
 recent Markdown ATX heading (`#`, `##`, …) at or before the chunk's start
@@ -20,8 +23,8 @@ CLI (run from `worker/`):
     uv run python -m chunking path/to/book.md
 """
 
-# llama-index + HuggingFace embeddings ship without PEP 561 markers; relax
-# the strict-unknown rules locally rather than papering over the import sites.
+# llama-index ships without PEP 561 markers; relax the strict-unknown rules
+# locally rather than papering over the import sites.
 # pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false
 
 from __future__ import annotations
@@ -37,12 +40,15 @@ from typing import cast
 from llama_index.core import Document
 from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.schema import TextNode
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.embeddings.openai_like import OpenAILikeEmbedding
 
-# BGE-Large is the locked retrieval embedder (ARCHITECTURE.md §2). Using it
-# here too means Phase 6 reuses the loaded model rather than paying for a
-# second download.
-DEFAULT_EMBED_MODEL = "BAAI/bge-large-en-v1.5"
+from inference import MissingInferenceKeyError
+from inference import settings as inference_settings
+
+# BGE-Large is the locked retrieval embedder (ARCHITECTURE.md §2). Reading
+# the same env-driven setting `inference.py` uses means boundary detection
+# and chunk embedding can never disagree on model or endpoint (ADR 0006).
+DEFAULT_EMBED_MODEL = inference_settings.embeddings_model
 
 # SemanticSplitter defaults. `buffer_size=1` groups one sentence on each side
 # of a candidate boundary before embedding; `breakpoint_percentile_threshold=95`
@@ -91,9 +97,25 @@ def _parent_section_for(offset: int, headings: list[tuple[int, str]]) -> str | N
 
 
 @lru_cache(maxsize=1)
-def _default_embedder() -> HuggingFaceEmbedding:
-    """Lazily load the BGE-Large embedder. First call downloads the model."""
-    return HuggingFaceEmbedding(model_name=DEFAULT_EMBED_MODEL)
+def _default_embedder() -> OpenAILikeEmbedding:
+    """Construct the remote boundary embedder once per process (ADR 0006).
+
+    Same endpoint + model id as `inference.embed_texts`; llama-index owns
+    the batching for the splitter's sentence-group windows. One retry and
+    an explicit timeout, matching the shared transport's posture. Lazy +
+    cached so import / lint / tests never need a key — and `lru_cache`
+    does not cache the raise, so setting the key later still works.
+    """
+    if not inference_settings.deepinfra_api_key:
+        msg = "Remote inference is not configured; set DEEPINFRA_API_KEY."
+        raise MissingInferenceKeyError(msg)
+    return OpenAILikeEmbedding(
+        model_name=DEFAULT_EMBED_MODEL,
+        api_base=inference_settings.embeddings_base_url,
+        api_key=inference_settings.deepinfra_api_key,
+        max_retries=1,
+        timeout=60.0,
+    )
 
 
 def chunk(markdown: str) -> list[Chunk]:

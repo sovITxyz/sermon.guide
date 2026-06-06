@@ -10,14 +10,21 @@ dependencies = [
   "pypandoc>=1.17,<2",
   "pymupdf4llm>=1.27,<2",
   "llama-index-core>=0.14,<0.15",
-  "llama-index-embeddings-huggingface>=0.7,<0.8",
-  "sentence-transformers>=3,<6",
-  # Pulled in transitively by sentence-transformers but listed here so the
-  # CPU-only source override in [tool.uv.sources] applies. The default PyPI
-  # torch wheel bundles ~2GB of NVIDIA CUDA libraries we'd never use —
-  # neither dev hardware (Intel iGPU) nor CI (GitHub Actions ubuntu-latest)
-  # has a CUDA GPU, and Phase 6 explicitly defers GPU inference.
-  "torch>=2.5,<3",
+  # Phase 16b (ADR 0006): inference is remote — no model weights load
+  # in-process anywhere. The semantic chunker's boundary embedder reaches
+  # the same OpenAI-compatible embeddings endpoint `inference.py` uses
+  # (same model id, so chunk boundaries stay calibrated); torch +
+  # sentence-transformers + the CPU-wheel source override are gone, which
+  # drops ~1.5GB from the image and ~3GB of per-ingest RSS spikes.
+  "llama-index-embeddings-openai-like>=0.3,<0.4",
+  # The `openai` SDK is the embeddings transport (ADR 0006, mirroring the
+  # ADR 0005 chat transport in api/); httpx is the thin rerank client —
+  # DeepInfra's reranker endpoint is not OpenAI-shaped.
+  "openai>=2,<3",
+  "httpx>=0.27,<1",
+  # numpy moves from dev to runtime: it used to ride in transitively via
+  # sentence-transformers, which Phase 16b removed.
+  "numpy>=2,<3",
   "sqlalchemy[asyncio]>=2.0,<3",
   "alembic>=1.13,<2",
   "asyncpg>=0.30,<0.32",
@@ -31,7 +38,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "numpy>=2.4.4",
   "pyright",
   "pytest",
   "ruff",
@@ -39,14 +45,6 @@ dev = [
 
 [tool.uv]
 package = false
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 [tool.ruff]
 line-length = 100
@@ -70,6 +68,6 @@ pythonpath = ["."]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["extractors", "chunking.py", "db", "embedding.py", "ingest.py", "scripts", "tests", "celery_app.py", "tasks"]
+include = ["extractors", "chunking.py", "db", "embedding.py", "inference.py", "ingest.py", "scripts", "tests", "celery_app.py", "tasks"]
 venvPath = "."
 venv = ".venv"

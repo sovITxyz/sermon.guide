@@ -127,14 +127,27 @@ def test_embed_texts_empty_returns_zero_rows_without_client(
 
 def test_embed_texts_normalizes_and_preserves_order(monkeypatch: pytest.MonkeyPatch) -> None:
     """Rows come back L2-normalized and aligned with the input order —
-    even when the provider returns them shuffled (we sort by index)."""
+    even when the provider returns them shuffled (we sort by index).
+
+    Row i rides a DISTINCT axis (e_i scaled by i+1) so the index re-sort
+    is genuinely exercised: normalization kills magnitude but not
+    direction, so dropping the sort would leave the reversed rows in
+    place and fail the identity-matrix assertion below. (The first cut
+    of this test put every row on axis 0 — normalization collapsed them
+    to identical vectors and the sort was unpinned; adversarial review
+    2026-06-05.)
+    """
 
     def _responder(kwargs: dict[str, Any]) -> _FakeEmbeddingResponse:
         texts: list[str] = kwargs["input"]
-        # Return rows REVERSED to prove we re-sort by index.
+        n = len(texts)
+        # Row i → (i+1)·e_i, returned REVERSED to prove we re-sort by index.
         rows = [
-            _FakeEmbeddingRow(index=i, embedding=[float(i + 1), 0.0, 0.0])
-            for i in range(len(texts))
+            _FakeEmbeddingRow(
+                index=i,
+                embedding=[float(i + 1) if axis == i else 0.0 for axis in range(n)],
+            )
+            for i in range(n)
         ]
         return _FakeEmbeddingResponse(data=list(reversed(rows)))
 
@@ -145,11 +158,10 @@ def test_embed_texts_normalizes_and_preserves_order(monkeypatch: pytest.MonkeyPa
     assert api.calls[0]["input"] == ["a", "b", "c"]
     assert out.shape == (3, 3)
     assert out.dtype == np.float32
-    # Every row had magnitude i+1 along axis 0 → normalized to the same
-    # unit vector; order is proven by normalization being a no-op on
-    # direction (all rows equal) — assert norms and direction.
     assert np.allclose(np.linalg.norm(out, axis=1), 1.0, atol=1e-6)
-    assert np.allclose(out[:, 0], 1.0, atol=1e-6)
+    # Row i must be the unit vector along axis i — true only if the
+    # reversed response was re-sorted by its index field.
+    assert np.allclose(out, np.eye(3, dtype=np.float32), atol=1e-6)
 
 
 def test_embed_texts_batches_below_provider_cap(monkeypatch: pytest.MonkeyPatch) -> None:

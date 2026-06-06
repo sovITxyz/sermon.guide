@@ -26,7 +26,12 @@
 	admin off
 	# rate_limit is a non-standard directive; give it an explicit slot.
 	order rate_limit before basic_auth
+	# default_sni: cert selection when a client sends NO SNI (browsers on
+	# bare-IP URLs). fallback_sni: when a client sends an SNI that matches
+	# no cert (e.g. busybox ssl_client sends a literal-IP SNI — observed
+	# breaking the container healthcheck on the first AWS deploy).
 	default_sni {$SITE_HOST}
+	fallback_sni {$SITE_HOST}
 }
 
 https://{$SITE_HOST}
@@ -85,3 +90,12 @@ rate_limit {
 # connection ~130-300s (web's own upstream AbortSignal is 300s); Caddy's
 # defaults don't time out upstream reads, so leave them alone.
 reverse_proxy web:3000
+
+# Container-internal health listener (loopback-only, NOT host-published).
+# The compose healthcheck probes this instead of the TLS site: it proves
+# caddy is up AND the proxy→web chain works, without depending on busybox
+# wget's TLS/SNI quirks. The real TLS path is exercised by deploy.sh's
+# external smoke test.
+http://127.0.0.1:8081 {
+	reverse_proxy web:3000
+}

@@ -281,12 +281,12 @@ services:
       - sermon-caddy-data:/data
       - sermon-caddy-config:/config
     healthcheck:
-      # Traverses the real path — TLS (no-SNI + default_sni, like a browser
-      # hitting the bare IP) → host match → reverse_proxy → web — so caddy
-      # only reports healthy when the public surface actually works. A plain
-      # :80 probe would pass on an unmatched-host empty 200 even with the
-      # proxy dead.
-      test: ["CMD-SHELL", "wget -q --spider --no-check-certificate --header \"Host: $${SITE_HOST}\" https://127.0.0.1/login || exit 1"]
+      # Probes the loopback-only :8081 listener in the Caddyfile: proves
+      # caddy is serving AND the reverse_proxy→web chain works. Deliberately
+      # NOT the TLS site — busybox wget sends a literal-IP SNI that can't
+      # match the site cert (observed unhealthy-looping on the first AWS
+      # deploy); the TLS path is verified by deploy.sh's external smoke test.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8081/login || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 6

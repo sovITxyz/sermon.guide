@@ -1,14 +1,31 @@
 # infra/ — agent instructions
 
-Local-development infrastructure for sermon.guide v0. Production lives in
-k8s manifests later (see [docs/PHASES.md](../docs/PHASES.md), Beyond Phase 16).
+Local-development AND v0 single-box production infrastructure for
+sermon.guide. The k8s/KEDA shape stays post-v0
+(see [docs/PHASES.md](../docs/PHASES.md), Beyond Phase 16).
 
 ## What lives here
 
-- `docker-compose.yml` — Postgres 16, Redis 7, Milvus standalone v2.6 with its
-  required etcd + MinIO dependencies. Brought up via `make up` from repo root.
+- `docker-compose.yml` — local dev data plane: Postgres 16, Redis 7, Milvus
+  standalone v2.6 with its required etcd + MinIO dependencies. Brought up via
+  `make up` from repo root.
 - `.env.example` — template for `infra/.env` (gitignored). `make up` copies
   the example to `.env` on first run.
+- `docker-compose.prod.yml` — the v0 single-box AWS stack (data plane + api/
+  worker/web + Caddy edge). DELIBERATELY self-contained, not an overlay:
+  compose merges `ports:` additively, and "only Caddy publishes a port" is
+  the security property the file guarantees. Keep its data-plane blocks in
+  sync with `docker-compose.yml` when bumping versions. Runbook:
+  [docs/DEPLOY_AWS.md](../docs/DEPLOY_AWS.md).
+- `caddy/` — TLS edge (Dockerfile + Caddyfile: rate limits, body caps,
+  default_sni for bare-IP deploys).
+- `scripts/` — deploy-time one-shots (model prewarm into the shared HF cache).
+- `aws/` — provision/deploy/start/stop/status/destroy lifecycle scripts.
+  Tag-based and re-runnable; secrets are generated ON the instance, never
+  committed.
+- `env.prod.template` — documents `/opt/sermon/.env.prod` (generated on-box
+  by `aws/deploy.sh`). Deliberately NOT dot-env-named so repo tooling can
+  read it.
 - Future: `k8s/` Helm values + KEDA scaler config (post-v0).
 
 ## Conventions

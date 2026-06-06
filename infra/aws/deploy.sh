@@ -115,12 +115,16 @@ compose() {
 compose build
 
 # --- 5. data plane up → one-shots ---
-# NOTE: every `compose run` below MUST have stdin redirected (</dev/null).
-# This whole script arrives on the box via `bash -s` reading ssh stdin, and
-# `docker compose run` attaches the container's stdin by default — without
+# NOTE: every 'compose run' below MUST have stdin redirected (</dev/null).
+# This whole script arrives on the box via 'bash -s' reading ssh stdin, and
+# 'docker compose run' attaches the container's stdin by default — without
 # the redirect the one-shot container EATS THE REST OF THIS SCRIPT off the
 # stream and bash silently exits 0 after that line (observed on the first
-# real deploy: everything after `migrate` vanished).
+# real deploy: everything after 'migrate' vanished).
+# (And no backticks anywhere in this heredoc: the delimiter is unquoted, so
+# backticks COMMAND-SUBSTITUTE ON THE OPERATOR MACHINE during expansion —
+# a backticked 'bash -s' in an earlier version of this very comment ran
+# locally and hung the deploy reading stdin.)
 compose up -d --wait postgres redis etcd minio milvus
 compose run --rm migrate </dev/null
 # Milvus's :9091 healthz can report healthy moments before the :19530 gRPC

@@ -158,8 +158,8 @@ _PROVIDERS: Mapping[str, _Provider] = {
 def _active_provider() -> _Provider:
     """The row picked by ``SERMON_API_LLM_PROVIDER``.
 
-    ``settings.llm_provider`` is ``Literal["google", "ppq"]``, so the lookup
-    cannot ``KeyError`` on a validated config.
+    ``settings.llm_provider`` is ``Literal["google", "ppq", "deepinfra"]``, so
+    the lookup cannot ``KeyError`` on a validated config.
     """
     return _PROVIDERS[settings.llm_provider]
 

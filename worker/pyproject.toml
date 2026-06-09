@@ -11,12 +11,12 @@ dependencies = [
   "pymupdf4llm>=1.27,<2",
   "llama-index-core>=0.14,<0.15",
   # Phase 16b (ADR 0006): inference is remote — no model weights load
-  # in-process anywhere. The semantic chunker's boundary embedder reaches
-  # the same OpenAI-compatible embeddings endpoint `inference.py` uses
-  # (same model id, so chunk boundaries stay calibrated); torch +
+  # in-process anywhere. The semantic chunker's boundary embedder is a thin
+  # llama-index adapter over `inference.embed_texts` (same endpoint + model
+  # id the chunk embeddings use, so boundaries stay calibrated); torch +
   # sentence-transformers + the CPU-wheel source override are gone, which
   # drops ~1.5GB from the image and ~3GB of per-ingest RSS spikes.
-  "llama-index-embeddings-openai-like>=0.3,<0.4",
+  #
   # The `openai` SDK is the embeddings transport (ADR 0006, mirroring the
   # ADR 0005 chat transport in api/); httpx is the thin rerank client —
   # DeepInfra's reranker endpoint is not OpenAI-shaped.
@@ -25,6 +25,14 @@ dependencies = [
   # numpy moves from dev to runtime: it used to ride in transitively via
   # sentence-transformers, which Phase 16b removed.
   "numpy>=2,<3",
+  # `tokenizers` (pure-Rust WordPiece, ~3MB, NO torch/no model weights) +
+  # the bundled BGE tokenizer (worker/assets) let us replicate the old
+  # sentence-transformers silent ≤512-token truncation client-side:
+  # DeepInfra's bge-large endpoint REJECTS >512-token inputs (the local
+  # model trimmed them). A tokenizer is text-splitting, not inference —
+  # microseconds, a few MB RAM — so this does not reintroduce in-process
+  # models (ADR 0006 §truncation).
+  "tokenizers>=0.20,<1",
   "sqlalchemy[asyncio]>=2.0,<3",
   "alembic>=1.13,<2",
   "asyncpg>=0.30,<0.32",

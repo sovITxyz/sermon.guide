@@ -139,6 +139,14 @@ def _insert_book_with_chunks(
 
     Sync session bridge so the worker can write without spinning up an
     event loop. See ``db/session.py:get_sync_engine`` for the rationale.
+
+    The parent ``GlobalBook`` is flushed *before* the child ``chunks`` rows so
+    the ``fk_chunks_book_id`` foreign key is satisfied. SQLAlchemy's unit of
+    work does not order these two inserts by the raw FK on its own — there is
+    no ORM ``relationship()`` linking them — so without the explicit flush the
+    emit order depends on mapper-registration order, which is exactly the kind
+    of latent ordering bug a model-list edit can silently flip. Both writes
+    still share one transaction: a failure in either rolls back both.
     """
     sf = get_sync_session_factory()
     with sf() as session, session.begin():
@@ -152,6 +160,7 @@ def _insert_book_with_chunks(
             ),
         )
         if chunks:
+            session.flush()  # parent INSERT before the child chunks — see docstring
             session.add_all(
                 [
                     ChunkRow(

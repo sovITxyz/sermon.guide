@@ -109,12 +109,13 @@ on shifts in meaning rather than fixed token windows
 The boundary-detection embedder is **`BAAI/bge-large-en-v1.5`** — the same
 1024-d model Phase 6 uses for the chunk embeddings written to Milvus. Since
 Phase 16b ([ADR 0006](../docs/adr/0006-remote-inference.md)) it is a
-**remote call**: `chunking.py` constructs a llama-index
-`OpenAILikeEmbedding` against the same env-driven endpoint + model id
-`worker/inference.py` uses (`SERMON_EMBEDDINGS_*`, `DEEPINFRA_API_KEY`),
-so boundary detection and chunk embedding can never disagree on weights.
-No model downloads, no HF cache; the end-to-end test gates on
-`DEEPINFRA_API_KEY` and skips when absent so CI doesn't fail on a 503.
+**remote call**: `chunking.py` wraps `inference.embed_texts` in a thin
+`BaseEmbedding` adapter (`_RemoteBGEEmbedding`) so the splitter's boundary
+embeddings hit the same endpoint + model id + 512-token truncation the chunk
+embeddings use (`SERMON_EMBEDDINGS_*`, `DEEPINFRA_API_KEY`) — boundary
+detection and chunk embedding can never disagree on weights. No model
+downloads, no HF cache; the end-to-end test gates on `DEEPINFRA_API_KEY` and
+skips when absent so CI doesn't fail on a 503.
 
 `Chunk` carries `(text, start_idx, end_idx, parent_section)`. `start_idx`
 and `end_idx` are character offsets into the source markdown — they are

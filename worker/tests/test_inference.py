@@ -41,8 +41,13 @@ from inference import (
 
 @pytest.fixture(autouse=True)
 def _fresh_client_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test gets a configured key and an empty client cache."""
+    """Each test gets a configured key, an empty client cache, and no real sleeps.
+
+    The rerank backoff calls ``time.sleep``; stub it so the retry tests don't
+    actually wait out the exponential schedule.
+    """
     monkeypatch.setattr(inference_module.settings, "deepinfra_api_key", "test-key")
+    monkeypatch.setattr(inference_module.time, "sleep", lambda _s: None)  # type: ignore[misc]
     inference_module._embeddings_client.cache_clear()
 
 
@@ -219,6 +224,107 @@ def test_embed_texts_requires_key(monkeypatch: pytest.MonkeyPatch) -> None:
         embed_texts(["a"], model="m")
 
 
+# --- bge-large 512-token truncation (ADR 0006 §truncation) --------------------
+
+
+def _bad_request(message: str) -> openai.BadRequestError:
+    return openai.BadRequestError(
+        message,
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.deepinfra.com/v1/openai/embeddings"),
+        ),
+        body=None,
+    )
+
+
+def _content_tokens(text: str) -> int:
+    return len(inference_module._bge_tokenizer().encode(text, add_special_tokens=False).ids)
+
+
+_LENGTH_400 = "You passed 511 input tokens; context length is only 512 tokens"
+_OTHER_400 = "invalid model"
+
+
+def test_truncate_to_tokens_trims_only_over_limit() -> None:
+    """Short text passes through; long text comes back at <= limit content tokens."""
+    short = "grace and peace to you"
+    assert inference_module._truncate_to_tokens(short, 510) == short
+    long = "grace and peace " * 400  # ~1200 content tokens
+    out = inference_module._truncate_to_tokens(long, 510)
+    assert _content_tokens(out) <= 510
+    assert long.startswith(out[:50])  # kept the head, dropped the tail
+
+
+def test_embed_texts_truncates_bge_large_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An over-512-token input is trimmed to <= 510 content tokens BEFORE the call.
+
+    The faithful path: the provider never sees an over-length input, so it
+    never has to reject. Pins that truncation keys on the bge-large model id.
+    """
+    seen: list[str] = []
+
+    def _responder(kwargs: dict[str, Any]) -> _FakeEmbeddingResponse:
+        seen.extend(kwargs["input"])
+        return _FakeEmbeddingResponse(
+            data=[_FakeEmbeddingRow(index=i, embedding=[1.0]) for i in range(len(kwargs["input"]))],
+        )
+
+    _install_embeddings(monkeypatch, _responder)
+    long = "grace and peace " * 400
+    embed_texts([long], model=inference_module._BGE_LARGE_MODEL)
+    assert _content_tokens(seen[0]) <= 510
+
+
+def test_embed_texts_does_not_truncate_other_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """bge-m3 (highlight) inputs pass through untruncated — different window/tokenizer."""
+    seen: list[str] = []
+
+    def _responder(kwargs: dict[str, Any]) -> _FakeEmbeddingResponse:
+        seen.extend(kwargs["input"])
+        return _FakeEmbeddingResponse(data=[_FakeEmbeddingRow(index=0, embedding=[1.0])])
+
+    _install_embeddings(monkeypatch, _responder)
+    long = "grace and peace " * 400
+    embed_texts([long], model="BAAI/bge-m3")
+    assert seen == [long]  # untouched
+
+
+def test_embed_texts_retries_harder_on_length_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the provider STILL rejects on length after the first trim, trim harder and retry.
+
+    Defensive net for inputs DeepInfra might count above its window even after
+    the faithful 510-token trim. First call 400s on length → second call (harder
+    cap) succeeds.
+    """
+    attempts: list[int] = []
+
+    def _responder(kwargs: dict[str, Any]) -> _FakeEmbeddingResponse:
+        attempts.append(_content_tokens(kwargs["input"][0]))
+        if len(attempts) == 1:
+            raise _bad_request(_LENGTH_400)
+        return _FakeEmbeddingResponse(data=[_FakeEmbeddingRow(index=0, embedding=[1.0])])
+
+    _install_embeddings(monkeypatch, _responder)
+    embed_texts(["grace and peace " * 400], model=inference_module._BGE_LARGE_MODEL)
+    assert len(attempts) == 2
+    assert attempts[1] < attempts[0]  # second attempt trimmed harder
+
+
+def test_embed_texts_non_length_400_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 400 that ISN'T about length fails immediately (no retry ladder)."""
+    calls: list[int] = []
+
+    def _responder(_kwargs: dict[str, Any]) -> _FakeEmbeddingResponse:
+        calls.append(1)
+        raise _bad_request(_OTHER_400)
+
+    _install_embeddings(monkeypatch, _responder)
+    with pytest.raises(RemoteInferenceError, match="embeddings"):
+        embed_texts(["x"], model=inference_module._BGE_LARGE_MODEL)
+    assert len(calls) == 1
+
+
 # --- rerank --------------------------------------------------------------------
 
 
@@ -244,26 +350,28 @@ def test_rerank_scores_wire_shape_and_result(monkeypatch: pytest.MonkeyPatch) ->
     assert call["headers"]["Authorization"] == "Bearer test-key"
 
 
-def test_rerank_scores_retries_once_on_5xx_then_succeeds(
+def test_rerank_scores_retries_5xx_then_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = _FakeHTTPPost(queue=[_response(500), _response(200, {"scores": [0.5]})])
+    """Several 5xx blips are ridden out by the backoff budget, then it succeeds."""
+    fake = _FakeHTTPPost(
+        queue=[_response(500), _response(503), _response(200, {"scores": [0.5]})],
+    )
     monkeypatch.setattr(inference_module.httpx, "post", fake)
     assert rerank_scores(query="q", documents=["d"]) == [0.5]
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 3
 
 
-def test_rerank_scores_retries_once_on_transport_error_then_fails(
+def test_rerank_scores_exhausts_retries_then_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two transport failures exhaust the single retry → RemoteInferenceError."""
-    fake = _FakeHTTPPost(
-        queue=[httpx.ConnectError("boom"), httpx.ReadTimeout("slow")],
-    )
+    """Transport errors on every one of the 1 + _MAX_RETRIES attempts → error."""
+    attempts = 1 + inference_module._MAX_RETRIES
+    fake = _FakeHTTPPost(queue=[httpx.ConnectError("boom")] * attempts)
     monkeypatch.setattr(inference_module.httpx, "post", fake)
     with pytest.raises(RemoteInferenceError, match="rerank"):
         rerank_scores(query="q", documents=["d"])
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == attempts
 
 
 def test_rerank_scores_no_retry_on_4xx(monkeypatch: pytest.MonkeyPatch) -> None:

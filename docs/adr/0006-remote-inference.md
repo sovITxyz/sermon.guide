@@ -117,6 +117,35 @@ float tolerance (cosine ≥ 0.999) for both bge-large and bge-m3. If that
 test fails, the provider drifted off the exact weights and every stored
 vector + threshold is suspect — the test must not be loosened.
 
+### Input truncation (the 512-token window)
+
+bge-large has a hard **512-token** context (it has always had this; it is a
+property of the model, not of DeepInfra — 512 is standard for BERT-family
+embedders, which is *why* the pipeline chunks books into passages first). The
+in-process `sentence-transformers` path **silently truncated** longer inputs
+to `max_seq_length=512`; DeepInfra's endpoint instead **rejects** them with a
+400 (`truncate` params on both its OpenAI-compatible and native endpoints were
+probed — neither truncates, 2026-06-08). The live golden ingest surfaced this
+on a real over-long semantic chunk.
+
+To preserve behaviour, `worker/inference.py` replicates the silent truncation
+client-side with the model's **own WordPiece tokenizer** — a ~700 KB
+text-splitting ruleset bundled at `worker/assets/bge-large-en-v1.5-tokenizer.json`
+plus the pure-Rust `tokenizers` library. **This is not a model**: tokenizing is
+microseconds and a few MB of RAM, no weights, no GPU, no torch — it does not
+reintroduce in-process inference (the resource cost the whole ADR exists to
+remove was the 1.3 GB neural net, never the tokenizer in front of it). Inputs
+are trimmed to **510 content tokens** (leaving room for DeepInfra's
+`[CLS]+[SEP]` → ≤512), which matches the old model's window exactly, so an
+over-long chunk's vector is byte-identical to the in-process result. Verified
+live: 510-token inputs are accepted (DeepInfra counts repetitive text more
+leniently than the raw tokenizer, so the bound is strictly safe), with a
+defensive harder-trim retry for any pathological input. Only the bge-large
+embeddings leg truncates; bge-m3 highlight sentences sit far under its 8192
+window. The chunker reaches the same truncation by routing its boundary
+embeddings through a thin `BaseEmbedding` adapter over `embed_texts` (which
+also dropped the `llama-index-embeddings-openai-like` dependency).
+
 ### Privacy posture
 
 DeepInfra's documented default for standard inference: request content

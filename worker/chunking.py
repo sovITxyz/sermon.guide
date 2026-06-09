@@ -38,11 +38,11 @@ from pathlib import Path
 from typing import cast
 
 from llama_index.core import Document
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.schema import TextNode
-from llama_index.embeddings.openai_like import OpenAILikeEmbedding
 
-from inference import MissingInferenceKeyError
+from inference import embed_texts
 from inference import settings as inference_settings
 
 # BGE-Large is the locked retrieval embedder (ARCHITECTURE.md §2). Reading
@@ -96,26 +96,42 @@ def _parent_section_for(offset: int, headings: list[tuple[int, str]]) -> str | N
     return last
 
 
-@lru_cache(maxsize=1)
-def _default_embedder() -> OpenAILikeEmbedding:
-    """Construct the remote boundary embedder once per process (ADR 0006).
+class _RemoteBGEEmbedding(BaseEmbedding):
+    """llama-index embedding adapter over ``inference.embed_texts`` (ADR 0006).
 
-    Same endpoint + model id as `inference.embed_texts`; llama-index owns
-    the batching for the splitter's sentence-group windows. One retry and
-    an explicit timeout, matching the shared transport's posture. Lazy +
-    cached so import / lint / tests never need a key — and `lru_cache`
-    does not cache the raise, so setting the key later still works.
+    Routes the semantic splitter's boundary embeddings through the SAME remote
+    transport the chunk embeddings use — same model id, same 512-token
+    truncation — so boundary detection stays calibrated to the exact weights
+    that embed the chunks, and no model loads in-process. The splitter only
+    needs text embeddings (cosine between adjacent sentence groups); the query
+    methods are implemented for interface completeness. ``embed_texts`` raises
+    ``MissingInferenceKeyError`` lazily when the key is unset, so import / lint
+    / tests never need a key.
     """
-    if not inference_settings.deepinfra_api_key:
-        msg = "Remote inference is not configured; set DEEPINFRA_API_KEY."
-        raise MissingInferenceKeyError(msg)
-    return OpenAILikeEmbedding(
-        model_name=DEFAULT_EMBED_MODEL,
-        api_base=inference_settings.embeddings_base_url,
-        api_key=inference_settings.deepinfra_api_key,
-        max_retries=1,
-        timeout=60.0,
-    )
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        return embed_texts([query], model=DEFAULT_EMBED_MODEL)[0].tolist()
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        return self._get_query_embedding(query)
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return embed_texts([text], model=DEFAULT_EMBED_MODEL)[0].tolist()
+
+    def _get_text_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return [row.tolist() for row in embed_texts(texts, model=DEFAULT_EMBED_MODEL)]
+
+
+@lru_cache(maxsize=1)
+def _default_embedder() -> _RemoteBGEEmbedding:
+    """The remote boundary embedder, constructed once per process (ADR 0006).
+
+    A thin transport adapter — no weights, no key needed at construction
+    (``embed_texts`` validates the key lazily on first call). ``embed_batch_size``
+    is raised so the splitter sends sentence groups in larger batches, cutting
+    round-trips on a book-sized ingest.
+    """
+    return _RemoteBGEEmbedding(embed_batch_size=128)
 
 
 def chunk(markdown: str) -> list[Chunk]:

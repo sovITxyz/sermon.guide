@@ -141,6 +141,17 @@ _PROVIDERS: Mapping[str, _Provider] = {
         key_env_var="PPQ_API_KEY",
         api_key=lambda: settings.ppq_api_key,
     ),
+    # Phase 16b (ADR 0006): DeepInfra serves google/gemini-2.5-flash over its
+    # OpenAI-compatible chat endpoint (the same base_url the embeddings leg
+    # uses), keyed by the same DEEPINFRA_API_KEY — so the whole inference stack
+    # collapses to one vendor + one key. reasoning_effort=none is honored here
+    # (probed live 2026-06-09), unlike ppq's chat.completions.
+    "deepinfra": _Provider(
+        base_url="https://api.deepinfra.com/v1/openai",
+        default_model="google/gemini-2.5-flash",
+        key_env_var="DEEPINFRA_API_KEY",
+        api_key=lambda: settings.deepinfra_api_key,
+    ),
 }
 
 

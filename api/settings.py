@@ -42,15 +42,18 @@ class ApiSettings(BaseSettings):
 
     cors_origins: list[str] = ["http://localhost:3000"]
 
-    # LLM summary agent (Phase 14, transport re-cut in Phase 14b / ADR 0005).
-    # ``llm_provider`` picks which OpenAI-compatible endpoint /search-summary
-    # talks to; the per-provider base_url / default model / key live in
-    # ``summary.py:_PROVIDERS`` (single source of truth).
-    llm_provider: Literal["google", "ppq"] = "google"
+    # LLM summary agent (Phase 14, transport re-cut in Phase 14b / ADR 0005;
+    # ``deepinfra`` provider added Phase 16b / ADR 0006). ``llm_provider`` picks
+    # which OpenAI-compatible endpoint /search-summary talks to; the
+    # per-provider base_url / default model / key live in ``summary.py:_PROVIDERS``
+    # (single source of truth). ``deepinfra`` reuses DEEPINFRA_API_KEY so the
+    # whole platform — embeddings, rerank, highlight, AND the summary LLM — can
+    # run on one vendor + one key.
+    llm_provider: Literal["google", "ppq", "deepinfra"] = "google"
 
     # Optional model-id override (SERMON_API_LLM_MODEL); ``None`` → the active
     # provider's default. Spell it the provider's way — bare ``gemini-2.5-flash``
-    # on google, prefixed ``google/gemini-2.5-flash`` on ppq.
+    # on google, prefixed ``google/gemini-2.5-flash`` on ppq/deepinfra.
     llm_model: str | None = None
 
     # Optional reasoning-effort knob (SERMON_API_LLM_REASONING_EFFORT); ``None``
@@ -80,6 +83,11 @@ class ApiSettings(BaseSettings):
     # than letting an unconfigured key surface as an opaque SDK error.
     google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY")
     ppq_api_key: str | None = Field(default=None, validation_alias="PPQ_API_KEY")
+    # Phase 16b: the same key the embeddings/rerank/highlight legs use
+    # (worker/inference.py). When ``llm_provider=deepinfra`` the summary LLM
+    # rides DeepInfra's OpenAI-compatible chat endpoint too — one vendor, one
+    # key for the whole inference stack.
+    deepinfra_api_key: str | None = Field(default=None, validation_alias="DEEPINFRA_API_KEY")
 
 
 settings = ApiSettings()

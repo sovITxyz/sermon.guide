@@ -37,6 +37,11 @@ dependencies = [
   "numpy>=2,<3",
   "httpx>=0.27,<1",
   "psycopg[binary]>=3,<4",
+  # `worker/inference.py` (imported by api/rerank.py + highlight.py) loads the
+  # bundled BGE WordPiece tokenizer to enforce bge-large's 512-token window
+  # (ADR 0006 §truncation). Pure-Rust text-splitting, no model weights; pinned
+  # in lockstep with worker/.
+  "tokenizers>=0.20,<1",
   # Phase 14 (transport re-cut in Phase 14b / ADR 0005): the /search-summary
   # endpoint synthesizes a grounded 1–2 paragraph answer over the reranked +
   # sentence-pruned chunks with Gemini Flash, reached through the `openai`

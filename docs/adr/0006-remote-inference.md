@@ -167,6 +167,23 @@ so the day ppq (or anyone) serves BGE embeddings, the move is
 provider-shaped (DeepInfra-native JSON), so a rerank vendor move is a small
 code change by design — no OpenAI-compatible rerank shape exists to target.
 
+### LLM consolidation onto DeepInfra (one vendor, one key)
+
+The summary LLM stayed on ppq/google per ADR 0005 when this ADR was first
+written. But DeepInfra's chat catalog **also serves `google/gemini-2.5-flash`**
+(live-probed 2026-06-09: a 2.0 s round-trip, and `reasoning_effort=none` is
+honored — unlike ppq's chat.completions). So Phase 16b adds a third
+`deepinfra` row to `summary.py:_PROVIDERS`
+(`base_url=https://api.deepinfra.com/v1/openai`, `model=google/gemini-2.5-flash`,
+key=`DEEPINFRA_API_KEY`): with `SERMON_API_LLM_PROVIDER=deepinfra` the entire
+inference stack — embeddings, rerank, highlight, **and** the summary LLM —
+runs on one vendor and one key. This is a deliberate, opt-in extension of
+ADR 0005's locked "transport" decision, not a replacement: `google` (default)
+and `ppq` remain first-class rows, and the same pinned `gemini-2.5-flash`
+model and citation contract ride all three. The api carries its own
+`deepinfra_api_key` (unprefixed `DEEPINFRA_API_KEY` alias, same pattern as
+the worker's), so no key is silently cross-paired between providers.
+
 ### Latency bonus: `reasoning_effort`
 
 Google's OpenAI-compat layer accepts `reasoning_effort` —

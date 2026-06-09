@@ -47,7 +47,7 @@ either an [Open Question](#7-open-questions) or out of scope for v0.
 | Search (retrieval)    | Hybrid: dense BGE + sparse BM25, fused via RRF (k=60)   | Themes via dense, names/refs via sparse; RRF avoids score normalization |
 | Reranking             | Qwen3-Reranker-8B (remote, env-swappable — ADR 0006) on top-30 → top-10 | Precision pass before LLM context; large quality jump over the v0 MiniLM cross-encoder |
 | Context pruning       | BGE-M3 semantic highlighting (remote dense, exact weights), sentence-level, threshold 0.5 | 70–80% token reduction into the LLM; identical weights keep the 0.5 calibration |
-| LLM                   | Gemini Flash (2.5 at v0) over an OpenAI-compatible transport (ADR 0005) | Cheapest high-context model; provider-portable chat-completions shape   |
+| LLM                   | Gemini Flash (2.5 at v0) over an OpenAI-compatible transport (ADR 0005); google / ppq / deepinfra providers (ADR 0006) | Cheapest high-context model; provider-portable — `deepinfra` collapses the whole stack to one vendor + key |
 | Frontend              | Next.js 15 (app router) + Tailwind, TypeScript strict   | Server components keep JWT in HttpOnly cookies, never in browser JS     |
 | Raw file storage      | Cloudflare R2 or Backblaze B2 (S3-compatible)           | Cheap object storage for the originals; Postgres only stores pointers   |
 

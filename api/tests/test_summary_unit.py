@@ -519,6 +519,32 @@ def test_provider_map_pins_endpoints_models_keys() -> None:
     assert ppq.base_url == "https://api.ppq.ai/v1"
     assert ppq.default_model == "google/gemini-2.5-flash"
     assert ppq.key_env_var == "PPQ_API_KEY"
+    # Phase 16b: DeepInfra reuses the embeddings base_url + DEEPINFRA_API_KEY.
+    deepinfra = summary_module._PROVIDERS["deepinfra"]
+    assert deepinfra.base_url == "https://api.deepinfra.com/v1/openai"
+    assert deepinfra.default_model == "google/gemini-2.5-flash"
+    assert deepinfra.key_env_var == "DEEPINFRA_API_KEY"
+
+
+def test_deepinfra_flip_constructs_client_with_deepinfra_base_url_and_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """provider=deepinfra → client built against DeepInfra with DEEPINFRA_API_KEY.
+
+    No silent cross-pairing: a configured GOOGLE/PPQ key must not satisfy the
+    deepinfra arm.
+    """
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "deepinfra")
+    monkeypatch.setattr(summary_module.settings, "deepinfra_api_key", "di-test")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", None)
+    monkeypatch.setattr(summary_module.settings, "ppq_api_key", None)
+    summary_module._client.cache_clear()
+    try:
+        client = summary_module._client()
+        assert str(client.base_url).rstrip("/") == "https://api.deepinfra.com/v1/openai"
+        assert client.api_key == "di-test"
+    finally:
+        summary_module._client.cache_clear()
 
 
 def test_ppq_flip_constructs_client_with_ppq_base_url_and_key(

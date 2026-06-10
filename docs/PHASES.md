@@ -43,6 +43,15 @@ v1 (planned 2026-06-05 — see the **v1 Plan — Beyond Phase 16** section below
 - [ ] Phase 29 — App Dockerfiles + image-build CI (models baked, HF offline)
 - [ ] Phase 30 — KEDA + k8s manifests gated on /readyz
 
+v2 product backlog (captured 2026-06-10 — user-requested sermon-workflow direction; designed
+approaches in the **v2 Product Backlog — sermon workflow** section at the end of this file.
+The post-Phase-30 drill assigns phase numbers; B-ids are stable references until then):
+
+- [ ] B1 — Citation → in-app reader deep-link ("read in context", continue reading) + ⚠ time-sensitive originals-persistence sub-item
+- [ ] B2 — In-app sermon document editor (TipTap, citation nodes inserted from search)
+- [ ] B3 — Sermon calendar (year wall-planner + month + week views)
+- [ ] B4 — External editor round-trip (.docx first; Google Docs / Word OAuth sync later)
+
 ---
 
 Each phase is **one new Claude Code session**. Phases are intentionally small to keep context tight and reduce drift / errors. Run sequentially; verify each deliverable before moving on.
@@ -1370,7 +1379,7 @@ plan it as the next phase number.
 |---|---|---|
 | GPU swap (embedding/rerank/highlight → cuda) | No GPU hardware exists; this is the real latency lever (~30 s rerank, ~134 s summary E2E) | GPU runtime provisioned → swap the device pins per ADR 0003 + api/AGENTS.md |
 | google LLM arm live verify | Config-verified only; byte-identical code path to the live-verified ppq arm (ADR 0005) | GOOGLE_API_KEY provisioned → run the Phase 14b verify triad |
-| R2/B2 object storage | /tmp staging + Phase 20 idempotency + Phase 28 backups cover single-box risk; couples to the deploy provider | Multi-node k8s (post-Phase 30) makes shared object storage mandatory |
+| R2/B2 object storage | /tmp staging + Phase 20 idempotency + Phase 28 backups cover single-box risk; couples to the deploy provider | Multi-node k8s (post-Phase 30) makes shared object storage mandatory; B1 (v2 backlog) starts persisting originals to the compose MinIO over the same S3 API, so this swap becomes endpoint+credentials when it fires |
 | Email verification / CAPTCHA on signup | Phase 19 throttling covers abuse pre-launch | Real public signups |
 | Highlight/note import (Kindle, Logos) | Blocked on ARCHITECTURE.md §7.2 (separate collection vs content_type) — deliberately deferred | Real highlight queries exist → decide §7.2 (ADR), then schedule |
 | Hierarchical / parent-document retrieval | Quality enhancement; no correctness pressure | Phase 27 query logs show flat retrieval failing |
@@ -1383,4 +1392,316 @@ plan it as the next phase number.
 | Additional MCP servers (GitHub MCP, Context7) | Opt-in dev tooling; enableAllProjectMcpServers stays false | Explicit per-tool need |
 
 When Phases 17–30 are done, re-audit the repo and plan v2 here — same drill as
-2026-06-05.
+2026-06-05, starting from the **v2 Product Backlog** below: the product direction is
+already captured and pre-designed; the drill assigns phase numbers, sequences against
+the audit findings, and re-verifies the dated external facts.
+
+---
+
+## v2 Product Backlog — sermon workflow (captured 2026-06-10)
+
+User-requested product direction, captured and pre-designed so the post-Phase-30 v2
+drill starts from requirements, not memory. The ask: (1) click a citation → the book
+opens at that passage and you keep reading; (2) write sermons in the app; (3) schedule
+them on an in-app calendar — year view ("each month with each day in a box, a huge
+spreadsheet"), plus month and week views; (4) export a sermon to the user's preferred
+editor and have saves there land back in this app ("maybe we can link with api?").
+Together they close the product loop: search → cite → write → schedule → preach.
+
+Provenance: four parallel repo-grounded design passes + a 43-claim live web fact-check
+(2026-06-10: 41 confirmed, 1 refuted, 1 unclear — load-bearing ones marked "verified"
+inline). B-ids are stable references; the v2 drill assigns real phase numbers and MUST
+re-verify the dated facts (licenses, API capabilities, and library status drift).
+
+### Cross-item contracts (settle once — every B-item leans on them)
+
+- **Canonical sermon format = TipTap/ProseMirror JSON** in `documents.content` JSONB
+  (B2 decides, B4 consumes). Export leg: doc JSON → `@tiptap/html generateHTML`
+  (runs server-side in Node, no browser DOM — verified) → pandoc HTML↔docx
+  (hyperlinks survive both directions — verified). Markdown-canonical was rejected:
+  a citation node's structured attrs cannot round-trip through string syntax without
+  corrupting on edit.
+- **Table `documents`, UI route `/sermons`** — naming leaves room for non-sermon docs
+  (study notes) later. Calendar links via `sermon_events.document_id` FK
+  ON DELETE SET NULL.
+- **Reader route `/read/[bookId]?chunk=N`** (B1). The B2 citation node carries
+  `{bookId, chunkIndex, bookTitle, snippet, parentSection?}` and links there. In
+  docx/Google exports the citation serializes as a hyperlink to that URL — URLs
+  survive docx and Google Docs, `data-*` attributes do not (verified).
+- **Tenant rule unchanged and non-negotiable.** `documents`, `reading_positions`,
+  `sermon_events`, `sermon_doc_revisions`, `oauth_connections`, `editor_links` are
+  all user data: every query filters `user_id` from the JWT; path/body ids are never
+  capabilities (non-owned → 404, no existence oracle); web stays HttpOnly-cookie +
+  same-origin proxies with structural field whitelists (Phase 15/16 pattern). All
+  three tenant gates + `/security-review` per phase, `schema-reviewer` per migration.
+- Migrations stay hand-written, numbered 0004+ — B-items race each other for numbers;
+  first to land takes the next slot.
+- New Pydantic request models adopt `extra='forbid'` from day one (Phase 18 posture),
+  whether or not Phase 18 has landed.
+
+### B1 — Citation → reader deep-link ("read in context")
+
+**What:** clicking a citation card on `/search` opens the book in an in-app reader at
+the cited passage; scroll both directions through the whole book; reading position
+persists so `/library` offers "continue reading".
+
+**Approach — tiered.** Chunk-stitched reader now: Postgres `chunks` already holds the
+full extracted book text in dense order (`chunk_index` 0..N−1, unique per book —
+worker/ingest.py, worker/db/models.py), so the reader is one tenant-gated windowed
+endpoint plus a web page, zero new storage. The full-fidelity original-file reader
+(epub.js BSD-2 / pdfjs-dist Apache-2 — both verified viable) stays a later tier behind
+the parked R2/B2 item; no chunk→CFI/page mapping exists anyway, so the deep-link
+itself needs the chunk reader regardless.
+
+**⚠ Time-sensitive sub-item — persist originals NOW (candidate to pull into v1, e.g.
+alongside Phase 20 upload work):** originals live only in volatile `/tmp/sermon-uploads`
+(api/settings.py) and MinHash dedup short-circuits second owners before any write
+(worker/ingest.py), so every book ingested before this lands has a **permanently
+unrecoverable original**. Fix is write-only and cheap: new bucket on the compose MinIO
+(already running in infra/docker-compose.yml), populate the plumbed-but-never-filled
+`global_books.text_pointer` with `originals/{book_id}/{sanitized-filename}` on new
+books, and backfill on dup-hit when NULL — the only recovery mechanism that will ever
+exist. No read endpoint until the fidelity tier ships → zero new tenant read surface.
+Same S3 API as future R2/B2 (boto3/minio-py — verified), so that swap stays
+endpoint+credentials.
+
+**Data/API:** `reading_positions(position_id, user_id FK, book_id FK, chunk_index,
+offset_ratio NULL, updated_at, UNIQUE(user_id, book_id))` — doubly-scoped like
+`highlights`. `GET /books/{book_id}/chunks?start&limit` (default 40, cap 100; 404
+unless the book is in the JWT user's `user_library`); `GET`/`PUT
+/books/{book_id}/position` (upsert on the unique constraint); `GET /library` gains
+per-book `reading` progress. Web proxies per the Phase 15/16 same-origin pattern.
+
+**Web:** `app/read/[bookId]/page.tsx` — windowed bidirectional infinite scroll
+(IntersectionObserver sentinels both ends; manual scrollTop compensation on prepend —
+Safari lacks `overflow-anchor`, verified), `?chunk=N` anchor-scroll + tint. Markdown
+via react-markdown **without** rehype-raw (raw HTML stays inert — verified; preserves
+the zero-`dangerouslySetInnerHTML` invariant), `img` stubbed to alt-text (EPUB-internal
+refs never resolve), links `rel=noopener`; plain-text fallback if the dep is vetoed.
+Entry points: "Read in context" on citation cards (SearchPanel already has
+book_id+chunk_index), "Continue reading" + progress on library rows. Debounced
+position PUT on scroll-settle + pagehide flush via `fetch keepalive` (verified).
+Virtualization library only on observed jank — ~600 text blocks with windowed fetch is
+within plain-DOM budget.
+
+**Tenant traps specific to this repo:** `chunks` is shared-by-design (no user_id) —
+the gate is `user_library` membership per request, built as a testable statement
+builder (api/library.py `_library_stmt` precedent). The `/library` join to
+`reading_positions` MUST be `ON (user_id AND book_id)` — joining on book_id alone
+leaks another tenant's reading position for a shared deduped book.
+
+**Open questions:** is `offset_ratio` worth it in the first cut; denormalize
+`chunk_count` onto `global_books` or compute per request; `parent_section` TOC/nav in
+scope (cleaner after Phase 21 strips the HTML debris)?
+
+### B2 — In-app sermon document editor
+
+**What:** pastors write sermon manuscripts/outlines inside the app, with first-class
+cited passages inserted from library search.
+
+**Approach.** TipTap v3 — MIT core + free extensions only, never the paid Pro tier
+(verified: MIT, actively maintained, official React 19 + Next 15 App Router support
+with `immediatelyRender: false`; Pro = DOCX/comments/collab-cloud, none needed —
+pandoc covers docx). Headless, styled with the existing Tailwind; ~100 kB min+gzip
+confined to the editor route by App Router code-splitting (verified). Canonical
+storage is ProseMirror JSON (cross-item contract) + server-derived `content_text` for
+previews/FTS. Single-author v2: optimistic concurrency (`PATCH` carries
+`base_updated_at`, 409 on mismatch), soft delete via `deleted_at`, no versions table —
+collab-later is additive via Yjs/y-prosemirror/Hocuspocus (all MIT — verified) without
+changing `document_id` or the citation-node schema.
+
+**Citation node — the signature integration:** block-level "passage card" atom via
+`ReactNodeViewRenderer`, attrs `{bookId, chunkIndex, bookTitle, snippet (cached at
+insert), parentSection?}`; styled like the existing /search citation cards; serializes
+to the `/read` deep-link hyperlink on export. Snippet is cached so the doc stays
+self-contained — if the book later leaves `user_library`, render the cached text with
+a "no longer in your library" state instead of refetching. Insert flow: in-editor
+LibraryDrawer reusing the SearchPanel plumbing against a new thin `/api/search` proxy
+to the existing `POST /search` (raw hybrid hits, no LLM round-trip).
+
+**Data/API:** `documents(document_id, user_id FK, title, content JSONB, content_text,
+schema_version, deleted_at, created_at, updated_at; idx (user_id, updated_at DESC);
+optional tsv GIN mirroring chunks)`. `api/documents.py`: POST / GET list (non-deleted,
+preview) / GET / PATCH (409 stale) / DELETE (soft) / optional restore; content size
+cap (~2 MB); server re-derives `content_text` on every write; non-owned → 404.
+
+**Web:** `/sermons` list (server component, /library precedent) + `/sermons/[documentId]`
+(server shell → `"use client"` SermonEditor). Deps: @tiptap/react, @tiptap/pm,
+@tiptap/starter-kit, @tiptap/extension-placeholder (+@tiptap/html later, server-side).
+Autosave: debounced ~2 s + 15 s max-interval + pagehide `fetch keepalive` flush (~64 KB
+body ceiling — size-guard, large docs save on next open); SaveStatus indicator;
+409 → conflict banner. Middleware matcher + nav entries.
+
+**Cross-phase notes:** Phase 19 rate limiting needs a generous bucket for the chatty
+autosave PATCH. Phase 28 backups become materially more important — sermons are
+irreplaceable primary user data, unlike re-ingestable books. Phase 25's Playwright
+harness is the editor's E2E vehicle (contenteditable cannot be cookie-jar-verified).
+
+**Suggested slices:** (A) schema + API CRUD + ownership tests; (B) editor shell +
+explicit save; (C) autosave/conflict/soft-delete UX; (D) citation node +
+insert-from-search + `/api/search` proxy (re-run tenant gates); (E, optional) sermon
+metadata + niceties (series/date/passage fields, scripture-reference detection mark,
+preacher mode, word count/speaking time, print stylesheet).
+
+**Open questions:** block-level passage card only, or also an inline footnote-style
+marker (affects docx mapping); tsv column now or at a my-sermons-search phase;
+periodic version snapshots as anti-footgun despite keep-it-simple (lean no — soft
+delete + Phase 28); scripture detection display-only vs normalized column.
+
+### B3 — Sermon calendar (year wall-planner + month + week)
+
+**What:** schedule sermon documents on dates. Required: a YEAR view — all 12 months at
+once, each month a grid of day boxes ("huge spreadsheet" wall-planner feel) — plus
+standard month and week views.
+
+**Approach.** Custom Tailwind CSS-grid components, zero new runtime deps. The feature
+is exclusively day-anchored, single-day, all-day events at sermon density (1–3/day):
+the hard problems calendar libraries solve (time-slot layout, multi-day span packing,
+overlap resolution, RRULE expansion) are absent, and the year view needs custom
+density work regardless. Fact-check honesty: FullCalendar's `multiMonthYear` IS in the
+free MIT standard package with React 19 support (verified) — licensing is NOT why it
+lost; fit is (it would be web/'s largest dep to cover the easy 20%, and its
+Tailwind-preflight conflicts are real — verified). It remains the documented fallback
+if custom month/week proves heavier than expected. Year = `grid-cols-3/4` of 12
+MiniMonth components (each `grid-cols-7` of DayCell boxes: ≤2 series-colored dots +
+popover at small sizes, truncated title at ≥~36 px cells); month = same DayCell larger
+(≤3 chips + "+N more"); week = 7 day columns of full cards. One
+`GET /sermon-events?start&end` range fetch drives all views.
+
+**Recurrence:** discrete materialized rows + optional creation-time
+`repeat_weekly_until` server-side materializer (cap ~53 rows) + free-text `series`
+label — NOT RRULE: every sermon instance diverges immediately (unique title/doc per
+week), so RRULE's override/EXDATE machinery is pure cost; discrete rows keep range
+queries a single indexed WHERE and make reschedule/cancel a row edit.
+
+**Dates:** `event_date` is Postgres DATE, not timestamptz — preaching is day-anchored
+and UTC-midnight timestamps shift a day for UTC-minus users. Dates stay `YYYY-MM-DD`
+strings end-to-end in web/ (never `new Date('YYYY-MM-DD')`); pure string helpers in
+`web/lib/dates.ts`, vitest-pinned (Phase 15/16 pure-helper culture).
+
+**Data/API:** `sermon_events(event_id, user_id FK, event_date DATE, title, series
+NULL, document_id NULL FK→documents ON DELETE SET NULL, created_at, updated_at; idx
+(user_id, event_date); deliberately NO unique on (user_id, event_date) — two services
+one Sunday is normal)`. `api/calendar.py`: GET range (validated, capped ≤ ~400 days —
+year view is one call), POST (+materializer), PATCH partial (drag-to-reschedule is
+just `PATCH event_date`), DELETE; all double-scoped `(event_id AND user_id)`.
+
+**Tenant trap — `document_id` is attacker-controlled body input:** on POST/PATCH,
+ownership-check it against `documents WHERE user_id = JWT user` (422/404 on miss),
+otherwise user B links user A's sermon doc and the calendar leaks its existence/title.
+
+**Web:** `/calendar?view=year|month|week&date=YYYY-MM-DD` (URL state, linkable);
+QuickCreatePopover on empty day (title, weekly-repeat, create-doc); click event →
+`/sermons/{document_id}` when linked, else inline create; deterministic series→color
+hash; drag-to-reschedule via native HTML5 DnD, optimistic PATCH + rollback,
+keyboard-accessible fallback in the edit popover.
+
+**Suggested slices:** (1) schema + API CRUD (+materializer, statement-builder tests;
+include `document_id` only if `documents` already exists); (2) read-only year + month
+views + dates.ts helpers + proxies; (3) week view + CRUD UX + density polish; (4)
+editor linking (ownership check + open/create flows; add-column migration if (1)
+shipped without it); (5, nice-to-have) drag-to-reschedule + Playwright once Phase 25
+exists.
+
+**Open questions:** week start Sunday vs Monday (ship as a lib/dates.ts constant;
+per-user setting later?); optional `service_time`/label column for multi-service
+Sundays, or never any time in v2; scripture-passage column now or later; series as
+free-text + hashed color vs a series table; ICS export / printable wall chart in
+scope?; GET range cap value.
+
+### B4 — External editor round-trip (export + sync-back)
+
+**What:** export a sermon to the user's preferred editor (Google Docs and/or
+Microsoft Word/OneDrive, plus a dumb .docx download/upload fallback), continue editing
+there, and have saves land back in this app ("maybe we can link with api?" — yes:
+Drive API / Microsoft Graph, but staged).
+
+**Sync model — check-out/check-in, NOT continuous two-way merge.** Merge is overkill
+and corrupting: the conversion legs are lossy in both directions (silent merge =
+silent formatting corruption), sermon prep is single-author weekly cadence, and
+webhooks are hard-blocked today anyway — both providers require publicly-trusted HTTPS
+on a verified domain (verified) while the deploy is IP-only with `tls internal`
+(infra/caddy/Caddyfile). While linked: the external copy is source of truth, the
+in-app editor is read-only with an "Editing externally in {provider}" banner (Open /
+Pull changes / Unlink), and **every pull/import snapshots the prior app content to
+`sermon_doc_revisions` first** — last-writer-wins never destroys anything. Change
+detection in v2 is pull-on-open + a manual "Pull changes" button comparing the stored
+remote-version cursor (Drive `files.version` / Graph `eTag`, compared not parsed).
+
+**v2-MINIMAL slice ships first and standalone — .docx download/import, zero OAuth:**
+new `worker/convert.py` pandoc seam (pandoc is already a worker system dep; add the
+apt package to api/Dockerfile and extend api/AGENTS.md's allowed-import list — the
+same deliberate extension Phases 11/12/16b made). Export: content JSONB →
+`generateHTML` → pandoc HTML→docx with a `--reference-doc` template in worker/assets;
+import: docx → pandoc → HTML → `generateJSON`, snapshot first. Citations travel as
+`/read` hyperlinks (verified surviving pandoc and Google Docs). Note: the original
+design pass assumed markdown-canonical (`content_md`) — superseded by the cross-item
+contract (B2's ProseMirror JSON + the verified generateHTML→pandoc leg); fidelity is
+equal or better and the citation attrs stay lossless in-app.
+
+**OAuth slices (deferred, per provider, shared schema):**
+`oauth_connections(connection_id, user_id FK, provider, provider_account_id,
+provider_email, refresh_token_ciphertext BYTEA, scopes, access_token_expires_at,
+revoked_at, UNIQUE(user_id, provider))` — refresh tokens app-layer AESGCM-encrypted
+via the `cryptography` package (already in api/uv.lock), key from a new
+`SERMON_API_TOKEN_ENC_KEY` env var — and `editor_links(link_id, user_id FK, sermon/document FK,
+provider, provider_file_id, provider_web_url, state linked|error|unlinked,
+last_remote_version, exported_at, last_pulled_at; partial UNIQUE(document) WHERE
+state='linked' — one external editor at a time, simultaneous Google+Word is a merge
+problem by construction)`. OAuth state is the account-binding CSRF surface: HMAC-bind
+state to user_id + nonce + ~10-min expiry + PKCE S256, validate at callback BEFORE
+code exchange — else an attacker binds their account to a victim session and
+exfiltrates pulled sermons. Thin httpx clients, not SDKs (ADR 0005/0006 precedent —
+the surface is 2 token POSTs + ~5 REST calls per provider; verified no JS SDK needed,
+no new client libs).
+
+**Google first** — `drive.file` scope is non-sensitive: no CASA assessment, light
+verification (verified). Export: Drive `files.create` upload-with-conversion to a
+native Doc (verified; **hyperlink fidelity through that conversion is the one UNCLEAR
+fact-check — run an empirical spike before committing**). Pull: `files.export
+text/markdown` exists since ~mid-2024 with a 10 MB limit (verified) → through pandoc;
+else export docx → pandoc. Operator lead time: create the GCP project + consent screen
+early — Testing-mode refresh tokens expire in 7 days (fine for dev); production
+publishing removes that for drive.file-only apps (verified) but has multi-week lead
+time. **Microsoft second** — Graph docx in OneDrive (simple PUT under the size cap,
+else uploadSession), eTag staleness, download-back → pandoc; MSA refresh tokens are
+90-day sliding with rotation on each redemption (verified); Azure app registration is
+a second operator task.
+
+**Parked sub-item (written trigger):** background freshness — Celery beat service
+(none exists today: no beat_schedule, no beat container) polling linked docs,
+optionally Drive watch channels + Graph subscriptions with public validation routes
+and beat-driven channel renewal. Trigger: real domain + the Let's Encrypt flip per
+docs/DEPLOY_AWS.md "Adding a domain later". Webhook routes are UNAUTHENTICATED public
+surface when they come: resolve the link by per-channel secret (Drive channel token /
+Graph clientState), treat payloads as re-fetch hints, never as data.
+
+**Tenant/secrets notes:** four new user-data tables, all JWT-scoped; refresh tokens
+AESGCM-encrypted at rest, decrypted in-process per provider call, never returned to
+the browser, never logged (Phase 27 logging must redact); provider file ids/URLs are
+untrusted input; pulls write only to the link's own user_id-scoped document.
+
+**Suggested slices:** (ext-A) docx round-trip core — convert.py seam + export/import
+endpoints + `sermon_doc_revisions` migration + Download/Import UI; gate = golden
+round-trip test proving structure + citation hyperlinks survive; (ext-B) OAuth
+connection vault + /settings/integrations UI, live-verified against a Testing-mode
+Google project; (ext-C) Google Docs link/pull/unlink + check-out lock; (ext-D)
+Microsoft Graph as provider #2 over the same surface; (ext-E) PARKED background
+freshness per the trigger above.
+
+**Open questions:** lock severity while linked (hard read-only recommended) vs
+warn-and-allow; unlink default (pull-final-copy vs keep-app-version — make the user
+choose); account-rebind policy after revoke/reconnect (recommend auto-flip to
+state='error'); per-user cap on active links (~25) now or with per-tenant quotas;
+record pull provenance on revision rows (recommend yes — one column).
+
+### Sequencing sketch for the v2 drill
+
+B1's originals-persistence sub-item is the only time-sensitive piece — every ingest
+before it lands loses the original forever; consider pulling it into v1 near Phase 20.
+Then: B1 reader (independent) ∥ B2 A→D; B3 slices 1–3 are standalone once the
+`documents` FK contract is settled (defer the column if needed); B3-4 linking and
+B4 ext-A after B2; B4 ext-B/C/D as appetite allows; B4 ext-E stays parked on the
+domain trigger. Dependencies on v1: Phase 18 posture (adopted early regardless),
+Phase 19 autosave bucket, Phase 25 harness for editor/calendar E2E, Phase 28 backups
+upgraded in importance by irreplaceable sermon data.

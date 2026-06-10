@@ -8,15 +8,16 @@
 #   1. clone/pull the repo on the instance (/opt/sermon/app)
 #   2. first run only: generate /opt/sermon/.env.prod — strong secrets are
 #      created ON the box with openssl and never leave it
-#   3. forward GOOGLE_API_KEY / PPQ_API_KEY from the local env if set
-#      (so the LLM key never lands in git or chat either). Keys are STICKY:
-#      once set on the box they persist across deploys until you edit
-#      /opt/sermon/.env.prod by hand — running deploy.sh without the var
-#      exported leaves the old key (and provider) in place.
-#   4. docker compose build (first build ~10-20min: torch wheels, Next build,
-#      xcaddy compile)
-#   5. up the data plane, run one-shots: migrate → bootstrap-milvus → prewarm
-#      (prewarm downloads ~3.7GB of models into the hf-cache volume once)
+#   3. forward GOOGLE_API_KEY / PPQ_API_KEY / DEEPINFRA_API_KEY from the
+#      local env if set (so no key ever lands in git or chat). Keys are
+#      STICKY: once set on the box they persist across deploys until you
+#      edit /opt/sermon/.env.prod by hand — running deploy.sh without the
+#      var exported leaves the old key (and provider) in place.
+#      DEEPINFRA_API_KEY is REQUIRED (Phase 16b remote inference): the
+#      deploy aborts before build if it's neither on the box nor forwarded.
+#   4. docker compose build (first build is minutes now — Phase 16b removed
+#      the torch wheels; Next build + xcaddy compile dominate)
+#   5. up the data plane, run one-shots: migrate → bootstrap-milvus
 #   6. up everything, then smoke-test from the OUTSIDE (signup→login→library
 #      through Caddy with a cookie jar)
 
@@ -49,10 +50,11 @@ wait_for_ssh "${ip}"
 ssh_cmd "${ip}" "cloud-init status --wait >/dev/null 2>&1 || true"
 ssh_cmd "${ip}" "command -v docker >/dev/null" || die "Docker missing on instance — cloud-init failed? check /var/log/cloud-init-output.log"
 
-# Optional LLM keys forwarded from the local environment (never stored in git).
+# API keys forwarded from the local environment (never stored in git).
 llm_env=""
 [ -n "${GOOGLE_API_KEY:-}" ] && llm_env="GOOGLE_API_KEY=${GOOGLE_API_KEY}"
 [ -n "${PPQ_API_KEY:-}" ] && llm_env="${llm_env} PPQ_API_KEY=${PPQ_API_KEY}"
+[ -n "${DEEPINFRA_API_KEY:-}" ] && llm_env="${llm_env} DEEPINFRA_API_KEY=${DEEPINFRA_API_KEY}"
 
 ssh_cmd "${ip}" "bash -s" <<REMOTE
 set -euo pipefail
@@ -82,8 +84,10 @@ SITE_HOST=${ip}
 SERMON_API_CORS_ORIGINS=["https://${ip}"]
 SERMON_API_LLM_PROVIDER=google
 SERMON_API_LLM_MODEL=
+SERMON_API_LLM_REASONING_EFFORT=
 GOOGLE_API_KEY=
 PPQ_API_KEY=
+DEEPINFRA_API_KEY=
 EOF
   umask 022
   echo "generated /opt/sermon/.env.prod"
@@ -104,6 +108,19 @@ if [ -n "\${PPQ_API_KEY:-}" ]; then
   set_kv PPQ_API_KEY "\${PPQ_API_KEY}"
   set_kv SERMON_API_LLM_PROVIDER ppq
   echo "PPQ_API_KEY updated (provider → ppq)"
+fi
+if [ -n "\${DEEPINFRA_API_KEY:-}" ]; then
+  set_kv DEEPINFRA_API_KEY "\${DEEPINFRA_API_KEY}"
+  echo "DEEPINFRA_API_KEY updated"
+fi
+
+# Phase 16b: remote inference is load-bearing — every search and ingest
+# needs DEEPINFRA_API_KEY, and compose's \${VAR:?} would only fail later
+# with a less actionable message. Abort before the (long) build instead.
+if ! grep -q '^DEEPINFRA_API_KEY=..*' /opt/sermon/.env.prod; then
+  echo "DEEPINFRA_API_KEY is empty in /opt/sermon/.env.prod and not forwarded" >&2
+  echo "export DEEPINFRA_API_KEY=… locally and re-run deploy.sh" >&2
+  exit 1
 fi
 
 cd /opt/sermon/app
@@ -141,14 +158,6 @@ for attempt in 1 2 3; do
   echo "bootstrap-milvus attempt \${attempt} failed (cold Milvus gRPC?) — retrying in 10s"
   sleep 10
 done
-
-# Prewarm only when the heaviest model isn't cached yet (~3.7GB once).
-if ! docker run --rm -v sermon_sermon-hf-cache:/hf-cache alpine:3.20 \
-    test -d /hf-cache/hub/models--BAAI--bge-m3 2>/dev/null; then
-  compose run --rm prewarm </dev/null
-else
-  echo "hf-cache already warm — skipping prewarm"
-fi
 
 # --- 6. full stack ---
 compose up -d --wait

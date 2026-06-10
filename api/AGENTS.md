@@ -84,51 +84,56 @@ rules are here so the audit isn't your first line of defense.
 
 ## Cross-package imports from `worker/`
 
-`api/` reaches into `../worker` for four things only — `db` (since
-Phase 7), `embedding.embed`, `scripts.bootstrap_milvus`'s
+`api/` reaches into `../worker` for five things only — `db` (since
+Phase 7), `embedding.embed`, `inference` (the Phase 16b remote
+transport: `embed_texts`, `rerank_scores`, and the exception taxonomy
+`main.py` maps to 503/502), `scripts.bootstrap_milvus`'s
 `COLLECTION_NAME` + `make_client`, and `retrieval` (the hybrid
-dense+sparse+RRF kernel from Phase 12). The api venv accordingly carries
-`pymilvus`, `sentence-transformers`, `torch` (CPU-only via the same
-`[tool.uv.sources]` override `worker/` uses), and `numpy`. Pin them in
-lockstep with `worker/pyproject.toml` so the two processes load the
-exact same model and speak the same Milvus wire protocol.
+dense+sparse+RRF kernel from Phase 12). The api venv accordingly
+carries `pymilvus`, `numpy`, `openai`, `httpx`, and `psycopg` (the sync
+driver `embedding.py`'s space guard reads its meta row with). Keep
+`pymilvus` pinned in lockstep with `worker/pyproject.toml` — drift
+surfaces as a wire-protocol mismatch only at runtime; the model-weight
+lockstep concern died with Phase 16b (no process loads weights).
 
-## Models loaded in this process (Phase 11 + Phase 13)
+## Inference calls made by this process (Phase 16b, ADR 0006)
 
-Three sentence-transformers models load lazily on first use — each
-behind a `@lru_cache(maxsize=1)` so import-time / lint / test cost
-stays free until the first /search request:
+NO model weights load in this process. Every inference leg is a remote
+API call — clients are lazy + cached so import / lint / test cost stays
+free, and the empty-library path never needs a key or network:
 
-| File | Class | Model | Approx size | Used for |
-|------|-------|-------|-------------|----------|
-| `worker.embedding._model` | `SentenceTransformer` | `BAAI/bge-large-en-v1.5` | ~1.3 GB | Query embedding (dense arm). |
-| `rerank._model` | `CrossEncoder` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | ~90 MB | Top-30 → top-N rerank (Phase 13). |
-| `highlight._model` | `SentenceTransformer` | `BAAI/bge-m3` | ~2.3 GB | Sentence-level pruning (Phase 13). |
+| File | Transport | Model (env-driven) | Used for |
+|------|-----------|--------------------|----------|
+| `worker.embedding.embed` | `worker/inference.py` embeddings (OpenAI-compatible) | `BAAI/bge-large-en-v1.5` (`SERMON_EMBEDDINGS_MODEL`) | Query embedding (dense arm). Space-guarded against the Postgres `meta` row. |
+| `rerank._score_pairs` | `worker/inference.py` rerank (DeepInfra native shape) | `Qwen/Qwen3-Reranker-8B` (`SERMON_RERANK_MODEL`) | Top-30 → top-N rerank (Phase 13 contract, Phase 16b transport). |
+| `highlight._embed_batch` | `worker/inference.py` embeddings | `BAAI/bge-m3` (module constant) | Sentence-level pruning; query + all sentences ride ONE batched call. |
 
-Cold first-reranked-request cost: ~3.7 GB of model loads + cold
-inference. All three live in the HF cache
-(`~/.cache/huggingface/hub`); the worker process shares the BGE-Large
-weights (LlamaIndex Phase 5 + `worker.embedding` Phase 6 both pull the
-same blob), so the api ↔ worker pair has roughly 5 GB of model state
-between them when both are warm.
+All three are keyed by the unprefixed `DEEPINFRA_API_KEY`. Failure
+mapping is centralized in `main.py`: unset key →
+`MissingInferenceKeyError` → 503 naming the env var; upstream failure
+after the single retry → `RemoteInferenceError` → 502 naming the
+provider + leg. The remote calls carry only the query + chunk text the
+JWT user was already authorized to read — never `user_id`/JWT/email
+(see the tenant note below and `worker/inference.py`).
 
 The `/search-summary` LLM (Phase 14; transport re-cut in Phase 14b,
-[ADR 0005](../docs/adr/0005-llm-transport.md)) is deliberately **not**
-in that table: it is a network call through the `openai` SDK to an
-OpenAI-compatible endpoint — Google's compat endpoint by default,
-ppq.ai via `SERMON_API_LLM_PROVIDER=ppq`, with `summary.py:_PROVIDERS`
-as the single provider map and the unprefixed `GOOGLE_API_KEY` /
-`PPQ_API_KEY` as keys. No in-process model, no HF-cache footprint, and
-no api↔worker pin-lockstep concern — the `openai` pin rides alone in
-`api/pyproject.toml`.
+[ADR 0005](../docs/adr/0005-llm-transport.md)) follows the same shape:
+a network call through the `openai` SDK to an OpenAI-compatible
+endpoint — Google's compat endpoint by default, ppq.ai via
+`SERMON_API_LLM_PROVIDER=ppq`, with `summary.py:_PROVIDERS` as the
+single provider map and the unprefixed `GOOGLE_API_KEY` /
+`PPQ_API_KEY` as keys. `SERMON_API_LLM_REASONING_EFFORT=none` (Phase
+16b) disables Gemini 2.5 Flash thinking on providers that honor it.
 
 The rerank + highlight stages run *after* both retrieval arms' tenant
 filters have already executed. They take a `Sequence[RetrievalHit]`
 that was filtered by `book_id` upstream, score (query, chunk) pairs,
 and return a re-ordered + pruned subset. They **never** query the DB or
-Milvus and so introduce no new tenant surface — the cross-encoder and
-BGE-M3 see only chunks the JWT-authenticated user is already
-authorized to see (CLAUDE.md tenant rule, ARCHITECTURE.md §3 + §7.1).
+Milvus and so introduce no new tenant surface — the remote scorer sees
+only chunks the JWT-authenticated user is already authorized to read
+(CLAUDE.md tenant rule, ARCHITECTURE.md §3 + §7.1). The Phase 16b
+outbound calls carry that authorized text to DeepInfra (zero-retention
+default, ADR 0006) with the key in the `Authorization` header only.
 
 What `api/` still **must not** import:
 
@@ -166,25 +171,23 @@ you change one, change both.
   it in practice at v0 scale; introducing a chunked-filter or
   partition-key narrowing strategy is the next phase to do this
   properly.
-- **No graceful degradation when a model load or inference fails.**
-  Phase 12 noted `asyncio.gather` lacks `return_exceptions=True` on the
-  dense/sparse fan-out; Phase 13 adds two more sequential model calls
-  (cross-encoder, BGE-M3) that also raise straight through to a 500.
-  A cold HF cache without network on the first reranked /search after
-  process boot is the only realistic trigger — warm processes are
-  stable. Same posture held over to a future ops-resilience pass.
-- **Rerank wall-time cost.** With rerank=true the warm /search latency
-  on CPU is ~30 s vs the ~1 s Phase 12 baseline (10 chunks × ~30
-  sentences each through BGE-M3 dominates). Acceptable for sermon prep
-  but pushes hard against any future real-time use case; the GPU swap
-  in `worker/embedding.py` plus equivalent moves in `rerank.py` /
-  `highlight.py` are the architecture-locked next step. Phase 14b live
-  numbers (dev box, ppq.ai + `google/gemini-2.5-flash`): warm
-  `/search-summary` E2E ≈ 134 s ≈ 71–76 s retrieval+rerank+highlight
-  (this box runs above the ~30 s figure) + ~58–64 s LLM round-trip —
-  Gemini 2.5 Flash runs thinking by default through the
-  OpenAI-compat layer, so the LLM leg is tens of seconds, not the
-  2–3 s a non-thinking flash model would take.
+- **No graceful degradation when retrieval infra fails.** Phase 12
+  noted `asyncio.gather` lacks `return_exceptions=True` on the
+  dense/sparse fan-out — a Milvus or Postgres blip is still a 500.
+  Phase 16b *did* centralize the inference failure mapping (remote
+  call fails after retry → 502, key unset → 503, `main.py`), but
+  there is no fallback path (e.g. raw-RRF-on-rerank-failure); same
+  posture held over to a future ops-resilience pass.
+- **Inference wall-time moved off-box (Phase 16b).** The in-process-era
+  numbers (~30 s warm rerank on dev CPU; Phase 14b: warm
+  `/search-summary` E2E ≈ 134 s = ~71–76 s retrieval/rerank/highlight +
+  ~58–64 s thinking-enabled LLM) are obsolete — embeddings/rerank/
+  highlight are now sub-second-class provider calls, and
+  `SERMON_API_LLM_REASONING_EFFORT=none` collapses the LLM leg on
+  providers that honor it. The remaining structural latency is network
+  round-trips (4 sequential inference legs per summary: embed → rerank
+  → highlight → LLM). See the Phase 16b row in docs/PHASES.md for the
+  measured before/after.
 
 ## Before merging anything in this directory
 

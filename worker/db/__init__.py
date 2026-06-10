@@ -11,6 +11,7 @@ from db.models import (
     Collection,
     GlobalBook,
     Highlight,
+    Meta,
     User,
     UserLibraryEntry,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "Collection",
     "GlobalBook",
     "Highlight",
+    "Meta",
     "User",
     "UserLibraryEntry",
     "get_engine",

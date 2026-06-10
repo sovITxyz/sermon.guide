@@ -11,8 +11,11 @@ flows through unchanged (Phase 12 behavior).
 
 The algorithm primitives live elsewhere — this module is the FastAPI
 wrapper that handles auth, request validation, and the event-loop
-dance between sync (Milvus, BGE encode, cross-encoder, BGE-M3) and
-async (SQLAlchemy ``AsyncSession``) call sites.
+dance between sync (Milvus, the blocking remote-inference calls) and
+async (SQLAlchemy ``AsyncSession``) call sites. Since Phase 16b
+(ADR 0006) every inference leg — query embedding, rerank, highlight —
+is a remote API call through ``worker/inference.py``; no model weights
+load in this process.
 
 ## Trust boundary
 
@@ -36,37 +39,35 @@ This is the load-bearing tenant invariant for retrieval (repo-root
 - Rerank + highlight (Phase 13) are post-retrieval stages: they only
   see hits that already cleared the tenant filter on both arms. They
   do not query the DB or Milvus, so they introduce no new tenant
-  surface. The cross-encoder + BGE-M3 do consume the user query +
-  chunk content together as model input, but that's text-into-a-
-  transformer — not a SQL / filter-expression injection vector.
+  surface. Since Phase 16b they send the user query + chunk content to
+  the remote inference provider as model input — text the JWT user was
+  already authorized to read, never ``user_id``/JWT/email (see
+  ``worker/inference.py`` tenant notes) — not a SQL / filter-expression
+  injection vector.
 
 ## Parallelism
 
 The async handler kicks off two concurrent retrieval tasks via
 ``asyncio.gather``:
 
-1. Embed the query (``asyncio.to_thread`` around the BGE-Large encode),
-   then run the Milvus search (also ``to_thread`` — pymilvus is
-   blocking).
+1. Embed the query (``asyncio.to_thread`` around the blocking remote
+   embeddings call), then run the Milvus search (also ``to_thread`` —
+   pymilvus is blocking).
 2. Run the BM25 search directly on the request's ``AsyncSession``.
 
 After fusion, the rerank + highlight stages run sequentially on the
-fused list, each in ``asyncio.to_thread`` (cross-encoder predict +
-BGE-M3 encode are both blocking). Sequential because highlight depends
-on the post-rerank top-N; parallelism within the post-retrieval
-pipeline would only save the smaller stage's wall time, and the
-implementation cost (model warmup ordering, more failure modes for
-``asyncio.gather`` to fan out) isn't worth it at v0 scale.
+fused list, each in ``asyncio.to_thread`` (both are blocking remote
+calls). Sequential because highlight depends on the post-rerank top-N;
+parallelism within the post-retrieval pipeline would only save the
+smaller stage's wall time, and the implementation cost (more failure
+modes for ``asyncio.gather`` to fan out) isn't worth it at v0 scale.
 
 ## Process-level singletons
 
-BGE-Large (query embedding), the cross-encoder reranker, and BGE-M3
-(highlight scoring) are each loaded once per process via ``@lru_cache``
-in their respective modules. First request after process boot pays
-all three model loads (~3.7 GB across the three) plus cold inference;
-every subsequent call is one forward pass per model. The Milvus client
-is also one per process, lazily constructed on first use via
-``scripts.bootstrap_milvus.make_client``.
+The remote-inference clients (``worker/inference.py``) and the Milvus
+client are each constructed once per process, lazily on first use.
+Since Phase 16b no model weights load here — a cold process's first
+request pays connection setup, not multi-GB model loads.
 
 ## Why ``score`` shifts meaning by ``rerank``
 
@@ -75,8 +76,8 @@ score of the final ranking stage:
 
 - ``rerank=false`` → RRF score (sum of reciprocal ranks across arms;
   same as Phase 12).
-- ``rerank=true`` (default) → cross-encoder relevance score (higher =
-  better, unbounded, typical range ``[-15, +15]``).
+- ``rerank=true`` (default) → reranker relevance score (higher =
+  better; roughly ``[0, 1]`` on the Phase 16b Qwen3 reranker).
 
 The previous-stage scores survive on each hit's ``metadata``:
 ``rrf_score`` is written by the reranker; ``sentences_kept`` and
@@ -88,12 +89,13 @@ clients see only the final ordering score and the chunk metadata.
 
 ## Failure mode
 
-Same as Phase 12: ``asyncio.gather`` lacks ``return_exceptions=True``
-on the dense/sparse fan-out, and the rerank + highlight stages raise
-through to the handler. A Milvus or Postgres blip becomes a 500; a
-cross-encoder / BGE-M3 model load failure (cold HF cache + offline)
-also 500s. Documented in the Phase 12 audit (docs/PHASES.md row 12)
-and held over to a future ops-resilience pass.
+Same as Phase 12 for the storage arms: ``asyncio.gather`` lacks
+``return_exceptions=True`` on the dense/sparse fan-out, so a Milvus or
+Postgres blip becomes a 500 (documented in the Phase 12 audit,
+docs/PHASES.md row 12; held over to a future ops-resilience pass).
+Remote-inference failures are mapped in ``api/main.py`` since Phase
+16b: unset ``DEEPINFRA_API_KEY`` → 503 naming the env var, upstream
+failure after retry → 502 naming the provider + leg.
 """
 
 # pymilvus 2.6 ships without `py.typed`; same relaxation as worker/.
@@ -170,7 +172,7 @@ class SearchResponse(BaseModel):
 
 
 def _embed_query(query: str) -> list[float]:
-    """Embed a single query with BGE-Large. Blocking; offload via ``to_thread``."""
+    """Embed a single query with BGE-Large (remote). Blocking; offload via ``to_thread``."""
     arr = embed([query])
     return arr[0].tolist()
 
@@ -268,7 +270,7 @@ async def search(
 
     Thin HTTP wrapper over ``run_search`` — see that function for the
     pipeline and the tenant-scoping contract. When ``payload.rerank`` is
-    true (default), the top-30 fused list flows through the cross-encoder
+    true (default), the top-30 fused list flows through the remote
     reranker (→ top ``limit``) and BGE-M3 sentence-level pruning (drops
     sentences below threshold 0.5). When false, the raw RRF top-K is
     returned (Phase 12 behavior).

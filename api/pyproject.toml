@@ -21,27 +21,27 @@ dependencies = [
   "pydantic-settings>=2.6,<3",
   "celery>=5.4,<6",
   "redis>=5,<9",
-  # Phase 11: search endpoint embeds queries with BGE-Large and runs a
-  # filtered Milvus search in-process. Pins must stay aligned with
-  # `worker/pyproject.toml` — both processes load the same model from the
-  # same HF cache, and drift in pymilvus versions across api/worker would
-  # surface as a wire-protocol mismatch only at runtime. The CPU-only
-  # torch source override below mirrors worker/ for the same reason
-  # (Phase 5 row): the default PyPI wheel ships ~2GB of CUDA libraries
-  # we'd never use on api hardware.
+  # Phase 11: search endpoint embeds queries and runs a filtered Milvus
+  # search. pymilvus pins must stay aligned with `worker/pyproject.toml` —
+  # drift across api/worker would surface as a wire-protocol mismatch only
+  # at runtime.
   #
-  # Phase 13 adds two more models that ride on the same sentence-transformers
-  # install (no new pyproject entry needed — both classes are exported by
-  # sentence-transformers ≥3): `cross-encoder/ms-marco-MiniLM-L-6-v2`
-  # (~90MB, via `sentence_transformers.CrossEncoder`) for top-30 → top-N
-  # reranking; `BAAI/bge-m3` (~2.3GB, via `sentence_transformers.SentenceTransformer`)
-  # for sentence-level context pruning. Both load lazily per process via
-  # `@lru_cache` so import-time / lint / test cost stays free until the
-  # first reranked /search.
+  # Phase 16b (ADR 0006): all three in-process models (BGE-Large query
+  # embedding, ms-marco cross-encoder rerank, BGE-M3 highlight) became
+  # remote API calls through `worker/inference.py` — sentence-transformers
+  # and torch (and the CPU-wheel source override) are gone. httpx is the
+  # rerank transport (DeepInfra's reranker endpoint is not OpenAI-shaped);
+  # psycopg is the sync driver `worker/embedding.py`'s embedding-space
+  # guard reads its Postgres meta row with (same pin as worker/).
   "pymilvus>=2.6,<4",
-  "sentence-transformers>=3,<6",
-  "torch>=2.5,<3",
   "numpy>=2,<3",
+  "httpx>=0.27,<1",
+  "psycopg[binary]>=3,<4",
+  # `worker/inference.py` (imported by api/rerank.py + highlight.py) loads the
+  # bundled BGE WordPiece tokenizer to enforce bge-large's 512-token window
+  # (ADR 0006 §truncation). Pure-Rust text-splitting, no model weights; pinned
+  # in lockstep with worker/.
+  "tokenizers>=0.20,<1",
   # Phase 14 (transport re-cut in Phase 14b / ADR 0005): the /search-summary
   # endpoint synthesizes a grounded 1–2 paragraph answer over the reranked +
   # sentence-pruned chunks with Gemini Flash, reached through the `openai`
@@ -49,16 +49,16 @@ dependencies = [
   # Google's compat endpoint (default) or the ppq.ai gateway, selected by
   # SERMON_API_LLM_PROVIDER (summary.py:_PROVIDERS is the provider map; the
   # unprefixed GOOGLE_API_KEY / PPQ_API_KEY env vars thread through explicit
-  # aliases in settings.py; infra/.env.example documents all of it). Unlike
-  # the three sentence-transformers models above, nothing loads in-process —
-  # this is a network call either way, so no pin-lockstep-with-worker
-  # concern applies.
+  # aliases in settings.py; infra/.env.example documents all of it). The
+  # same SDK also serves worker/inference.py's embeddings leg since Phase
+  # 16b — nothing loads in-process anywhere, so no pin-lockstep-with-worker
+  # concern applies (but the openai pin itself must satisfy both packages,
+  # since api/ imports worker/inference.py).
   "openai>=2,<3",
 ]
 
 [dependency-groups]
 dev = [
-  "httpx>=0.27,<1",
   "pyright",
   "pytest",
   "pytest-asyncio>=0.24,<2",
@@ -67,14 +67,6 @@ dev = [
 
 [tool.uv]
 package = false
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 [tool.ruff]
 line-length = 100

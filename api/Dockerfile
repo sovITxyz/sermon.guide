@@ -3,20 +3,19 @@
 #   docker build -f api/Dockerfile .
 #
 # The context must be the repo root because api/ imports `db`, `embedding`,
-# `retrieval`, and `scripts.bootstrap_milvus` from ../worker at RUNTIME (the
-# one allowed cross-package import — root CLAUDE.md). A `COPY api/`-only
-# build fails at boot with ModuleNotFoundError.
+# `inference`, `retrieval`, and `scripts.bootstrap_milvus` from ../worker at
+# RUNTIME (the one allowed cross-package import — root CLAUDE.md). A
+# `COPY api/`-only build fails at boot with ModuleNotFoundError.
 #
-# Deps install from api/uv.lock with `uv sync --frozen` so the
-# [tool.uv.sources] CPU-only torch index is honored — re-resolving (or pip)
-# would drag in ~2GB of unused CUDA wheels.
+# Deps install from api/uv.lock with `uv sync --frozen` for reproducible
+# builds.
 #
-# The three inference models (BGE-Large ~1.3GB, ms-marco cross-encoder
-# ~90MB, BGE-M3 ~2.3GB) are NOT baked into this image. They live in the
-# shared `sermon-hf-cache` volume (HF_HOME), downloaded once by the
-# `prewarm` one-shot in infra/docker-compose.prod.yml; the runtime then
-# loads them lazily with HF_HUB_OFFLINE=1 so no request ever blocks on
-# (or flakes over) a HuggingFace network round-trip.
+# Phase 16b (ADR 0006): NO model weights live in (or near) this image —
+# embeddings/rerank/highlight are remote DeepInfra calls through
+# worker/inference.py, and the LLM was already remote (ADR 0005). The
+# ~1.5GB torch + sentence-transformers layer, the shared hf-cache volume,
+# and the prewarm one-shot are gone; ca-certificates is what keeps the
+# HTTPS legs (DeepInfra + LLM endpoints) verifiable.
 
 FROM python:3.12-slim AS deps
 COPY --from=ghcr.io/astral-sh/uv:0.11.19 /uv /usr/local/bin/uv
@@ -30,11 +29,10 @@ COPY api/pyproject.toml api/uv.lock ./
 RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim
-# libgomp1: OpenMP runtime needed by the torch-CPU / sentence-transformers
-# native wheels on slim images. ca-certificates: HTTPS to the LLM endpoint
-# (generativelanguage.googleapis.com / api.ppq.ai).
+# ca-certificates: HTTPS to the inference endpoints (api.deepinfra.com) and
+# the LLM endpoint (generativelanguage.googleapis.com / api.ppq.ai).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/api/.venv /app/api/.venv
 COPY worker/ /app/worker/
@@ -44,8 +42,9 @@ ENV PATH="/app/api/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 WORKDIR /app/api
 EXPOSE 8000
-# Exactly ONE uvicorn worker: each process lazily loads ~3.7GB of models, so
-# --workers N would cost N × 3.7GB on the shared box. Handlers offload
-# blocking CPU/Milvus work via asyncio.to_thread, so a single worker serves
-# concurrent requests fine; the bottleneck is model wall-time, not async I/O.
+# ONE uvicorn worker is still plenty: handlers offload blocking remote-call
+# and Milvus work via asyncio.to_thread, so a single worker serves concurrent
+# requests fine. The Phase 16b RAM rationale (N × 3.7GB of models) is gone,
+# but the box is small and the bottleneck is provider wall-time, not async
+# I/O — revisit only if traffic data says otherwise.
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

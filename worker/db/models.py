@@ -35,6 +35,31 @@ class Base(DeclarativeBase):
     """Declarative base for the sermon.guide schema."""
 
 
+class Meta(Base):
+    """Deployment-scoped key/value facts — currently the embedding-space pin.
+
+    Phase 16b (ADR 0006). ``key='embedding_model_id'`` records which
+    embedding model produced every vector in Milvus; the migration that
+    creates this table seeds it with the v0 locked model
+    (``BAAI/bge-large-en-v1.5``). ``worker/embedding.py`` refuses to embed
+    when ``SERMON_EMBEDDINGS_MODEL`` disagrees with the recorded value —
+    silent provider/model drift would mix embedding spaces and quietly
+    destroy retrieval. Changing embedders is a deliberate migration
+    (re-embed the corpus, recalibrate thresholds, update this row), never
+    an env flip.
+    """
+
+    __tablename__ = "meta"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class User(Base):
     __tablename__ = "users"
 

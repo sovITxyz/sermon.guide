@@ -83,8 +83,7 @@ sermon prep; the architecture-locked GPU swap is the documented path.
 """
 
 # The openai SDK ships py.typed with fully-typed chat completions, so this
-# module needs no stub relaxation like the pymilvus / sentence-transformers
-# modules do.
+# module needs no stub relaxation like the pymilvus-touching modules do.
 
 from __future__ import annotations
 
@@ -142,14 +141,25 @@ _PROVIDERS: Mapping[str, _Provider] = {
         key_env_var="PPQ_API_KEY",
         api_key=lambda: settings.ppq_api_key,
     ),
+    # Phase 16b (ADR 0006): DeepInfra serves google/gemini-2.5-flash over its
+    # OpenAI-compatible chat endpoint (the same base_url the embeddings leg
+    # uses), keyed by the same DEEPINFRA_API_KEY — so the whole inference stack
+    # collapses to one vendor + one key. reasoning_effort=none is honored here
+    # (probed live 2026-06-09), unlike ppq's chat.completions.
+    "deepinfra": _Provider(
+        base_url="https://api.deepinfra.com/v1/openai",
+        default_model="google/gemini-2.5-flash",
+        key_env_var="DEEPINFRA_API_KEY",
+        api_key=lambda: settings.deepinfra_api_key,
+    ),
 }
 
 
 def _active_provider() -> _Provider:
     """The row picked by ``SERMON_API_LLM_PROVIDER``.
 
-    ``settings.llm_provider`` is ``Literal["google", "ppq"]``, so the lookup
-    cannot ``KeyError`` on a validated config.
+    ``settings.llm_provider`` is ``Literal["google", "ppq", "deepinfra"]``, so
+    the lookup cannot ``KeyError`` on a validated config.
     """
     return _PROVIDERS[settings.llm_provider]
 
@@ -342,6 +352,11 @@ def _generate_summary(*, query: str, sources: Sequence[_Source]) -> str:
     completion — FastAPI re-raises it from the worker thread into the handler.
     """
     provider = _active_provider()
+    # Phase 16b: optionally disable/cap thinking (SERMON_API_LLM_REASONING_EFFORT).
+    # Sent via extra_body so the knob is provider-agnostic and forward-compatible
+    # with values the SDK's typed literal hasn't caught up to (e.g. "none").
+    reasoning = settings.llm_reasoning_effort
+    extra_body = {"reasoning_effort": reasoning} if reasoning is not None else None
     try:
         response = _client().chat.completions.create(
             model=settings.llm_model or provider.default_model,
@@ -351,6 +366,7 @@ def _generate_summary(*, query: str, sources: Sequence[_Source]) -> str:
             ],
             temperature=_TEMPERATURE,
             max_tokens=_MAX_OUTPUT_TOKENS,
+            extra_body=extra_body,
         )
     except openai.APIError as exc:
         raise HTTPException(

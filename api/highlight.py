@@ -1,12 +1,12 @@
-"""Sentence-level context pruning via BGE-M3 semantic highlighting.
+"""Sentence-level context pruning via BGE-M3 dense scoring. Remote since Phase 16b.
 
 Phase 13 (ARCHITECTURE.md §2 "Context pruning", §5 lifecycle). After
-the cross-encoder rerank in ``api/rerank.py`` selects the top-N most
-relevant chunks, we still want to feed downstream stages (Phase 14
-LLM summarization) only the *parts* of each chunk that actually answer
-the query. ``highlight`` splits each chunk into sentences, scores
-every sentence against the query with BGE-M3 (cosine, unit-normalized),
-and drops sentences below threshold 0.5.
+the rerank in ``api/rerank.py`` selects the top-N most relevant chunks,
+we still want to feed downstream stages (Phase 14 LLM summarization)
+only the *parts* of each chunk that actually answer the query.
+``highlight`` splits each chunk into sentences, scores every sentence
+against the query with BGE-M3 dense embeddings (cosine, unit-
+normalized), and drops sentences below threshold 0.5.
 
 Target reduction per ARCHITECTURE.md §2 row "Context pruning": 70–80%
 fewer input tokens to the LLM, without losing the answer-bearing
@@ -14,11 +14,13 @@ sentences.
 
 ## Model
 
-``BAAI/bge-m3`` is a multi-functional embedder (dense + sparse +
-ColBERT-style multi-vec). We use only its dense head — sentence-vs-
-query cosine — so we load it via ``SentenceTransformer`` in default
-mode. Model weights are ~2.3GB; first cold call downloads from HF.
-Same CPU-only / future-GPU note as ``worker/embedding.py``.
+``BAAI/bge-m3``'s dense head — sentence-vs-query cosine. Phase 16b
+(ADR 0006): the embeddings come from the remote OpenAI-compatible
+endpoint via ``worker/inference.py`` — the EXACT same weights the
+in-process loader served, so threshold 0.5's calibration (and with it
+the no-context → no-LLM-call anti-confabulation contract the Phase
+14/16 live verifies pinned) carries over unchanged. The query and every
+sentence ride ONE batched embeddings call per request.
 
 Threshold 0.5 is the spec value. Empirically on BGE-M3:
 
@@ -43,9 +45,7 @@ the kept/dropped boundary than a linguist would.
 
 A future swap to ``pysbd`` or NLTK ``punkt_tab`` is mechanical — the
 splitter is the only mutable boundary between regex behavior and
-linguistic intuition. Adding it now would mean shipping another
-HuggingFace-style "did you remember to download the resource?" foot-
-gun, so we stay regex-based until eval shows it costs us recall.
+linguistic intuition.
 
 ## Output
 
@@ -59,34 +59,28 @@ shorter than itself.
 
 ``metadata["sentences_kept"]`` / ``metadata["sentences_total"]`` are
 written so callers (debug tooling, the Phase 14 token-budget check)
-can see how aggressively each chunk was pruned without re-running the
-model.
+can see how aggressively each chunk was pruned without re-scoring.
 
 ## Failure mode
 
-Same fail-loud posture as ``api/rerank.py`` — a model load failure or
-OOM raises into the handler and 500s. The empty-input path is cheap
-and does *not* load the model.
+Same as ``api/rerank.py`` — a remote failure raises
+``RemoteInferenceError`` into the FastAPI layer, which maps it to a 502
+(unset key → 503; see ``api/main.py``). The empty-input path is cheap,
+key-free, and makes no remote call.
 """
-
-# sentence-transformers stubs are wide on encode()'s return type — same
-# relaxation as worker/embedding.py.
-# pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 
 from __future__ import annotations
 
 import re
 from collections.abc import Sequence
 from dataclasses import replace
-from functools import lru_cache
 
 import numpy as np
+from inference import embed_texts
 from retrieval import RetrievalHit
-from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = "BAAI/bge-m3"
 HIGHLIGHT_THRESHOLD = 0.5
-_DEVICE = "cpu"
 
 # Sentence boundary: sentence-ending punctuation followed by whitespace
 # and the next sentence's likely start character (capital letter or an
@@ -95,10 +89,15 @@ _DEVICE = "cpu"
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'“‘])")
 
 
-@lru_cache(maxsize=1)
-def _model() -> SentenceTransformer:
-    """Lazily load BGE-M3 once per process. First call may download ~2.3GB."""
-    return SentenceTransformer(MODEL_NAME, device=_DEVICE)
+def _embed_batch(texts: list[str]) -> np.ndarray:
+    """Embed *texts* with BGE-M3 dense remotely; the unit-test seam.
+
+    Returns unit-normalized ``(len(texts), dim)`` float32 rows (the
+    transport normalizes client-side), so cosine reduces to inner
+    product downstream. Tests monkeypatch this — the same role the
+    ``_model`` loader seam played in the in-process era.
+    """
+    return embed_texts(texts, model=MODEL_NAME)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -129,16 +128,12 @@ def highlight(
 
     Each surviving hit's ``metadata`` is augmented with
     ``sentences_kept`` and ``sentences_total`` so downstream tooling
-    can attribute token reduction without re-running BGE-M3.
+    can attribute token reduction without re-scoring.
     """
     if not hits:
         return []
 
     per_hit_sentences = [_split_sentences(h.content_chunk) for h in hits]
-    # Flatten every sentence into one batch so the BGE-M3 forward pass
-    # is a single call instead of N. The model itself is loaded once
-    # per process via ``_model``'s lru_cache; per-call latency is the
-    # encode pass over (1 + total_sentences) inputs.
     all_sentences: list[str] = [s for sents in per_hit_sentences for s in sents]
     if not all_sentences:
         # No splittable sentences in any chunk — nothing to score.
@@ -151,22 +146,15 @@ def highlight(
             for hit in hits
         ]
 
-    model = _model()
-    query_vec = model.encode(
-        [query],
-        normalize_embeddings=True,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-    sentence_vecs = model.encode(
-        all_sentences,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-    # Both arrays are unit-normalized, so cosine reduces to inner product.
-    # Shape: (N_sentences, 1024) @ (1024,) → (N_sentences,).
-    scores = np.asarray(sentence_vecs @ np.asarray(query_vec)[0], dtype=np.float32)
+    # ONE batched remote call per request: the query rides as row 0 and
+    # every sentence follows, so the per-query cost is a single network
+    # round-trip however many chunks survived the rerank.
+    vectors = _embed_batch([query, *all_sentences])
+    query_vec = np.asarray(vectors[0], dtype=np.float32)
+    sentence_vecs = np.asarray(vectors[1:], dtype=np.float32)
+    # All rows are unit-normalized by the transport, so cosine reduces to
+    # inner product. Shape: (N_sentences, dim) @ (dim,) → (N_sentences,).
+    scores = np.asarray(sentence_vecs @ query_vec, dtype=np.float32)
 
     pruned: list[RetrievalHit] = []
     cursor = 0

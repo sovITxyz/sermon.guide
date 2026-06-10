@@ -7,9 +7,9 @@ Two layers:
    CI.
 2. **End-to-end** — drives ``ingest_markdown`` with a tiny synthetic
    markdown string, two simulated tenants, and the full dedup gate. Real
-   BGE-Large, real Milvus, real Postgres. Skips cleanly without (a)
-   HF cache, (b) reachable Milvus, (c) reachable Postgres, or (d)
-   NLTK WordNet corpus.
+   remote BGE-Large (Phase 16b), real Milvus, real Postgres. Skips
+   cleanly without (a) DEEPINFRA_API_KEY, (b) reachable Milvus, (c)
+   reachable Postgres, or (d) NLTK WordNet corpus.
 
 The e2e covers the Phase 8 verify checklist: ingest under tenant_a (new
 book, vectors created), ingest the same content under tenant_b (no new
@@ -26,7 +26,6 @@ import os
 import socket
 import uuid
 from collections.abc import Iterator
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -34,7 +33,7 @@ import pytest
 from chunking import Chunk
 from db import GlobalBook, User, UserLibraryEntry, get_sync_session_factory
 from db.settings import settings as db_settings
-from embedding import EMBED_DIM, MODEL_NAME
+from embedding import EMBED_DIM
 from ingest import _build_rows, ingest_markdown
 from scripts.bootstrap_milvus import COLLECTION_NAME
 
@@ -53,12 +52,9 @@ A child laughed somewhere down the lane.
 """
 
 
-def _model_available() -> bool:
-    if os.environ.get("HF_HUB_OFFLINE") == "1":
-        return False
-    cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    slug = MODEL_NAME.replace("/", "--")
-    return (cache / "hub" / f"models--{slug}").is_dir()
+def _remote_embeddings_available() -> bool:
+    """Phase 16b: chunk + boundary embeddings are remote calls now."""
+    return bool(os.environ.get("DEEPINFRA_API_KEY"))
 
 
 def _milvus_host_port() -> tuple[str, int]:
@@ -201,8 +197,8 @@ def milvus_clean_test_books() -> Iterator[None]:
 
 
 @pytest.mark.skipif(
-    not _model_available(),
-    reason="BGE-Large model not in HF cache — set HF_HOME or prewarm to run",
+    not _remote_embeddings_available(),
+    reason="DEEPINFRA_API_KEY unset — remote embeddings unavailable",
 )
 @pytest.mark.skipif(
     not _wordnet_available(),

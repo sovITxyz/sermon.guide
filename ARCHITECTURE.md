@@ -36,7 +36,8 @@ either an [Open Question](#7-open-questions) or out of scope for v0.
 | --------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------- |
 | Tenancy model         | Shared collection with metadata filtering               | Operationally simplest at 4k tenants; per-tenant collections don't scale |
 | Vector DB             | Milvus, **flat** index                                  | 100% recall and predictable latency once filtered to one tenant's slice |
-| Embedding model       | BGE-Large (1024d)                                       | Best open-weight retrieval quality at the size; English-first corpus    |
+| Embedding model       | BGE-Large (1024d), served remotely (DeepInfra, exact weights — ADR 0006) | Best open-weight retrieval quality at the size; identical weights keep every stored vector valid |
+| Inference transport   | Remote APIs for ALL inference (embeddings/rerank/highlight via DeepInfra, LLM via ADR 0005); no in-process weights | Kills ~3.7GB api RSS + ~75s/query CPU + the ~40min/book ingest wall; env-portable (ADR 0006) |
 | Ingestion runtime     | Celery + Redis on Kubernetes with KEDA autoscaling      | Decouples bursty uploads from the API; scales workers to zero           |
 | EPUB extraction       | EbookLib → pandoc → markdown                            | Avoids Tika's alt-text pollution / metadata leakage                     |
 | PDF extraction        | pymupdf4llm                                             | Markdown-aware, page-structure preserving                               |
@@ -44,9 +45,9 @@ either an [Open Question](#7-open-questions) or out of scope for v0.
 | Dedup                 | MinHash LSH on lemmatized 5-shingles, threshold 0.85    | Catches near-duplicates (different editions); ~80% storage savings      |
 | Chunking              | LlamaIndex SemanticSplitterNodeParser                   | Boundary-on-meaning beats fixed token windows for theology / narrative  |
 | Search (retrieval)    | Hybrid: dense BGE + sparse BM25, fused via RRF (k=60)   | Themes via dense, names/refs via sparse; RRF avoids score normalization |
-| Reranking             | Cross-encoder (ms-marco-MiniLM-L-6-v2) on top-30 → top-10 | Precision pass before LLM context; cheap                              |
-| Context pruning       | BGE-M3 semantic highlighting, sentence-level, threshold 0.5 | 70–80% token reduction into the LLM                                  |
-| LLM                   | Gemini Flash (2.5 at v0) over an OpenAI-compatible transport (ADR 0005) | Cheapest high-context model; provider-portable chat-completions shape   |
+| Reranking             | Qwen3-Reranker-8B (remote, env-swappable — ADR 0006) on top-30 → top-10 | Precision pass before LLM context; large quality jump over the v0 MiniLM cross-encoder |
+| Context pruning       | BGE-M3 semantic highlighting (remote dense, exact weights), sentence-level, threshold 0.5 | 70–80% token reduction into the LLM; identical weights keep the 0.5 calibration |
+| LLM                   | Gemini Flash (2.5 at v0) over an OpenAI-compatible transport (ADR 0005); google / ppq / deepinfra providers (ADR 0006) | Cheapest high-context model; provider-portable — `deepinfra` collapses the whole stack to one vendor + key |
 | Frontend              | Next.js 15 (app router) + Tailwind, TypeScript strict   | Server components keep JWT in HttpOnly cookies, never in browser JS     |
 | Raw file storage      | Cloudflare R2 or Backblaze B2 (S3-compatible)           | Cheap object storage for the originals; Postgres only stores pointers   |
 
@@ -128,6 +129,10 @@ to enforce this.
 
 ## 5. Request lifecycle (v0)
 
+All inference legs below are remote API calls since Phase 16b (ADR 0006) —
+no model weights load in any process. The embedding model id is additionally
+pinned by the Postgres `meta` row; `embed` refuses to run on a mismatch.
+
 ```
 upload:
   client → POST /upload (JWT) → api saves to local/R2 → enqueue Celery task
@@ -135,19 +140,22 @@ upload:
   worker:
     detect format → extract markdown → MinHash signature
       ├── duplicate? → insert user_library row only.       done.
-      └── new?       → chunk → embed (BGE-Large) → insert
+      └── new?       → chunk (boundary embeds via DeepInfra)
+                       → embed chunks (BGE-Large via DeepInfra) → insert
                                   global_books + library_vectors + user_library
 
 search-summary:
   client → POST /search-summary (JWT) → api
-    → embed(query) with BGE-Large
+    → embed(query) with BGE-Large (DeepInfra, space-guarded)
     → resolve user's book_id set from Postgres user_library
     → Milvus filtered search (expr=book_id IN <set>)  → top-30 dense
     → Postgres tsvector BM25                          → top-30 sparse
     → RRF fuse                                        → top-30
-    → cross-encoder rerank                            → top-10
-    → BGE-M3 sentence highlighting (drop < 0.5)       → pruned context
-    → Gemini Flash with citation prompt (ADR 0005)    → {summary, citations}
+    → remote rerank (Qwen3-Reranker via DeepInfra)    → top-10
+    → BGE-M3 sentence highlighting via DeepInfra
+      (one batched call, drop < 0.5)                  → pruned context
+    → Gemini Flash with citation prompt (ADR 0005;
+      reasoning_effort knob from Phase 16b)           → {summary, citations}
 ```
 
 ## 6. Out of scope for v0

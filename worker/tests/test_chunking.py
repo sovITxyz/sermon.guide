@@ -3,12 +3,13 @@
 Three layers, matching `test_extractors.py`:
 
 1. **Pure unit** — synthetic markdown drives the ATX-header helper and the
-   empty-input short-circuit. No embedder, no model download, runs in CI.
+   empty-input short-circuit. No embedder, no network, runs in CI.
 2. **API surface** — `Chunk` dataclass shape and `chunk()` signature.
 3. **End-to-end** — real EPUB from `worker/tests/samples/` extracted to
    markdown then chunked. Boundary count, ordering, and sentence-end shape
-   are asserted. Skipped without a sample (copyrighted; gitignored) or when
-   the BGE model can't be loaded (no `HF_HOME` / offline CI).
+   are asserted. Skipped without a sample (copyrighted; gitignored) or
+   without `DEEPINFRA_API_KEY` (Phase 16b: boundary embedding is a remote
+   call — ~$0.01 of embeddings per run on a novel-sized EPUB).
 """
 
 # Tests deliberately reach for `_heading_offsets` / `_parent_section_for` —
@@ -81,24 +82,19 @@ def test_parent_section_before_first_heading_is_none() -> None:
     assert _parent_section_for(0, headings) is None
 
 
-def _model_available() -> bool:
-    """True if BGE-Large can be loaded without hitting the network.
+def _remote_embeddings_available() -> bool:
+    """True when the remote boundary embedder can be reached (Phase 16b).
 
-    Honours `HF_HUB_OFFLINE` (HF's own opt-out) and looks for the model in
-    the default HuggingFace cache. CI without the cache prewarmed will skip
-    the end-to-end test rather than block on a download.
+    The semantic splitter's embeddings are a remote call now; CI without
+    the key skips the end-to-end test rather than failing on a 503.
     """
-    if os.environ.get("HF_HUB_OFFLINE") == "1":
-        return False
-    cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    # The model lives under hub/models--BAAI--bge-large-en-v1.5/ once warm.
-    return (cache / "hub" / "models--BAAI--bge-large-en-v1.5").is_dir()
+    return bool(os.environ.get("DEEPINFRA_API_KEY"))
 
 
 @pytest.mark.skipif(not EPUB_SAMPLE.exists(), reason="no EPUB sample in worker/tests/samples/")
 @pytest.mark.skipif(
-    not _model_available(),
-    reason="BGE-Large model not in HF cache — set HF_HOME or prewarm to run",
+    not _remote_embeddings_available(),
+    reason="DEEPINFRA_API_KEY unset — remote boundary embedding unavailable",
 )
 def test_chunk_real_epub_produces_sane_chunks() -> None:
     """Real EPUB → 50–500 chunks with monotonically advancing offsets."""

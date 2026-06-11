@@ -306,27 +306,73 @@ What `api/` still **must not** import:
 
 api/ enqueues ingest tasks by name via a thin `Celery()` instance
 against the same Redis broker / backend — `send_task(
-"tasks.ingest.ingest_book", args=[…])`. Drift between this module's
-`RedisSettings` and `worker/celery_app.py:RedisSettings` is a silent
-failure — the api enqueues into a queue the worker isn't reading. If
-you change one, change both. The Phase 19 rate limiter reuses this
-module's `RedisSettings().url(2)` for its counters (logical db 2) but
-deliberately does NOT add a field to the mirrored class — db 2 is an
-api-only concern and the mirror must stay byte-identical to the
-worker's (see "Rate limiting" above).
+"tasks.ingest.ingest_book", args=[…], task_id=…)`. Drift between this
+module's `RedisSettings` and `worker/celery_app.py:RedisSettings` is a
+silent failure — the api enqueues into a queue the worker isn't
+reading. If you change one, change both. The Phase 19 rate limiter
+reuses this module's `RedisSettings().url(2)` for its counters (logical
+db 2) but deliberately does NOT add a field to the mirrored class — db
+2 is an api-only concern and the mirror must stay byte-identical to the
+worker's (see "Rate limiting" above). Since Phase 20 the `task_id` is
+REQUIRED and minted by the `/upload` route, never by Celery — the
+`upload_tasks` row must exist under that id before the broker sees the
+message (see "Upload integrity" below).
+
+## Upload integrity (Phase 20)
+
+`POST /upload` + `GET /tasks/{task_id}` form one contract, backed by
+the `upload_tasks(task_id, user_id, book_id, filename, created_at)`
+table (`worker/db/models.py`, migration 0004):
+
+- **Task ownership, 404 contract.** `GET /tasks/{task_id}` resolves the
+  row scoped to the JWT user (`uploads._ownership_stmt` — BOTH
+  predicates load-bearing, compile-pinned in `tests/test_uploads_unit.py`).
+  Non-owned, nonexistent, and non-UUID ids are the SAME 404 — no
+  existence oracle (the cross-tenant-404 rule above). The Celery backend
+  is consulted only AFTER ownership passes: `AsyncResult` reports
+  `PENDING` for ids it has never seen, so backend-first would make the
+  route a universal 200 prober. This replaces the Phase 10 "122-bit
+  task_id is the capability" posture.
+- **Commit-before-send ordering.** The route commits the `upload_tasks`
+  row, THEN calls `send_task` with the api-minted task UUID. A crash
+  between the two leaves an owned row whose task never runs (polls as
+  `PENDING`; the user re-uploads). The reverse order could run a task
+  its owner can never see — and whose worker-side idempotency claim row
+  is missing. Keep the ordering; it is asserted in the route tests.
+- **Idempotency claim (the Phase 9 orphan-vector window).** The same row
+  carries the worker's in-flight `book_id` claim: a redelivered task
+  scrubs the crashed attempt's partial vectors and re-runs under the
+  same `book_id` — one consistent record, zero orphans. Worker-side
+  design + invariant live in `worker/ingest.py` ("Task-id claim") and
+  `worker/AGENTS.md` ("Idempotency — the task-id claim").
+- **Result durability caveat.** `result_expires=3600` (worker config):
+  an owned task's Celery result vanishes from Redis after 1h and the
+  status reverts to `PENDING`. The `upload_tasks` row keeps ownership +
+  the 404 contract correct forever; persisting the *outcome* to the row
+  is deliberately deferred until a product surface needs it.
+
+## Content-type posture (Phase 20 — early sniff, decided)
+
+`POST /upload` libmagic-sniffs the FIRST BYTES of the body and 415s
+anything that isn't `application/epub+zip` / `application/pdf` —
+*before* any disk write, DB row, or enqueue. This reverses the Phase 10
+"no format trust at the API" stance deliberately: that rationale argued
+against trusting the client's Content-Type *header*; the sniff inspects
+content bytes — the same evidence the worker sees — so there is no
+header for an attacker to vary. What it buys: attacker bytes are never
+staged to `upload_dir`, no ownership row or queue slot is burned on a
+guaranteed-failure task, and the uploader gets an immediate 415 instead
+of polling to `FAILURE`. The worker's `extractors.detect()` still
+re-sniffs the staged file and remains authoritative (the api sees only
+the stream head). `uploads._ALLOWED_UPLOAD_MIMES` is a MIRROR of
+`worker/extractors/extract.py:_MIME_TO_FORMAT` — mirrored, NOT imported
+(the `worker.extractors` import ban below); change both sides in the
+same PR, same rule as the `_sanitize_filename` mirror. Runtime needs
+the `libmagic` system library (`api/Dockerfile` installs `libmagic1`;
+GitHub's ubuntu runners ship it).
 
 ## Open trust gaps
 
-- **No task ownership table.** `GET /tasks/{task_id}` requires auth but
-  doesn't check that the caller enqueued the task — the task_id is the
-  capability (122-bit Celery UUID, computationally unguessable). Fold in
-  an `upload_tasks(task_id, user_id)` row once a later phase needs it;
-  Phase 11's `/search` route doesn't touch upload tasks so this stays
-  open.
-- **Orphan-vector risk from Phase 9.** The Celery pipeline isn't
-  crash-safe between Milvus insert and `global_books` commit
-  (`worker/AGENTS.md` documents the same caveat). The `/upload` route
-  doesn't yet add a task-id-keyed idempotency token.
 - **No library cap on the search filter.** A user with 10K books
   produces a ~360 KB `book_id IN [...]` filter expression on every
   `/search`. Phase 12's BM25 arm doubles the per-query work (Milvus

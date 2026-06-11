@@ -16,6 +16,11 @@ dependencies = [
   "passlib[bcrypt]>=1.7,<2",
   "bcrypt>=4.0,<5.1",
   "python-multipart>=0.0.20,<1",
+  # Phase 20: /upload content-sniffs the first bytes via libmagic and 415s
+  # non-EPUB/PDF before staging to disk. Pin matches worker/pyproject.toml;
+  # needs the libmagic system library (api/Dockerfile installs libmagic1,
+  # GitHub's ubuntu runners ship it with `file`).
+  "python-magic>=0.4.27,<0.5",
   "sqlalchemy[asyncio]>=2.0,<3",
   "asyncpg>=0.30,<0.32",
   "pydantic-settings>=2.6,<3",

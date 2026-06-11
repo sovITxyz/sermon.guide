@@ -12,6 +12,7 @@ from db.models import (
     GlobalBook,
     Highlight,
     Meta,
+    UploadTask,
     User,
     UserLibraryEntry,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "GlobalBook",
     "Highlight",
     "Meta",
+    "UploadTask",
     "User",
     "UserLibraryEntry",
     "get_engine",

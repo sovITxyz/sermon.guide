@@ -204,8 +204,10 @@ services:
       # Phase 19 — api-layer rate limiting (second layer behind Caddy's edge
       # zones; Redis db 2, see api/AGENTS.md). TRUST_PROXY_HEADERS is safe
       # here and ONLY here: the api has no published port, its TCP peers are
-      # compose services, and the web auth proxies forward the Caddy-attested
-      # X-Forwarded-For (Caddy discards client-supplied XFF). Never enable it
+      # compose services, the web auth proxies forward Caddy's X-Forwarded-For
+      # verbatim, and the api keys on the RIGHTMOST entry — proxy-written
+      # whether Caddy replaces inbound XFF (modern default, >=2.5) or appends.
+      # Never enable it
       # where clients can reach :8000 directly. Limits are "<max>/<window s>";
       # ENABLED=false is the operational kill switch (Redis-down already
       # fails open at request time).

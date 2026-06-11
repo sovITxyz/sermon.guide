@@ -156,12 +156,18 @@ tiny module-local dependency on `CurrentUserDep` that calls
 ### Keying — IP vs user (load-bearing)
 
 - **Public routes key on the client IP** via `ratelimit.client_ip`: the
-  TCP peer by default; the first `X-Forwarded-For` entry ONLY when
-  `SERMON_API_TRUST_PROXY_HEADERS=true`. In prod every browser reaches
-  the api through Caddy → web, so the peer is always the web container —
-  the web auth proxies therefore forward the Caddy-attested XFF
-  (`web/lib/http.ts:clientIpHeaders`; Caddy discards client-supplied
-  XFF, Caddyfile), and the prod compose enables trust. NEVER enable
+  TCP peer by default; the **rightmost** `X-Forwarded-For` entry ONLY
+  when `SERMON_API_TRUST_PROXY_HEADERS=true`. Rightmost, never leftmost:
+  the rightmost hop is written by our own proxy and is the only part of
+  the list a client cannot forge — correct whether Caddy REPLACES a
+  client-supplied XFF (modern ≥2.5 default, no trusted_proxies) or some
+  hop ever APPENDS to it; leftmost parsing would let an attacker rotate
+  the bucket per request (tenant-audit finding, fixed in-phase). In prod
+  every browser reaches the api through Caddy → web, so the peer is
+  always the web container — the web auth proxies forward Caddy's XFF
+  verbatim and add no hop (`web/lib/http.ts:clientIpHeaders`), and the
+  prod compose enables trust. Revisit the hop choice only if a
+  CDN/multi-hop chain lands in front of Caddy. NEVER enable
   trust where clients can reach :8000 directly (dev default is off —
   fail closed; a spoofed XFF is then ignored entirely). uvicorn runs
   with `--no-proxy-headers` everywhere (`Makefile` dev target +

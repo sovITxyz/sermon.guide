@@ -211,6 +211,54 @@ Phase 9 (below) puts the same pipeline behind a Celery task, but
 `ingest.py` itself stays the synchronous source of truth — the task
 calls it directly.
 
+## Originals storage (Phase 31)
+
+`worker/storage.py` persists every raw upload to the compose MinIO under
+`originals/{book_id}/{sanitized-filename}` and `ingest.py` records that
+key in `global_books.text_pointer` (plumbed since Phase 7, never filled
+before this). New books upload *before* the `global_books` transaction
+(a stored pointer never dangles); dup-hits backfill the existing row
+only when its pointer is NULL — `UPDATE … WHERE text_pointer IS NULL`,
+race-safe, never overwrites, never writes a second object. That backfill
+is the **only recovery path** books ingested before Phase 31 will ever
+get; do not weaken it.
+
+**Client choice: minio-py (`minio>=7.2,<8`), not boto3.** Decided in
+Phase 31: minio ships `py.typed` so pyright strict needs zero stub
+packages or relaxation headers (boto3 is untyped and would force
+`boto3-stubs` or another header); its footprint is ~5 small deps vs
+botocore's ~80MB in a worker image Phase 16b fought to shrink; and it
+speaks plain S3, so the future R2/B2 swap is endpoint + credentials in
+`StorageSettings` (`SERMON_MINIO_*`, defaults match `infra/.env.example`
+— host-side `localhost:9000`, never the compose-internal `minio:9000`).
+Revisit only if a future phase genuinely needs AWS-ecosystem features
+(transfer manager, presigned POST policies).
+
+**Write-failure posture: fail the ingest loudly — both paths.** Storage
+failures raise `OriginalsStorageError` and nothing catches it; the
+Celery task fails and the operator sees it. Durability is the point of
+the phase — log-and-continue would silently reintroduce the exact data
+loss it exists to stop. On the new-book path the upload runs before
+chunk/embed, so a failure aborts with nothing written anywhere. On the
+dup-hit path the idempotent `user_library` upsert lands *first*, so a
+loud backfill failure still leaves the user's library converged and the
+NULL pointer retryable on the next dup-hit. Crash between upload and
+Postgres commit leaves an orphan object — accepted, same posture as the
+Milvus orphan-vector window above.
+
+**Scope fence (B1): write-only.** NO read endpoint, NO presigned URLs,
+zero new tenant read surface until the full-fidelity reader tier ships.
+Anything that starts *reading* originals must re-run the tenant gates
+(`/check-tenant-leak`, tenant-auditor, `make test-isolation`).
+
+**Key hygiene.** The filename segment is client-supplied; it is
+sanitized by `storage.sanitize_filename` — an exact mirror of
+`api/uploads.py:_sanitize_filename` (mirrored, **not** imported:
+worker/ must never import api/) plus a 255-char cap for object-key
+safety. If one side's rules change, change the other in the same PR.
+The bucket (`SERMON_MINIO_ORIGINALS_BUCKET`, default `sermon-originals`)
+is created idempotently on first write.
+
 ## Celery (Phase 9)
 
 `worker/celery_app.py` is the Celery app; `worker/tasks/ingest.py`

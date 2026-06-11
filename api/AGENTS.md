@@ -51,12 +51,65 @@ rules are here so the audit isn't your first line of defense.
 
 1. New file at `api/<name>.py` exposing `router = APIRouter(prefix=...)`.
 2. Protect it with `current_user: CurrentUserDep` unless the route is
-   genuinely public (only `/auth/signup`, `/auth/login`, `/healthz`
-   today).
+   genuinely public (only `/auth/signup`, `/auth/login`, `/healthz`,
+   `/readyz` today).
 3. Import the session via `session: SessionDep` and `await` everything
    — no sync DB calls inside async handlers.
 4. Mount in `main.py`: `app.include_router(name.router)`.
 5. Add the route's path to `tests/test_smoke.py::test_healthz_route_is_registered`.
+6. If the route takes a JSON body, the request model MUST set
+   `model_config = ConfigDict(extra="forbid")` — see the request-model
+   posture below.
+
+## Boot guards (`main.py` lifespan, Phase 18)
+
+`main.py` registers a FastAPI `lifespan` hook that runs before the
+first request. uvicorn (`make dev`, Docker) and `with TestClient(app):`
+execute it; a bare `import main` does NOT — that is what keeps test
+collection guard-free, and it is why every boot-time invariant belongs
+INSIDE the hook, never at module scope. Phase 19 adds the CORS
+prod-origin guard to the same hook.
+
+- **JWT-secret guard.** The process refuses to boot when
+  `SERMON_API_JWT_SECRET` is unset/empty or still equals
+  `settings.DEV_JWT_SECRET` — the placeholder is public (it lives in
+  this repo), so signing with it lets anyone mint a valid token for any
+  `user_id`: a total tenant-isolation defeat. The refusal message names
+  both env vars so a failed deploy is self-diagnosing.
+- **Dev opt-out: `SERMON_API_ENV=dev`.** `ApiSettings.env` is
+  `Literal["dev", "prod"]` and **defaults to `"prod"`** — fail closed:
+  any environment that does not explicitly declare itself dev gets the
+  full guards, and an empty string (compose's `${VAR:-}`) also resolves
+  to prod. `make dev` keeps working because `infra/.env` sets
+  `SERMON_API_ENV=dev`. Never set `dev` on a deployment that faces real
+  users. Defense-in-depth: `infra/docker-compose.prod.yml` additionally
+  hard-fails at compose-up when `SERMON_API_JWT_SECRET` is unset.
+
+## Request models: `extra="forbid"` (Phase 18)
+
+Every inbound body model — `SignupRequest`, `LoginRequest`,
+`SearchRequest`, `SummaryRequest` — sets
+`model_config = ConfigDict(extra="forbid")`: an unknown field (e.g. a
+smuggled `user_id` or `book_ids`) is a hard 422 naming the field, never
+a silently-dropped key. This makes the tenant rule above mechanical
+instead of reviewer-enforced (closes Phase 12 deviation d). New request
+models MUST set it; response models don't need it. The `web/` proxies
+are unaffected — they rebuild bodies with exact field whitelists. In
+tests, exercise it with `Model.model_validate({...})`, not kwargs —
+pyright strict already rejects unknown kwargs at type-check time.
+
+## Probes: `/healthz` vs `/readyz`
+
+- `GET /healthz` — liveness only: "is the process alive". Cheap and
+  dependency-free; keep it that way.
+- `GET /readyz` (`readyz.py`, Phase 18) — readiness: "can it serve real
+  traffic". Probes Postgres, Milvus, and Redis concurrently with a ~2 s
+  per-dep budget; 200 `{"status": "ready", "deps": {...}}` only when
+  all three answer, 503 with per-dep `"down"` otherwise. Failure detail
+  goes to the server log, never the body (connection errors can embed
+  DSNs and the Redis password). Phase 29 points the container
+  HEALTHCHECK here; Phase 30 wires the k8s readinessProbe. Both probe
+  routes are genuinely public — no auth, no tenant surface.
 
 ## Auth helpers (`auth.py`)
 

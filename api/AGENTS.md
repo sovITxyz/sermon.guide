@@ -60,22 +60,35 @@ rules are here so the audit isn't your first line of defense.
 6. If the route takes a JSON body, the request model MUST set
    `model_config = ConfigDict(extra="forbid")` — see the request-model
    posture below.
+7. If the route is public or expensive (provider tokens, long-held
+   connections, heavy CPU), give it a rate-limit bucket — see "Rate
+   limiting" below for the three-line recipe.
 
-## Boot guards (`main.py` lifespan, Phase 18)
+## Boot guards (`main.py` lifespan, Phases 18–19)
 
 `main.py` registers a FastAPI `lifespan` hook that runs before the
 first request. uvicorn (`make dev`, Docker) and `with TestClient(app):`
 execute it; a bare `import main` does NOT — that is what keeps test
 collection guard-free, and it is why every boot-time invariant belongs
-INSIDE the hook, never at module scope. Phase 19 adds the CORS
-prod-origin guard to the same hook.
+INSIDE the hook, never at module scope.
 
-- **JWT-secret guard.** The process refuses to boot when
+- **JWT-secret guard (Phase 18).** The process refuses to boot when
   `SERMON_API_JWT_SECRET` is unset/empty or still equals
   `settings.DEV_JWT_SECRET` — the placeholder is public (it lives in
   this repo), so signing with it lets anyone mint a valid token for any
   `user_id`: a total tenant-isolation defeat. The refusal message names
   both env vars so a failed deploy is self-diagnosing.
+- **CORS prod-origin guard (Phase 19).** `main.py` pairs
+  `allow_origins=settings.cors_origins` with `allow_credentials=True`;
+  Starlette mirrors the request Origin back for a `"*"` entry, which is
+  credentials-for-any-site. Outside dev the process refuses to boot when
+  the list is empty/unset or contains a wildcard, an empty string, or a
+  loopback origin (`localhost`/`127.0.0.1`/`0.0.0.0`/`::1` — a leftover
+  dev default means the operator never set the real origin). Prod must
+  set `SERMON_API_CORS_ORIGINS` to the exact browser origin(s) as a JSON
+  list; the prod compose hard-fails without it. The middleware is
+  constructed at import time, so the guard validates `settings` at
+  lifespan time — tests monkeypatch settings attributes, never env vars.
 - **Dev opt-out: `SERMON_API_ENV=dev`.** `ApiSettings.env` is
   `Literal["dev", "prod"]` and **defaults to `"prod"`** — fail closed:
   any environment that does not explicitly declare itself dev gets the
@@ -97,6 +110,93 @@ models MUST set it; response models don't need it. The `web/` proxies
 are unaffected — they rebuild bodies with exact field whitelists. In
 tests, exercise it with `Model.model_validate({...})`, not kwargs —
 pyright strict already rejects unknown kwargs at type-check time.
+
+## Rate limiting (`ratelimit.py`, Phase 19)
+
+**Choice: a small hand-rolled FastAPI dependency over the already-locked
+`redis.asyncio` client — NOT slowapi/fastapi-limiter.** Rationale: (1)
+zero new dependencies (`redis` 6.x is already a direct dep; slowapi and
+friends would change `uv.lock`); (2) slowapi's incomplete typing and
+decorator/`Request` coupling fight pyright strict, while the primitive we
+need is one atomic pipeline (`INCR` + first-hit `EXPIRE NX` + `TTL`);
+(3) dependencies compose with `CurrentUserDep` for per-user keying,
+which a pure middleware can't do without re-decoding the JWT.
+
+This is the SECOND layer. Caddy already rate-limits per-IP at the edge
+(`infra/caddy/Caddyfile`: zone `auth` 10/min, zone `heavy` 6/min, zone
+`general` 600/min, all keyed on the TCP peer). The api layer adds what
+Caddy cannot: enforcement shared across api replicas (one Redis),
+per-USER granularity (Caddy has no JWT), and coverage for traffic that
+never crosses Caddy (compose-network peers; the dev box's :8000).
+
+### Buckets
+
+| Bucket | Route(s) | Key | Default | Env var |
+|--------|----------|-----|---------|---------|
+| `signup_ip` | `POST /auth/signup` | client IP | `5/60` | `SERMON_API_RATELIMIT_SIGNUP_IP` |
+| `login_ip` | `POST /auth/login` | client IP | `10/60` | `SERMON_API_RATELIMIT_LOGIN_IP` |
+| `summary_user` | `POST /search-summary` | JWT `user_id` | `5/60` | `SERMON_API_RATELIMIT_SUMMARY_USER` |
+
+Format is `"<max requests>/<window seconds>"` (fixed window); malformed
+values fail at boot (`settings.parse_rate` validator), and limits are
+read at request time so env/monkeypatch changes take effect live.
+
+**Adding or widening a bucket** (e.g. Phase 36's generous
+documents-autosave bucket, ~1 PATCH/2 s sustained → something like
+`60/60`) is three one-liners: a `ratelimit_<name>` field on
+`ApiSettings` (+ the field name in its validator list), a
+`"<name>": lambda: settings.ratelimit_<name>` entry in
+`ratelimit._BUCKETS`, and a route dependency —
+`dependencies=[Depends(ratelimit.ip_limit("<name>"))]` for per-IP, or a
+tiny module-local dependency on `CurrentUserDep` that calls
+`ratelimit.enforce("<name>", str(current_user.user_id))` for per-user
+(see `summary.py:_summary_rate_limit`; defined route-side so
+`ratelimit.py` never imports `auth`). Record the new row in this table.
+
+### Keying — IP vs user (load-bearing)
+
+- **Public routes key on the client IP** via `ratelimit.client_ip`: the
+  TCP peer by default; the first `X-Forwarded-For` entry ONLY when
+  `SERMON_API_TRUST_PROXY_HEADERS=true`. In prod every browser reaches
+  the api through Caddy → web, so the peer is always the web container —
+  the web auth proxies therefore forward the Caddy-attested XFF
+  (`web/lib/http.ts:clientIpHeaders`; Caddy discards client-supplied
+  XFF, Caddyfile), and the prod compose enables trust. NEVER enable
+  trust where clients can reach :8000 directly (dev default is off —
+  fail closed; a spoofed XFF is then ignored entirely). uvicorn runs
+  with `--no-proxy-headers` everywhere (`Makefile` dev target +
+  `Dockerfile` CMD, keep in lockstep): its default `proxy_headers=on`
+  rewrites `request.client` from XFF for loopback peers — a hidden
+  second trust knob that live-verify caught spoofing the dev buckets.
+  `SERMON_API_TRUST_PROXY_HEADERS` is the ONLY XFF trust decision.
+- **Authed expensive routes key on `current_user.user_id`, never IP** —
+  behind the web proxy all users share one source IP, so per-IP would
+  let one user exhaust everyone. The per-user dependency sits in the
+  route decorator so the 429 fires BEFORE retrieval and the paid LLM
+  call (FastAPI solves decorator dependencies first).
+
+### Mechanics & posture
+
+- Counters live in the broker Redis, **logical db 2** (`LIMITER_DB`).
+  db 0 = Celery broker, db 1 = result backend. Deliberate decision:
+  `tasks_client.RedisSettings` (the lockstep mirror of
+  `worker/celery_app.py`) is NOT extended with a limiter field — db 2 is
+  an api-only concern, so `ratelimit.py` calls `RedisSettings().url(2)`
+  and the mirror stays byte-identical to the worker's.
+- **429 contract**: FastAPI-shaped `{"detail": ...}` + `Retry-After`
+  header (seconds left in the window), matching Caddy's edge 429s — the
+  web proxies pass status + detail to the browser verbatim, so the body
+  must never name Redis, the bucket, or the key (the Redis URL embeds a
+  password; same no-leak pinning as `/readyz`).
+- **Fail OPEN on Redis outage**, with a loud `WARNING` log. This edge is
+  abuse mitigation, not authorization: Redis-down already breaks /upload
+  and flips /readyz, and failing closed would turn a store blip into a
+  sitewide login lockout. `SERMON_API_RATELIMIT_ENABLED=false` is the
+  operational kill switch (e.g. false-positive lockouts mid-incident).
+- `/healthz` and `/readyz` are deliberately unlimited — compose
+  HEALTHCHECK (every 15 s) and the future k8s probes poll them.
+- Tests: monkeypatch the `ratelimit._hit` seam (the `readyz._probe_*`
+  convention) — never require a live Redis.
 
 ## Probes: `/healthz` vs `/readyz`
 
@@ -203,7 +303,11 @@ against the same Redis broker / backend — `send_task(
 "tasks.ingest.ingest_book", args=[…])`. Drift between this module's
 `RedisSettings` and `worker/celery_app.py:RedisSettings` is a silent
 failure — the api enqueues into a queue the worker isn't reading. If
-you change one, change both.
+you change one, change both. The Phase 19 rate limiter reuses this
+module's `RedisSettings().url(2)` for its counters (logical db 2) but
+deliberately does NOT add a field to the mirrored class — db 2 is an
+api-only concern and the mirror must stay byte-identical to the
+worker's (see "Rate limiting" above).
 
 ## Open trust gaps
 

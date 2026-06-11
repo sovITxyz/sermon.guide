@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +55,48 @@ def _guard_jwt_secret() -> None:
     raise RuntimeError(msg)
 
 
+# Hosts that mark a CORS origin as a leftover dev default — meaningless
+# (or worse, attacker-registrable on a shared host) for a real deployment.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}  # noqa: S104 — denylist entry, not a bind
+
+
+def _guard_cors_origins() -> None:
+    """Refuse credentialed CORS with a promiscuous origin list (Phase 19).
+
+    ``main.py`` pairs ``allow_origins`` with ``allow_credentials=True``;
+    Starlette then mirrors the request Origin back for a ``"*"`` entry —
+    effectively handing ANY website credentialed API access. An unset/empty
+    list or a leftover loopback default outside dev is the same misconfig
+    in a quieter coat (the operator never set the real origin), so all of
+    them refuse boot. Reads settings at lifespan time, not import time —
+    same testability contract as the JWT guard.
+    """
+    if settings.env == "dev":
+        return
+    origins = settings.cors_origins
+    offenders = [
+        origin
+        for origin in origins
+        if "*" in origin
+        or not origin.strip()
+        or (urlsplit(origin).hostname or "") in _LOOPBACK_HOSTS
+    ]
+    if origins and not offenders:
+        return
+    problem = (
+        "the origin list is empty/unset" if not origins else f"offending entries: {offenders!r}"
+    )
+    msg = (
+        "Refusing to start: SERMON_API_CORS_ORIGINS must list the exact "
+        "production browser origin(s) — this app sends CORS responses with "
+        "allow_credentials=True, and a wildcard, empty, or localhost origin "
+        f"outside dev grants other sites credentialed access ({problem}). "
+        'Set SERMON_API_CORS_ORIGINS (JSON list, e.g. ["https://app.example.com"]) '
+        "for production, or set SERMON_API_ENV=dev for local development."
+    )
+    raise RuntimeError(msg)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """Boot-time guards — fail loudly at startup, before the first request.
@@ -61,9 +104,11 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     Settings are read here rather than at import time so test collection
     (which merely imports this module under dev defaults) stays guard-free:
     uvicorn and ``with TestClient(app):`` execute the lifespan, a bare
-    import does not. Phase 19 adds the CORS prod-origin guard here.
+    import does not. Phase 18: JWT-secret guard; Phase 19: CORS
+    prod-origin guard.
     """
     _guard_jwt_secret()
+    _guard_cors_origins()
     yield
 
 

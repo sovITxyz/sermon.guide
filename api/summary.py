@@ -97,7 +97,7 @@ from functools import lru_cache
 import openai
 from db import GlobalBook
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -197,7 +197,11 @@ class SummaryRequest(BaseModel):
 
     No ``user_id`` / ``book_ids`` fields — tenant scope is resolved
     server-side by ``run_search`` from the JWT (see ``search.py``).
+    ``extra="forbid"`` (Phase 18) makes a smuggled extra field a hard
+    422 instead of a silently-dropped key.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1, max_length=1024)
     # Feeds ``run_search``'s ``limit`` (the cross-encoder's top-N). The rerank

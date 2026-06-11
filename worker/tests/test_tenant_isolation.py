@@ -146,7 +146,6 @@ class TestTenantIsolation:
         results = milvus_client.search(
             collection_name=COLLECTION_NAME,
             data=[query_vector],
-            filter=expr,
             limit=200,
             output_fields=["book_id"],
         )
@@ -176,7 +175,6 @@ class TestTenantIsolation:
         results = milvus_client.search(
             collection_name=COLLECTION_NAME,
             data=[query_vector],
-            filter=expr,
             limit=200,
             output_fields=["book_id"],
         )

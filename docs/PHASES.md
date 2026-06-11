@@ -43,14 +43,26 @@ v1 (planned 2026-06-05 — see the **v1 Plan — Beyond Phase 16** section below
 - [ ] Phase 29 — App Dockerfiles + image-build CI (models baked, HF offline)
 - [ ] Phase 30 — KEDA + k8s manifests gated on /readyz
 
-v2 product backlog (captured 2026-06-10 — user-requested sermon-workflow direction; designed
-approaches in the **v2 Product Backlog — sermon workflow** section at the end of this file.
-The post-Phase-30 drill assigns phase numbers; B-ids are stable references until then):
+v2 — Sermon Workflow (planned 2026-06-10 from the v2 Product Backlog; see the **v2 Plan —
+Sermon Workflow** section below for the execution model, ordered queue, and per-phase
+prompts. Milestones: M4 Read 31–33 · M5 Write 34–37 · M6 Schedule 38–42 · M7 Round-trip 43–46):
 
-- [ ] B1 — Citation → in-app reader deep-link ("read in context", continue reading) + ⚠ time-sensitive originals-persistence sub-item
-- [ ] B2 — In-app sermon document editor (TipTap, citation nodes inserted from search)
-- [ ] B3 — Sermon calendar (year wall-planner + month + week views)
-- [ ] B4 — External editor round-trip (.docx first; Google Docs / Word OAuth sync later)
+- [ ] Phase 31 — Originals persistence: stop losing uploads (⚠ time-sensitive — first in queue)
+- [ ] Phase 32 — Reader API: windowed chunks + reading positions
+- [ ] Phase 33 — Reader UI: /read/[bookId] windowed scroll + entry points
+- [ ] Phase 34 — Documents schema + API CRUD
+- [ ] Phase 35 — Editor shell: /sermons + TipTap
+- [ ] Phase 36 — Editor autosave + conflict + soft-delete UX
+- [ ] Phase 37 — Citation node + insert-from-search
+- [ ] Phase 38 — Calendar schema + API (events, weekly materializer, doc-ownership check)
+- [ ] Phase 39 — Calendar year + month views (read-only)
+- [ ] Phase 40 — Calendar week view + event CRUD UX
+- [ ] Phase 41 — Calendar↔editor linking flows
+- [ ] Phase 42 — Drag-to-reschedule + calendar E2E
+- [ ] Phase 43 — .docx round-trip core (export/import + revision snapshots)
+- [ ] Phase 44 — OAuth connection vault (⛔ operator: GCP creds first)
+- [ ] Phase 45 — Google Docs link/pull/unlink (spike-first)
+- [ ] Phase 46 — Microsoft Graph provider (⛔ operator: Azure creds first)
 
 ---
 
@@ -1370,6 +1382,716 @@ recommended before real traffic).
 
 ---
 
+## v2 Plan — Sermon Workflow (Phases 31–46)
+
+Planned 2026-06-10 directly from the **v2 Product Backlog** section below, which stays
+the canonical design — the prompts cite its anchors instead of restating it. Numbering
+was assigned ahead of the post-Phase-30 drill by operator decision; that re-audit still
+happens, scoped to hardening gaps rather than these features.
+
+Milestones: **M4 Read** (31–33) · **M5 Write** (34–37) · **M6 Schedule** (38–42) ·
+**M7 Round-trip** (43–46).
+
+Rules — v2 execution model (extends the v0/v1 rules; written for autonomous runs):
+
+- One phase = one `phase-N/short-slug` branch off main = **one ultracode Workflow**.
+  The main loop stays thin — scout, build, gate, verify, ship — holding conclusions
+  only; subagents absorb all file reading and return summaries, never file dumps.
+- Scout reads ONLY the files the phase prompt names + the backlog anchor it cites.
+  The backlog is the design; do not re-derive or re-litigate it.
+- Build: fan out builder subagents on disjoint file sets (worker/ vs api/ vs web/).
+  A builder is done only when its PostToolUse hooks (ruff+pyright / tsc+biome) pass
+  clean.
+- Gates: audit gates run in parallel (tenant-auditor, /check-tenant-leak,
+  /security-review, schema-reviewer — as the diff demands); live suites run SERIALLY
+  (one shared Milvus/Postgres on this box). Tenant gates are never waived,
+  downgraded, or retried-until-green.
+- Gate failure: fix-forward only when the fix stays inside the phase's stated scope;
+  otherwise STOP — push the branch, open the PR marked blocked, notify the operator.
+  Two consecutive failed gate rounds = hard stop.
+- Migration race rule: take number = (highest merged in worker/db/alembic/versions)
+  + 1 at branch time; renumber + re-point down_revision if scooped; never two
+  migration-bearing phases in flight at once. Migration-bearing here: 32, 34, 38,
+  43, 44, 45.
+- Ship: flip this file's `- [x] Phase N` row IN THE SAME BRANCH before opening the
+  PR — the phases-row-flipped job fails any phase-N/* PR otherwise, and merges happen
+  only via `gh pr merge` (direct push to main is denied), so an unflipped row
+  deadlocks an autonomous session. Conventional commits, atomic; the PR body lists
+  every gate run and its result.
+
+Ordered queue (v1 ∥ v2 interleave — the Progress checkboxes at the top of this file
+are the durable cursor; any session resumes at the first unchecked row in this order):
+
+```
+31 → 17 18 19 20 21 → 32 33 → 22 23* 24 25 → 34 35 36 37 → 28† → 38 39 40 41 42
+   → 43 44* 45* 46* → 26 27 29 30
+```
+
+`*` = operator-gated stop-at-PR (17 changes CI semantics + needs the branch-protection
+flip, 23 corpus rights, 44–46 OAuth credentials). `†` = Phase 28 pulled forward from
+M3: backups must precede irreplaceable sermon manuscripts (B2 flags this upgrade), and
+26/27 deferred so the doc sweep covers everything and Phase 27 log-redaction covers
+the full OAuth token surface — this amends v1's "milestones are sequential" rule.
+
+Merge policy: auto-merge (`gh pr merge --rebase`) when local gates + CI are green and
+no fix-forward touched a cross-item contract. Until Phase 17 lands, local gates are
+the merge authority (CI's load-bearing suites skip-pass there); after 17, both must be
+green. Stop-at-PR for the `*` phases and any blocked gate.
+
+Operator-only checkpoints (autonomy stops + notifies): GCP project + OAuth consent +
+client creds in `.env` before 44 (Testing mode is fine for dev; production publishing
+has multi-week lead — start console work around M5); Azure app registration before 46;
+real keys land in `.env` by operator hand only (agent reads are denied), and
+`SERMON_API_TOKEN_ENC_KEY` must be generated + backed up by the operator (loss bricks
+every stored refresh token); corpus rights at 23; branch-protection flips (17) are
+GitHub admin actions. Product micro-calls pre-answered in the prompts: week start
+Sunday; hard read-only lock while linked; explicit user choice on unlink; block-level
+citation card with cached snippet.
+
+---
+
+## Phase 31 — Originals persistence: stop losing uploads
+
+```
+cd to sermon.guide. Read worker/ingest.py, worker/db/settings.py, infra/docker-compose.yml
++ the "### B1 — Citation → reader deep-link" section (esp. its time-sensitive
+originals sub-item) of the v2 Product Backlog in this file.
+
+Goal: stop losing originals — time-sensitive. Uploads live only in volatile
+/tmp/sermon-uploads and MinHash dedup short-circuits second owners before any
+write: every book ingested to date has a permanently unrecoverable original,
+and each ingest before this lands adds another. Fix per B1 is write-only.
+
+## Build
+- Branch: phase-31/originals-persistence off main.
+- Originals bucket on the compose MinIO (already running): idempotent
+  create-if-missing; creds/endpoint via a new BaseSettings class following the
+  worker/db/settings.py pattern; new env vars append-only in infra/.env.example.
+- New-book path in worker/ingest.py: upload the original bytes under
+  originals/{book_id}/{sanitized-filename}; set the plumbed-but-never-filled
+  global_books.text_pointer to that key. Sanitize the user-supplied filename —
+  strip path separators/dotdot/control chars; never use it raw in the key.
+- Dup-hit path: when the existing book's text_pointer IS NULL, upload the
+  second owner's identical bytes and backfill it; already set → no-op, no
+  duplicate object. This is the only recovery path pre-phase books will ever get.
+- Scope fence per B1: NO read endpoint (zero new tenant read surface) and NO
+  migration (text_pointer column exists since Phase 7).
+- Pick boto3 vs minio-py (same S3 API as the future R2/B2 swap); record the
+  choice + the write-failure posture (fail the ingest vs log-and-continue) in
+  worker/AGENTS.md.
+
+## Verify
+- Fresh ingest of a new book → object lands at originals/{book_id}/... in the
+  bucket AND global_books.text_pointer holds that key.
+- Re-upload the same content as a second user: NULL pointer → backfilled;
+  already-set pointer → unchanged, still one object.
+- Hostile filename (../, slashes) → key stays under originals/{book_id}/.
+- Gates: make test-isolation (ingestion touched; stays green) + /check-tenant-leak
+  + tenant-auditor + /security-review (user filename becomes an object key).
+```
+
+---
+
+## Phase 32 — Reader API: windowed chunks + reading positions
+
+```
+cd to sermon.guide. Read api/library.py, api/main.py, worker/db/models.py + the
+"### B1 — Citation → reader deep-link" section of the v2 Product Backlog in this file.
+
+Goal: the reader's data layer per B1 Data/API — tenant-gated windowed chunk
+reads plus persisted reading positions. chunks already holds every book's full
+text in dense chunk_index order: one migration + three endpoints, no new storage.
+
+## Build
+- Branch: phase-32/reader-api off main.
+- reading_positions + migration at the next free migration number (0004 at
+  authoring time = highest merged + 1; renumber + re-point down_revision if
+  scooped); doubly-scoped like highlights, UNIQUE(user_id, book_id) — shape per B1.
+- GET /books/{book_id}/chunks?start&limit — default 40, cap 100, chunk_index
+  order; 404 unless the book is in the JWT user's user_library (no existence
+  oracle). chunks has no user_id by design — membership IS the tenant gate;
+  build it as a testable statement builder per api/library.py _library_stmt.
+- GET/PUT /books/{book_id}/position — upsert on the UNIQUE constraint, same
+  404 gate; PUT model extra="forbid"; user_id from the JWT, never the body.
+- GET /library gains per-book progress. Trap, verbatim from B1: the /library
+  join to reading_positions MUST be ON (user_id AND book_id) — joining on
+  book_id alone leaks another tenant's reading position for a shared deduped book.
+- Decide in-phase (B1 open questions): offset_ratio in or out of the first
+  cut; chunk_count denormalized onto global_books or computed per request.
+
+## Verify
+- Owned book: default 40; ?limit=500 capped at 100; start past end → empty list.
+- Non-owned and nonexistent book_id → identical 404s on /chunks and /position.
+- PUT /position twice → one upserted row; smuggled extra body field → 422.
+- Two users sharing one deduped book each see only their own position and
+  progress on GET /library — the join trap, checked live.
+- Gates: make test-isolation + /check-tenant-leak + tenant-auditor +
+  /security-review + schema-reviewer on the migration.
+
+## Close out
+- Row records the migration number taken + offset_ratio/chunk_count decisions.
+```
+
+---
+
+## Phase 33 — Reader UI: /read/[bookId]?chunk=N
+
+```
+cd to sermon.guide. Read web/components/SearchPanel.tsx, web/components/LibraryTable.tsx,
+web/middleware.ts, web/app/api/tasks/[taskId]/route.ts (the same-origin proxy exemplar)
++ the "### B1 — Citation → reader deep-link" section of the v2 Product Backlog in this file.
+
+Goal: the in-app reader per B1 Web — /read/[bookId]?chunk=N on the Phase 32 API;
+citation cards gain "Read in context", library rows "Continue reading". Deps: Phase 32.
+
+## Build
+- Branch: phase-33/reader-ui off main.
+- Same-origin proxies per the Phase 15/16 pattern — app/api/books/[bookId]/chunks
+  (GET) + .../position (GET/PUT): cookie forwarded, structural whitelist on PUT body.
+- app/read/[bookId]/page.tsx: bidirectional windowed scroll per B1 Web —
+  IntersectionObserver sentinels at both ends; manual scrollTop compensation on
+  prepend (Safari lacks overflow-anchor); ?chunk=N anchor-scroll + tint; plain
+  DOM first, virtualization only on observed jank.
+- Rendering: react-markdown WITHOUT rehype-raw (raw HTML stays inert — keeps the
+  repo's zero-dangerouslySetInnerHTML stance); img stubbed to alt text; links
+  rel=noopener; plain-text fallback acceptable if the dep is vetoed.
+- Position persistence: debounced PUT on scroll-settle + pagehide flush via
+  fetch keepalive.
+- Entry points: "Read in context" on citation cards (SearchPanel already has
+  book_id + chunk_index); "Continue reading" + progress on library rows.
+- middleware.ts matcher gains "/read/:path*" (today only library/search/upload);
+  nav stays card/row-driven — the two entry points above, no top-nav link.
+
+## Verify
+- Citation card → /read/[bookId]?chunk=N lands anchored on the tinted chunk;
+  scroll up prepends with no viewport jump; scroll down reaches the book's end.
+- Close the tab mid-read → /library shows progress and Continue reading resumes
+  at the saved chunk (pagehide keepalive landed).
+- Raw HTML in a chunk renders as inert text, images as alt text; grep web/ for
+  dangerouslySetInnerHTML → still zero.
+- Unauthenticated /read/... → middleware redirect to /login.
+- Gates: pnpm typecheck + lint + test (tsc/biome/vitest) + /security-review
+  (new proxies + user-navigable surface); tenant suites ran in Phase 32.
+```
+
+---
+
+## Phase 34 — Documents schema + API
+
+```
+cd to sermon.guide. Read api/highlight.py (user-owned CRUD precedent),
+worker/db/models.py, worker/db/alembic/versions/ (current numbering + style) + the
+"### B2 — In-app sermon document editor" section and "Cross-item contracts" of the
+v2 Product Backlog in this file.
+
+Goal: the storage + API half of the sermon editor (B2 slice A). Canonical sermon
+storage is TipTap/ProseMirror JSON per the Cross-item contracts; Phases 35–37 build
+the web side on this surface. No web changes in this phase.
+
+## Build
+- Branch: phase-34/documents-api off main.
+- documents table + Alembic migration at the next free migration number (0004 at
+  authoring time — renumber + re-point down_revision if another phase lands first):
+  columns per B2 Data/API, including content JSONB (ProseMirror JSON), server-derived
+  content_text, schema_version, deleted_at soft delete, idx (user_id, updated_at DESC).
+- api/documents.py: POST / GET list (non-deleted, content_text preview) / GET / PATCH /
+  DELETE (soft) / restore (Phase 36's list UX consumes it). PATCH carries
+  base_updated_at → 409 on mismatch (single-author optimistic concurrency per B2).
+- Request models Pydantic extra="forbid" (Phase 18 posture). content_text is NEVER
+  accepted from the client — the server re-derives it from content on every write.
+  Reject content over ~2 MB with 413.
+- Every query filters user_id from the JWT; non-owned document_id → 404 (no existence
+  oracle — the Phase 20 /tasks posture).
+
+## Verify
+- curl round-trip: create → list shows preview → PATCH with stale base_updated_at →
+  409, fresh → 200; smuggled user_id field → 422; >2 MB content → 413; soft-deleted
+  doc vanishes from list, GET → 404, restore returns it intact.
+- Ownership test in api/tests: user B GET/PATCH/DELETE user A's document → 404 each.
+- Gates: make test-isolation + /check-tenant-leak + tenant-auditor + /security-review
+  (new user-input surface) + schema-reviewer on the migration.
+```
+
+---
+
+## Phase 35 — Editor shell: /sermons + TipTap
+
+```
+cd to sermon.guide. Read web/middleware.ts, web/app/library/page.tsx (server-list
+precedent), web/app/api/search-summary/route.ts (proxy pattern), web/AGENTS.md + the
+"### B2 — In-app sermon document editor" section of the v2 Product Backlog in this file.
+
+Goal: pastors get a working manuscript editor (B2 slice B) — a /sermons list plus a
+TipTap editor with explicit save. Autosave (36) and citations (37) stack on this
+shell. Depends on Phase 34's documents API.
+
+## Build
+- Branch: phase-35/editor-shell off main.
+- pnpm add @tiptap/react @tiptap/pm @tiptap/starter-kit @tiptap/extension-placeholder —
+  MIT core only, NEVER a Pro extension (B2 Approach); editor code stays confined to
+  the editor route by App Router code-splitting.
+- /sermons: server-component list per the /library precedent — title, content_text
+  preview, updated_at, "new sermon" create flow.
+- /sermons/[documentId]: server shell → "use client" editor; useEditor with
+  immediatelyRender: false (App Router SSR requirement per B2); StarterKit +
+  Placeholder; fixed toolbar; editable title; explicit Save sending doc JSON +
+  base_updated_at — no autosave yet (Phase 36).
+- Same-origin proxy route handlers for documents CRUD under web/app/api/documents/
+  (structural field whitelists + HttpOnly cookie pass-through — Phase 15/16 pattern);
+  add /sermons to the middleware.ts matcher and the shared nav.
+- TipTap is headless contenteditable — zero dangerouslySetInnerHTML (repo invariant);
+  previews render content_text as plain text.
+
+## Verify
+- Cookie-jar live drive (Phase 15/16 precedent): login → create via proxy → PATCH
+  content JSON → GET round-trips it; unauthenticated /sermons redirects to /login.
+- Browser pass for what cookie jars can't type (B2 cross-phase note): create, type,
+  Save, reload → content persists; a stale-tab Save surfaces the 409 as an error
+  (full conflict UX is Phase 36). Extend the Phase 25 Playwright suite with an editor
+  smoke if it reaches cheaply.
+- Gates: pnpm tsc + biome + vitest + /security-review (new cookie-forwarding proxy
+  surface); no DB/Milvus queries touched — API tenant gates ran in Phase 34.
+```
+
+---
+
+## Phase 36 — Editor autosave + conflict + soft-delete UX
+
+```
+cd to sermon.guide. Read the Phase 35 editor under web/app/sermons/ (+ its client
+component), the web/app/api/documents/ proxies, api/AGENTS.md (Phase 19 limiter
+entry) + the "### B2 — In-app sermon document editor" section of the v2 Product
+Backlog in this file.
+
+Goal: the editor stops losing work (B2 slice C) — autosave with a tab-close flush,
+visible save state, honest conflict handling, delete/restore in the list. Pure web UX
+on the Phase 34/35 surface; the only api/ touch allowed is the Phase 19 limiter config.
+
+## Build
+- Branch: phase-36/editor-autosave off main.
+- Autosave per B2 Web: ~2 s debounce + 15 s max-interval; one in-flight PATCH at a
+  time; after every 200, adopt the response updated_at as the next base_updated_at —
+  reusing a stale base manufactures spurious 409s.
+- pagehide flush via fetch keepalive with the ~64 KB body ceiling guarded: oversize
+  docs skip the flush (they save on next open per B2) instead of throwing.
+- SaveStatus indicator: saved / saving / error / conflict.
+- 409 → conflict banner: stop autosaving, offer reload-latest; never silently clobber
+  either side.
+- Delete (soft) + restore actions on the /sermons list against the Phase 34 endpoints.
+- Phase 19 landed earlier in the queue: confirm its limiter tolerates ~1 PATCH/2 s
+  sustained autosave; widen the bucket in-phase if needed and record it in
+  api/AGENTS.md.
+
+## Verify
+- Continuous typing: PATCHes coalesce to the debounce cadence, the max-interval save
+  fires, SaveStatus cycles, and logs show zero 429s under sustained typing.
+- Two tabs on one doc: the stale tab's save → 409 banner with a working reload.
+- Edit → close tab → reopen: last state persisted via the keepalive flush; a >64 KB
+  doc closes without errors and saves on next open.
+- Delete from list → gone (GET 404); restore returns it with content intact.
+- Gates: pnpm tsc + biome + vitest; if the limiter config changed, api make lint
+  typecheck + /security-review.
+```
+
+---
+
+## Phase 37 — Citation node + insert-from-search
+
+```
+cd to sermon.guide. Read web/components/SearchPanel.tsx, api/search.py (POST /search
+contract), web/app/api/search-summary/route.ts (proxy precedent), the Phase 35 editor
+component + the "### B2 — In-app sermon document editor" section and "Cross-item
+contracts" of the v2 Product Backlog in this file.
+
+Goal: the signature integration (B2 slice D) — cited passages from library search
+become first-class blocks in the manuscript, deep-linking into the reader. Depends on
+Phase 35; the click-through live verify needs Phase 33's /read route.
+
+## Build
+- Branch: phase-37/citation-node off main.
+- Block-level citation atom via ReactNodeViewRenderer, attrs {bookId, chunkIndex,
+  bookTitle, snippet, parentSection?} per the Cross-item contracts; snippet is cached
+  at insert so the doc stays self-contained — the node view NEVER refetches on render.
+  Styled like the /search citation cards, snippet as plain text (zero-
+  dangerouslySetInnerHTML invariant), linking to /read/{bookId}?chunk={chunkIndex}.
+- Degraded state: book no longer in the user's library → render the cached snippet
+  with a "no longer in your library" badge, no refetch, no error.
+- In-editor LibraryDrawer reusing the SearchPanel plumbing against a NEW thin proxy
+  web/app/api/search/route.ts → existing POST /search (raw hybrid hits, no LLM
+  round-trip): structural whitelist forwards {query} only, HttpOnly cookie
+  pass-through (Phase 15/16 pattern).
+- Insert from a drawer hit via editor.chain().insertContent with the citation attrs;
+  the node must survive save → reload → re-render through documents.content JSON.
+
+## Verify
+- Live drive: open a doc → drawer search returns raw hits (no LLM wait) → insert →
+  card shows title + snippet → save + reload intact → click → /read/{bookId}?chunk=N
+  opens at the cited passage (Phase 33 live).
+- Remove the cited book from the library, reopen the doc: cached snippet + degraded
+  badge, zero per-citation network fetches.
+- Proxy: smuggled extra fields dropped by the whitelist; unauthenticated call → 401.
+- Gates — the new /api/search proxy is a new tenant-facing surface, re-run ALL of:
+  make test-isolation + /check-tenant-leak + tenant-auditor + /security-review +
+  pnpm tsc + biome + vitest.
+```
+
+---
+
+## Phase 38 — Calendar schema + API
+
+```
+cd to sermon.guide. Read api/highlight.py (double-scoped CRUD precedent),
+api/documents.py (Phase 34 FK target), worker/db/models.py + the
+"### B3 — Sermon calendar" section of the v2 Product Backlog in this file.
+
+Goal: the calendar's whole server side in one slice — sermon_events + api/calendar.py
+CRUD with the weekly materializer. Phases 39–42 are pure web on top of this API.
+
+## Build
+- Branch: phase-38/calendar-api off main.
+- Migration at the next free number (0004 at authoring time; renumber + re-point
+  down_revision if scooped): sermon_events per B3 Data/API. Exact traps: event_date
+  is DATE, not timestamptz (day-anchored; UTC-midnight shifts a day for UTC-minus
+  users); document_id NULL FK→documents ON DELETE SET NULL; idx (user_id,
+  event_date); deliberately NO unique on (user_id, event_date) — two services one
+  Sunday is normal.
+- api/calendar.py (router in main.py): GET half-open [start, end), validated +
+  capped ≤ ~400 days; POST with optional repeat_weekly_until materializing discrete
+  rows, cap ~53 (B3 Recurrence — no RRULE); PATCH partial; DELETE. All double-scoped
+  (event_id AND user_id), non-owned → 404; builders testable per api/library.py
+  _library_stmt; request models extra='forbid' (cross-item contract).
+- TRAP — document_id is attacker-controlled body input: ownership-check on
+  POST/PATCH against documents WHERE user_id = JWT user (422/404 on miss), or user B
+  links user A's doc and the calendar leaks its existence/title. The FK + this check
+  ship IN THIS PHASE (documents landed in 34).
+
+## Verify
+- Range GET: own events only; event dated `end` excluded (half-open); span > cap →
+  422. repeat_weekly_until → capped row count, each row independently PATCH/DELETE.
+- Another user's document_id on POST/PATCH → 422/404; another user's event_id →
+  404. Deleting a linked document leaves the event, document_id NULL.
+- Gates: make test-isolation + /check-tenant-leak + tenant-auditor +
+  /security-review + schema-reviewer on the migration.
+
+## Close out
+- Record the chosen range cap + materializer cap in the row (B3 open question).
+```
+
+---
+
+## Phase 39 — Calendar year + month views, read-only
+
+```
+cd to sermon.guide. Read web/middleware.ts, web/app/layout.tsx,
+web/app/api/search-summary/route.ts (the proxy exemplar), api/calendar.py (Phase 38)
++ the "### B3 — Sermon calendar" section of the v2 Product Backlog in this file.
+
+Goal: the headline year wall-planner plus the month view, read-only — all 12 months
+on one screen before any CRUD UX exists. Custom Tailwind CSS-grid, ZERO new runtime
+deps (B3 Approach; FullCalendar is the documented fallback, don't reach for it).
+
+## Build
+- Branch: phase-39/calendar-year-month off main.
+- web/lib/dates.ts: pure YYYY-MM-DD string helpers (month grids, ranges; week starts
+  Sunday — settled, keep it a named constant), vitest-pinned. NEVER
+  new Date("YYYY-MM-DD") anywhere — UTC parse shifts the day (B3 Dates).
+- Same-origin proxy web/app/api/sermon-events/route.ts (Phase 15/16 pattern:
+  cookie→Bearer, structural whitelist of start/end). ONE range fetch drives both
+  views.
+- /calendar page, URL state ?view=year|month&date=YYYY-MM-DD (linkable): CalendarYear
+  = grid-cols-3/4 of 12 MiniMonth (grid-cols-7 DayCells; ≤2 series-colored dots +
+  popover at small sizes, truncated title at ≥~36px cells); month = larger DayCell,
+  ≤3 chips + "+N more" — per B3 Web.
+- middleware.ts matcher gains "/calendar/:path*"; nav link added in app/layout.tsx.
+- Event titles render as text nodes only — the repo's zero-dangerouslySetInnerHTML
+  stance holds.
+
+## Verify
+- /calendar?view=year: 12 aligned months (spot-check a leap-year February and a
+  month starting on Sunday); event days show dots; ?view=month&date=… deep-links;
+  unauthenticated /calendar redirects to /login.
+- vitest pins dates.ts over month/year boundaries + leap years; grep shows no
+  new Date( on date strings under web/app/calendar or web/lib/dates.ts.
+- Gates: /security-review (new proxy = new input surface) + pnpm
+  typecheck/lint/test.
+```
+
+---
+
+## Phase 40 — Calendar week view + event CRUD UX
+
+```
+cd to sermon.guide. Read web/app/calendar/ (Phase 39 components), web/lib/dates.ts,
+web/app/api/sermon-events/route.ts + the "### B3 — Sermon calendar" section of the
+v2 Product Backlog in this file.
+
+Goal: the calendar goes read-write — week view, quick create with weekly repeat,
+edit/delete from chips, deterministic series colors. Still zero new runtime deps.
+
+## Build
+- Branch: phase-40/calendar-week-crud off main.
+- Week view: 7 day columns of full event cards; ?view=week joins the URL state;
+  same single range fetch; dates.ts gains week helpers (vitest-pinned, Sunday
+  start).
+- QuickCreatePopover on empty-day click: title, series, optional weekly-repeat-until
+  → POST (the Phase 38 materializer caps rows server-side). Edit/delete popover on
+  chips/cards → PATCH/DELETE.
+- Proxy mutations: POST on web/app/api/sermon-events/route.ts, PATCH/DELETE on
+  …/sermon-events/[eventId]/route.ts — structural whitelists (title, series,
+  event_date, repeat_weekly_until; document_id waits for Phase 41), Phase 15/16
+  pattern.
+- Series→color: hash the series string into a fixed map of literal Tailwind classes
+  (runtime-built class strings won't compile — Tailwind only sees literals); same
+  color across year/month/week (B3 Web).
+- Density polish per B3: dot/chip caps and "+N more" thresholds across views.
+
+## Verify
+- Create on an empty day → appears in year, month, and week; weekly repeat shows
+  the capped run; edit title and delete round-trip across all views.
+- Same series string = same color everywhere, stable across reloads; vitest pins
+  the hash. User text renders as text nodes (no dangerouslySetInnerHTML).
+- Gates: /security-review (new mutation proxies + form input) + pnpm
+  typecheck/lint/test.
+```
+
+---
+
+## Phase 41 — Calendar-editor linking
+
+```
+cd to sermon.guide. Read web/app/calendar/ (Phase 39/40), web/app/sermons/ (Phase 35
+editor entry), api/documents.py + the "### B3 — Sermon calendar" section of the v2
+Product Backlog in this file.
+
+Goal: calendar ↔ manuscript linking. Pure UX — the document_id FK and its ownership
+check landed in Phase 38; this phase wires flows over existing endpoints. No schema
+or API changes expected.
+
+## Build
+- Branch: phase-41/calendar-editor-link off main.
+- Linked event chip/card click → /sermons/{document_id}; unlinked click keeps the
+  Phase 40 edit popover.
+- Create-doc-from-empty-date: POST /documents (title prefilled from the event),
+  then PATCH the event's document_id, then navigate into the editor — two existing
+  calls, no new endpoint.
+- Link/unlink in the edit popover: picker fed by the Phase 35 documents list proxy
+  (own docs only by construction); unlink = PATCH document_id: null. The event
+  PATCH proxy whitelist gains document_id — explicit null must pass it.
+- Surface the Phase 38 ownership 422/404 as a visible error state; never swallow it.
+
+## Verify
+- Click linked event → editor opens the right doc; create-from-date → doc exists
+  and the event shows its linked state; unlink clears it.
+- Delete the doc in /sermons → the event survives with document_id NULL
+  (ON DELETE SET NULL, cross-item contract).
+- curl PATCH with another user's document_id still → 422/404 (Phase 38 regression).
+- Gates: /security-review (proxy whitelist gains document_id) + pnpm
+  typecheck/lint/test.
+```
+
+---
+
+## Phase 42 — Drag-to-reschedule + calendar E2E
+
+```
+cd to sermon.guide. Read web/app/calendar/ (chips + DayCells), the Phase 25
+Playwright harness under web/ (config + one existing spec), web/AGENTS.md + the
+"### B3 — Sermon calendar" section of the v2 Product Backlog in this file.
+
+Goal: reschedule by dragging — the last B3 slice — plus the calendar's regression
+suite riding the Phase 25 harness.
+
+## Build
+- Branch: phase-42/calendar-drag off main.
+- Native HTML5 DnD, zero new runtime deps: EventChip draggable (payload =
+  event_id), DayCell a drop target, working in year, month, and week views.
+- Optimistic PATCH event_date on drop: move the chip immediately; on failure roll
+  back and show a visible error.
+- Keyboard-accessible fallback per B3 Web: a move-to-date control in the Phase 40
+  edit popover — HTML5 DnD is mouse-only, this is the only accessible path.
+- Playwright specs on the Phase 25 harness, wired into its CI job: login → create
+  event → visible in all three views; drag to another day → persists after reload.
+
+## Verify
+- Drag a chip to another day in each view: exactly one PATCH fires, the chip moves,
+  reload persists it. Stop the api (or force a 500) and drag → chip snaps back +
+  error visible.
+- Keyboard-only reschedule succeeds via the popover fallback.
+- Playwright suite green locally and in CI; deliberately breaking the drop handler
+  turns it red.
+- Gates: pnpm typecheck/lint/test + the Playwright suite (web-only; no server code
+  touched).
+```
+
+---
+
+## Phase 43 — .docx round-trip core (export/import + revision snapshots)
+
+```
+cd to sermon.guide. Read api/uploads.py ("Security choices" docstring + /tmp
+staging pattern), api/documents.py, api/AGENTS.md + the "### B4 — External
+editor round-trip" section of the v2 Product Backlog in this file.
+
+Goal: B4's v2-MINIMAL slice — .docx download/import, zero OAuth. Hard deps:
+Phases 34 (documents) + 37 (citation nodes) merged — the round-trip exists to
+carry sermon structure + citation /read hyperlinks.
+
+## Build
+- Branch: phase-43/docx-roundtrip off main.
+- worker/convert.py pandoc seam per B4 + the Cross-item contracts: export =
+  content JSON → @tiptap/html generateHTML (server-side Node, no browser DOM)
+  → pandoc html→docx with a --reference-doc template under worker/assets;
+  import = docx → pandoc → HTML → generateJSON. Pandoc legs live in
+  worker/convert.py; decide the Node-leg placement in-phase and record it.
+- pandoc becomes an api system dep (apt in api/Dockerfile, or an api/AGENTS.md
+  note for Phase 29 to bake — the queue runs 43 first) and the api/AGENTS.md
+  allowed-import surface gains worker/convert.py (Phases 11/12/16b precedent).
+- sermon_doc_revisions + Alembic migration at the next free number (0004 at
+  authoring time; renumber + re-point down_revision if scooped). Every import
+  snapshots prior app content FIRST — last-writer-wins never destroys anything.
+- GET /sermons/{id}/export.docx + POST /sermons/{id}/import: multipart,
+  size-capped, /tmp staging per api/uploads.py; non-owned id → 404; request
+  models extra='forbid'.
+- Web: Download/Import editor UI via same-origin proxy route handlers (Phase
+  15/16 pattern); imports render as TipTap JSON — zero dangerouslySetInnerHTML.
+
+## Verify
+- Golden round-trip test — THE phase gate: a citation-bearing sermon exported
+  then re-imported keeps structure + every citation /read hyperlink, with the
+  snapshot revision row predating the overwrite.
+- Oversized / non-docx multipart → 4xx; staged /tmp files cleaned up either way.
+- Gates: schema-reviewer (migration) + /check-tenant-leak + tenant-auditor +
+  /security-review (upload surface) + make test-isolation + api make
+  lint/typecheck/test + pnpm tsc/biome.
+```
+
+---
+
+## Phase 44 — OAuth connection vault
+
+```
+cd to sermon.guide. Read api/auth.py, api/settings.py, infra/.env.example +
+the "### B4 — External editor round-trip" section of the v2 Product Backlog in
+this file.
+
+OPERATOR CHECKPOINT FIRST: STOP and notify unless the operator confirms a GCP
+project + OAuth consent screen + client id/secret in .env (agents cannot read
+or write .env — ask, never peek; Testing mode is fine for dev: 7-day refresh
+expiry) and has generated AND backed up SERMON_API_TOKEN_ENC_KEY (loss bricks
+every stored token). Goal: the provider-agnostic vault Phases 45/46 sit on.
+
+## Build
+- Branch: phase-44/oauth-vault off main.
+- oauth_connections per B4 (UNIQUE(user_id, provider), refresh_token_ciphertext
+  BYTEA) + Alembic migration at the next free number (0004 at authoring time;
+  renumber + re-point down_revision if scooped). App-layer AESGCM via the
+  cryptography package — promote it to an explicit api dep — keyed by
+  SERMON_API_TOKEN_ENC_KEY, documented append-only in infra/.env.example.
+- api/integrations.py: GET /integrations, authorize, callback, DELETE revoke.
+  HMAC-bind state to user_id + nonce + ~10-min expiry, plus PKCE S256; validate
+  BOTH at the callback BEFORE the code exchange — the account-binding CSRF
+  defense (an attacker otherwise binds their account to a victim session and
+  exfiltrates pulled sermons). Thin httpx, no SDKs (ADR 0005/0006 precedent).
+- Web: /api/integrations/{provider}/callback route handler is the PUBLIC
+  redirect URI (top-level redirect onto the web origin — SameSite=Lax survives);
+  /settings/integrations page + nav entry + middleware.ts matcher coverage.
+- Tokens never reach the browser and never hit logs (Phase 27 will redact).
+
+## Verify
+- Live against the Testing-mode Google project: connect → row + provider_email
+  on /settings/integrations; tampered/expired/wrong-user state rejected BEFORE
+  any token POST; DELETE revokes and removes the row; DB holds ciphertext
+  only; grep api logs — zero token material.
+- Gates: schema-reviewer (migration) + /check-tenant-leak + tenant-auditor +
+  /security-review (new auth surface) + make test-isolation + api make
+  lint/typecheck/test + pnpm tsc/biome.
+```
+
+---
+
+## Phase 45 — Google Docs link/pull/unlink (spike-first)
+
+```
+cd to sermon.guide. Read worker/convert.py, api/integrations.py,
+api/documents.py + the "### B4 — External editor round-trip" section of the v2
+Product Backlog in this file.
+
+Goal: check-out/check-in to Google Docs over Phase 43's seam + Phase 44's vault
+(hard deps). NOT merge — while linked, the external copy is source of truth.
+
+## Build
+- Branch: phase-45/google-docs-link off main.
+- FIRST, B4's mandated empirical spike (its one UNCLEAR fact-check): export a
+  citation-bearing docx, Drive files.create upload-with-conversion to a native
+  Doc, export back, assert /read hyperlinks survived. If not, STOP — write the
+  bail-to-fallback decision (docx-in-Drive, no conversion) into the PR for
+  operator sign-off.
+- editor_links per B4 (provider_file_id, web_url, state linked|error|unlinked,
+  last_remote_version — a cursor, compared never parsed; partial UNIQUE: one
+  linked editor per document) + Alembic migration at the next free number
+  (0004 at authoring time; renumber + re-point down_revision if scooped).
+- api/editor_links.py: POST link (export+upload+row), GET status
+  (remote_changed via Drive files.version), POST pull (snapshot to
+  sermon_doc_revisions FIRST; prefer files.export text/markdown → pandoc, else
+  the docx leg), POST unlink (explicit choice, settled: pull-final vs
+  keep-app). document_id / provider file ids are untrusted: non-owned → 404.
+- Hard read-only editor lock while linked (settled), "Editing externally"
+  banner with Open / Pull changes / Unlink; same-origin proxies for all routes.
+
+## Verify
+- Live: link → native Doc at web_url; remote edit → remote_changed=true; pull
+  → snapshot row precedes the content update + citation /read links survive;
+  unlink offers both choices; second link while linked → 409.
+- Gates: schema-reviewer (migration), /check-tenant-leak + tenant-auditor,
+  /security-review, make test-isolation, api lint/typecheck/test, pnpm tsc/biome.
+
+## Close out
+- Record the spike outcome and which pull leg (markdown vs docx) ships primary.
+```
+
+---
+
+## Phase 46 — Microsoft Graph provider
+
+```
+cd to sermon.guide. Read api/integrations.py, api/editor_links.py,
+worker/convert.py + the "### B4 — External editor round-trip" section of the
+v2 Product Backlog in this file.
+
+OPERATOR CHECKPOINT FIRST: STOP and notify unless an Azure app registration +
+client id/secret exist in .env (agents cannot read .env — ask, never peek).
+Goal: Microsoft Graph as provider #2 over the SAME Phase 45 editor_links
+surface — no new tables, no migration; proves vault + link schema are
+provider-agnostic.
+
+## Build
+- Branch: phase-46/msgraph-link off main.
+- Graph leg per B4: the sermon travels as docx in OneDrive (no native
+  conversion) — simple PUT under the size cap, createUploadSession above it;
+  staleness via eTag (compared, never parsed — same cursor rule as Drive);
+  pull = download-back → pandoc through worker/convert.py.
+- Vault refresh path must handle MSA rotation-on-redemption: every refresh
+  redemption returns a NEW refresh token (90-day sliding window) that must be
+  re-encrypted and persisted immediately — keeping the old one bricks the
+  connection at the next refresh.
+- Wire provider='microsoft' through authorize/callback/revoke,
+  /settings/integrations, and the editor banner; thin httpx, no Graph SDK.
+
+## Verify
+- Live against an MSA account: connect, link a sermon, edit in Word Online →
+  GET status flags remote_changed via eTag, pull snapshots then updates,
+  unlink offers both choices; citation /read hyperlinks survive the docx legs.
+- Rotation proof: force two consecutive refreshes — the second succeeds and
+  the stored ciphertext changed between them (rotated token persisted).
+- An oversized doc exercises (or a unit test pins) the createUploadSession
+  branch.
+- Gates: /check-tenant-leak + tenant-auditor + /security-review + make
+  test-isolation + api make lint/typecheck/test + pnpm tsc/biome (no
+  migration → no schema-reviewer).
+```
+
+---
+
 ## Parked — trigger-gated, blocked, or v2+
 
 Deliberately NOT scheduled. Each has a written unblock trigger; when one fires,
@@ -1390,11 +2112,14 @@ plan it as the next phase number.
 | ParadeDB pg_search (true BM25) | ts_rank_cd passes all goldens | A golden regression attributable to ranking |
 | Postmortems dir (agent_docs/postmortems/) | Empty-dir busywork | First real postmortem (create the dir with it) |
 | Additional MCP servers (GitHub MCP, Context7) | Opt-in dev tooling; enableAllProjectMcpServers stays false | Explicit per-tool need |
+| B2-E sermon niceties (series/date/passage metadata, scripture-reference detection, preacher mode, word count, print stylesheet) | Polish; the core write loop (Phases 34–37) ships without it | Editor in weekly real use → schedule as one phase |
+| B4 ext-E background freshness (Celery beat poll + Drive watch channels / Graph subscriptions + renewal job) | No Celery beat service exists; both providers require publicly-trusted HTTPS on a verified domain — deploy is IP-only `tls internal` | Real domain + Let's Encrypt flip per docs/DEPLOY_AWS.md → schedule together with a beat service |
 
-When Phases 17–30 are done, re-audit the repo and plan v2 here — same drill as
-2026-06-05, starting from the **v2 Product Backlog** below: the product direction is
-already captured and pre-designed; the drill assigns phase numbers, sequences against
-the audit findings, and re-verifies the dated external facts.
+When Phases 17–30 are done, re-audit the repo — same drill as 2026-06-05 — scoped to
+hardening gaps and deviations: the sermon-workflow features are already planned as
+Phases 31–46 (see the **v2 Plan** section above) with the **v2 Product Backlog** below
+as their canonical design. Each consuming phase re-verifies the backlog's dated
+external facts as it runs.
 
 ---
 
@@ -1410,8 +2135,10 @@ Together they close the product loop: search → cite → write → schedule →
 
 Provenance: four parallel repo-grounded design passes + a 43-claim live web fact-check
 (2026-06-10: 41 confirmed, 1 refuted, 1 unclear — load-bearing ones marked "verified"
-inline). B-ids are stable references; the v2 drill assigns real phase numbers and MUST
-re-verify the dated facts (licenses, API capabilities, and library status drift).
+inline). B-ids remain stable references and are now numbered (2026-06-10): B1 →
+Phases 31–33, B2 → 34–37, B3 → 38–42, B4 → 43–46 — see the **v2 Plan — Sermon
+Workflow** section above. Each consuming phase MUST re-verify the dated facts it
+leans on (licenses, API capabilities, and library status drift).
 
 ### Cross-item contracts (settle once — every B-item leans on them)
 
@@ -1695,9 +2422,10 @@ choose); account-rebind policy after revoke/reconnect (recommend auto-flip to
 state='error'); per-user cap on active links (~25) now or with per-tenant quotas;
 record pull provenance on revision rows (recommend yes — one column).
 
-### Sequencing sketch for the v2 drill
+### Sequencing sketch (adopted 2026-06-10 as the v2 Plan ordered queue)
 
-B1's originals-persistence sub-item is the only time-sensitive piece — every ingest
+Historical record — the live queue is in the **v2 Plan — Sermon Workflow** section
+above. B1's originals-persistence sub-item is the only time-sensitive piece — every ingest
 before it lands loses the original forever; consider pulling it into v1 near Phase 20.
 Then: B1 reader (independent) ∥ B2 A→D; B3 slices 1–3 are standalone once the
 `documents` FK contract is settled (defer the column if needed); B3-4 linking and

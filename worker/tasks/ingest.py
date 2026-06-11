@@ -33,8 +33,26 @@ from celery_app import app
 from ingest import ingest
 
 
+def _request_task_uuid(task: Any) -> UUID | None:
+    """Parse ``task.request.id`` into the Phase 20 idempotency-claim key.
+
+    Celery mints UUID4 string task ids by default (the api also mints
+    them explicitly — ``api/tasks_client.py``), but the id is ultimately
+    caller-controlled: an operator-supplied custom id or an eager test
+    invocation may carry a non-UUID (or ``None``). Those runs fall back
+    to ``None`` — the legacy claim-less posture — rather than failing.
+    """
+    raw = getattr(task.request, "id", None)
+    if raw is None:
+        return None
+    try:
+        return UUID(str(raw))
+    except ValueError:
+        return None
+
+
 @app.task(name="tasks.ingest.ingest_book", bind=True)
-def ingest_book(self: Any, path: str, user_id: str) -> dict[str, Any]:  # noqa: ARG001 — bind=True hands `self` (the Task instance) to the function
+def ingest_book(self: Any, path: str, user_id: str) -> dict[str, Any]:
     """Run the full ingest pipeline for one book.
 
     Both arguments are JSON-friendly strings so the broker payload
@@ -45,11 +63,20 @@ def ingest_book(self: Any, path: str, user_id: str) -> dict[str, Any]:  # noqa: 
       reads the same local filesystem the API writes to.
     - *user_id*: UUID string of the owning ``users.user_id`` row.
 
+    ``bind=True`` hands us the Task instance so ``self.request.id`` — the
+    broker-stable task UUID, identical across redeliveries of the same
+    message — can key the Phase 20 idempotency claim in ``upload_tasks``
+    (see ``worker/ingest.py`` "Task-id claim").
+
     Returns a plain dict so the result backend can serialize it. The
     caller (Phase 10 API) maps it back into the typed ``IngestResult``
     on inspection.
     """
-    result = ingest(path=Path(path), user_id=UUID(user_id))
+    result = ingest(
+        path=Path(path),
+        user_id=UUID(user_id),
+        task_id=_request_task_uuid(self),
+    )
     return {
         "book_id": str(result.book_id),
         "was_duplicate": result.was_duplicate,

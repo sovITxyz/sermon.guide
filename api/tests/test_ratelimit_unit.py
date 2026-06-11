@@ -193,6 +193,22 @@ def test_client_ip_uses_rightmost_xff_entry_when_trusted(
     assert ratelimit.client_ip(req2) == ratelimit.client_ip(req)
 
 
+def test_client_ip_non_ip_trusted_tail_falls_back_to_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trusted XFF tail that isn't IP-shaped means the topology assumption
+    broke — key on the TCP peer, never on attacker-shaped text."""
+    monkeypatch.setattr(settings, "trust_proxy_headers", True)
+    req = _request({"X-Forwarded-For": "6.6.6.6, not-an-ip"})
+    assert ratelimit.client_ip(req) == "10.0.0.7"
+    # IPv6 (bracketed-with-port and bare) still passes the shape check.
+    assert (
+        ratelimit.client_ip(_request({"X-Forwarded-For": "[2001:db8::1]:443"}))
+        == "[2001:db8::1]:443"
+    )
+    assert ratelimit.client_ip(_request({"X-Forwarded-For": "2001:db8::1"})) == "2001:db8::1"
+
+
 def test_client_ip_trusted_but_no_header_falls_back_to_peer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

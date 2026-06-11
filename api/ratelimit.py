@@ -58,6 +58,7 @@ Design notes:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -149,7 +150,16 @@ def client_ip(request: Request) -> str:
         forwarded = request.headers.get("x-forwarded-for", "")
         last = forwarded.split(",")[-1].strip()
         if last:
-            return last
+            # Belt-and-suspenders: the trusted hop always writes a real
+            # address. A non-IP value means the topology assumption broke
+            # (some ingress bypassed the proxy) — fall back to the TCP
+            # peer rather than keying buckets on attacker-shaped text.
+            try:
+                ipaddress.ip_address(last.removeprefix("[").partition("]")[0])
+            except ValueError:
+                logger.warning("trusted X-Forwarded-For tail is not an IP; keying on TCP peer")
+            else:
+                return last
     return request.client.host if request.client else "unknown"
 
 

@@ -18,7 +18,15 @@
 #                       no-skip guard FAILS the job on any SKIPPED test, so a
 #                       vacuous green is impossible. Operators: mark this job
 #                       REQUIRED in branch protection.
-#   retrieval-golden    Phase 11 regression gate (keyless flavor)
+#   retrieval-golden    Phase 11 regression gate, keyless flavor. Skip-passes
+#                       until the DEEPINFRA_API_KEY secret + Phase 23 corpus
+#                       exist — but the golden-loud-skip-guard step makes the
+#                       vacuous green LOUD (::warning + job summary).
+#   retrieval-golden-live  Activates AUTOMATICALLY once the operator runs
+#                       `gh secret set DEEPINFRA_API_KEY` (no workflow edit
+#                       needed; the filter job probes secret presence). Boots
+#                       compose and runs the keyed suites live — cents/run.
+#                       Fork PRs never see secrets, so it skips there.
 #   phases-row-flipped  PHASES.md bookkeeping gate for phase-N/* PRs
 
 name: CI
@@ -45,6 +53,7 @@ jobs:
       web: ${{ steps.detect.outputs.web }}
       retrieval_golden: ${{ steps.detect.outputs.retrieval_golden }}
       infra_stack: ${{ steps.paths.outputs.infra_stack }}
+      deepinfra_key: ${{ steps.secret_probe.outputs.deepinfra_key }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -86,6 +95,15 @@ jobs:
           else
             echo "infra_stack=false" >> "$GITHUB_OUTPUT"
           fi
+      # The secrets context is not readable in job-level `if:`, so surface
+      # key presence as an output for retrieval-golden-live to gate on.
+      # Operator-owned: setting the repo secret is the ONLY step needed to
+      # activate the live job. Fork PRs get no secrets → 'false' → skip.
+      - id: secret_probe
+        name: Probe DEEPINFRA_API_KEY presence
+        env:
+          HAS_DEEPINFRA_KEY: ${{ secrets.DEEPINFRA_API_KEY != '' }}
+        run: echo "deepinfra_key=${HAS_DEEPINFRA_KEY}" >> "$GITHUB_OUTPUT"
 
   worker:
     name: worker (lint + typecheck + test)
@@ -228,6 +246,10 @@ jobs:
         run: |
           if [ -f infra/.env ]; then make down; else echo "stack never booted"; fi
 
+  # Phase 11 regression gate, keyless flavor. The dev corpus is copyrighted
+  # (gitignored) and this job gets no DEEPINFRA_API_KEY, so today every row
+  # skip-passes — the guard step below makes that LOUD so the green is never
+  # silent. Stays cheap on purpose: no compose boot, no spend.
   retrieval-golden:
     name: retrieval-golden (regression gate)
     runs-on: ubuntu-latest
@@ -241,7 +263,118 @@ jobs:
       - name: Install
         run: cd worker && uv sync --all-extras --dev
       - name: Run golden retrieval tests
-        run: cd worker && uv run pytest tests/test_retrieval_golden.py -v
+        shell: bash
+        env:
+          COLUMNS: "200"
+        run: |
+          set -euo pipefail
+          cd worker
+          uv run pytest tests/test_retrieval_golden.py -v -rs 2>&1 | tee /tmp/pytest-golden.log
+      # Loud-skip posture (Phase 17, prompt option (b) upgraded): green but
+      # NEVER silent. Names the exact activation path in the annotation and
+      # the job summary.
+      - name: golden-loud-skip-guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -iE "skipped" /tmp/pytest-golden.log; then
+            echo "Golden suite executed for real — no skips."
+            exit 0
+          fi
+          title="retrieval-golden is skip-passing (green but vacuous)"
+          msg="Activation: (1) operator runs: gh secret set DEEPINFRA_API_KEY — the retrieval-golden-live job then turns on automatically; (2) Phase 23 commits a public-domain CI corpus + golden rows, un-skipping the query tests."
+          echo "::warning title=${title}::${msg}"
+          {
+            echo "## :warning: ${title}"
+            echo ""
+            echo "${msg}"
+            echo ""
+            echo '```'
+            grep -E "^SKIPPED|[0-9]+ skipped" /tmp/pytest-golden.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Keyed flavor — exists from this commit on, but runs only when the filter
+  # job sees the DEEPINFRA_API_KEY repo secret (operator-owned; never wired
+  # here). Spend per run: cents (ingest e2e + embedding weight-parity trio;
+  # the golden corpus adds ~$0.006/book once Phase 23 lands — every CI run is
+  # a COLD ingest because the compose stack is ephemeral). Also path-gated:
+  # docs-only PRs don't spend.
+  retrieval-golden-live:
+    name: retrieval-golden-live (DeepInfra-keyed)
+    runs-on: ubuntu-latest
+    needs: [filter, worker]
+    if: >-
+      needs.filter.outputs.retrieval_golden == 'true' &&
+      needs.filter.outputs.deepinfra_key == 'true' &&
+      needs.filter.outputs.infra_stack == 'true'
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Boot infra stack (docker compose --wait)
+        run: make up
+      - name: Install worker deps
+        run: cd worker && uv sync --all-extras --dev
+      - name: Run migrations
+        run: make -C worker migrate-up
+      - name: Bootstrap Milvus collection
+        run: make -C worker bootstrap-milvus
+      - name: Install WordNet corpus
+        run: cd worker && uv run python -c "import nltk; nltk.download('wordnet')"
+      # Golden rows skip on the missing corpus until Phase 23; the ingest
+      # dedup-roundtrip e2e, the embedding weight-parity trio, and the
+      # golden embedder-dim guard run live today.
+      - name: Run keyed suites (golden + ingest e2e + embedding parity)
+        shell: bash
+        env:
+          DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
+          COLUMNS: "200"
+        run: |
+          set -euo pipefail
+          set -a && . infra/.env && set +a
+          cd worker
+          uv run pytest tests/test_retrieval_golden.py tests/test_ingest.py tests/test_embedding.py -v -rs 2>&1 | tee /tmp/pytest-golden-live.log
+      # With compose up and the key wired, infra/key/WordNet skips are wiring
+      # BUGS → fail. The only tolerated skip is the Phase 23 corpus gap —
+      # warned, never silent. Classification uses the `-rs` summary lines
+      # (full reasons); COLUMNS=200 keeps them untruncated.
+      - name: Live-gate guard (only corpus-gap skips tolerated)
+        shell: bash
+        run: |
+          set -euo pipefail
+          skips="$(grep -E "^SKIPPED" /tmp/pytest-golden-live.log || true)"
+          if [ -z "$skips" ]; then
+            echo "Live golden gate fully executed — no skips."
+            exit 0
+          fi
+          bad="$(printf '%s\n' "$skips" | grep -viE "corpus sample\(s\) missing" || true)"
+          if [ -n "$bad" ]; then
+            printf '%s\n' "$bad"
+            echo "::error title=retrieval-golden-live mis-wired::Non-corpus skips above must RUN in this job (compose is up, the key is wired). Fix the wiring; do not exempt the test."
+            exit 1
+          fi
+          msg="Golden query rows still skip: no CI corpus yet. Phase 23 commits public-domain samples + golden rows to activate them."
+          echo "::warning title=retrieval-golden-live awaiting Phase 23 corpus::${msg}"
+          {
+            echo "## :warning: retrieval-golden-live awaiting Phase 23 corpus"
+            echo ""
+            echo "${msg}"
+            echo ""
+            echo '```'
+            printf '%s\n' "$skips"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Compose logs (debug)
+        if: failure()
+        run: docker compose -f infra/docker-compose.yml --env-file infra/.env logs --tail=200
+      - name: Teardown infra stack
+        if: always()
+        shell: bash
+        run: |
+          if [ -f infra/.env ]; then make down; else echo "stack never booted"; fi
 
   phases-row-flipped:
     name: phases-row-flipped (PHASES.md gate)

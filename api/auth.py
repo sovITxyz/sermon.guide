@@ -45,6 +45,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import ratelimit
 from settings import settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -132,6 +133,9 @@ SessionDep = Annotated[AsyncSession, Depends(_session)]
     "/signup",
     status_code=status.HTTP_201_CREATED,
     response_model=SignupResponse,
+    # Phase 19: per-IP throttle on mass registration (Redis-backed,
+    # cross-replica; see ratelimit.py and api/AGENTS.md for the buckets).
+    dependencies=[Depends(ratelimit.ip_limit("signup_ip"))],
 )
 async def signup(payload: SignupRequest, session: SessionDep) -> SignupResponse:
     """Create a new user. 409 on email collision."""
@@ -154,7 +158,13 @@ async def signup(payload: SignupRequest, session: SessionDep) -> SignupResponse:
     return SignupResponse(user_id=user.user_id, email=user.email)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    # Phase 19: per-IP brake on credential stuffing — the uniform 401
+    # (module docstring) means a limiter is the only stuffing defense here.
+    dependencies=[Depends(ratelimit.ip_limit("login_ip"))],
+)
 async def login(payload: LoginRequest, session: SessionDep) -> TokenResponse:
     """Authenticate and return a bearer JWT. Single 401 on any failure."""
     stmt = select(User).where(User.email == payload.email)

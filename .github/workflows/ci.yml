@@ -202,8 +202,23 @@ jobs:
         run: make -C worker migrate-up
       - name: Bootstrap Milvus collection
         run: make -C worker bootstrap-milvus
+      # nltk.download() returns False on failure WITHOUT raising — first live
+      # run proved it (download died in 200ms, step exited 0, the no-skip
+      # guard caught the cascade). raise_on_error + retry + verify with the
+      # EXACT probe the suites use, so a download problem fails HERE.
       - name: Install WordNet corpus (dedup + storage dup-hit gates)
-        run: cd worker && uv run python -c "import nltk; nltk.download('wordnet')"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd worker
+          for attempt in 1 2 3; do
+            if uv run python -c "import nltk; nltk.download('wordnet', raise_on_error=True)"; then
+              break
+            fi
+            echo "::warning::nltk wordnet download attempt ${attempt} failed; retrying"
+            sleep 5
+          done
+          uv run python -c "import nltk; print('WordNet at:', nltk.data.find('corpora/wordnet'))"
       # Exact local enforcement command (CLAUDE.md / ARCHITECTURE.md §7.1).
       # Milvus env defaults (localhost:19530) match compose; no sourcing needed.
       - name: Tenant-isolation suite (Phase 3 hard gate)
@@ -322,8 +337,21 @@ jobs:
         run: make -C worker migrate-up
       - name: Bootstrap Milvus collection
         run: make -C worker bootstrap-milvus
+      # Same hardened install as tenant-isolation: raise_on_error + retry +
+      # probe-verify (nltk.download() returns False without raising).
       - name: Install WordNet corpus
-        run: cd worker && uv run python -c "import nltk; nltk.download('wordnet')"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd worker
+          for attempt in 1 2 3; do
+            if uv run python -c "import nltk; nltk.download('wordnet', raise_on_error=True)"; then
+              break
+            fi
+            echo "::warning::nltk wordnet download attempt ${attempt} failed; retrying"
+            sleep 5
+          done
+          uv run python -c "import nltk; print('WordNet at:', nltk.data.find('corpora/wordnet'))"
       # Golden rows skip on the missing corpus until Phase 23; the ingest
       # dedup-roundtrip e2e, the embedding weight-parity trio, and the
       # golden embedder-dim guard run live today.

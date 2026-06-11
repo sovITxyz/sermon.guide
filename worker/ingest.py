@@ -6,11 +6,28 @@ Phase 8 pipeline (ARCHITECTURE.md §5 upload path):
         → extract (EbookLib+pandoc or pymupdf4llm)
         → signature (MinHash, 5-shingles, lemmatized)
         → dedup lookup
-              ├── duplicate? → insert user_library row only
+              ├── duplicate? → insert user_library row;
+              │                backfill original upload when the
+              │                existing text_pointer is NULL
               │                (skip chunking + embedding)
-              └── new?       → chunk → embed → insert vectors;
-                               insert global_books + user_library;
-                               LSH.add to the in-memory index.
+              └── new?       → upload original → chunk → embed →
+                               insert vectors; insert global_books
+                               (text_pointer = originals key) +
+                               user_library; LSH.add to the index.
+
+## Originals persistence (Phase 31)
+
+The raw upload is persisted to the originals bucket (``storage.py``)
+*before* the ``global_books`` transaction, so a stored ``text_pointer``
+never dangles; a crash between upload and commit leaves an orphan
+object — the same accepted posture as the documented Milvus
+orphan-vector window (``celery_app.py`` docstring). Storage failures
+raise and **fail the ingest loudly** on both paths (posture recorded in
+``AGENTS.md``); on the dup-hit path the ``user_library`` upsert lands
+first, so a failed backfill still converges on retry while the pointer
+stays NULL for the next attempt. Backfill never overwrites a set
+pointer and never writes a second object for the same book
+(``UPDATE … WHERE text_pointer IS NULL`` — race-safe, idempotent).
 
 ## Tenant scoping
 
@@ -54,9 +71,11 @@ from uuid import UUID
 
 import numpy as np
 from pymilvus import MilvusClient
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 import dedup
+import storage
 from chunking import Chunk, chunk
 from db import Chunk as ChunkRow
 from db import GlobalBook, UserLibraryEntry, get_sync_session_factory
@@ -175,6 +194,40 @@ def _insert_book_with_chunks(
             )
 
 
+def _backfill_original(*, book_id: UUID, filename: str, original: bytes | Path) -> None:
+    """Persist *original* for an existing book whose ``text_pointer`` is NULL.
+
+    The dup-hit recovery path (Phase 31): every book ingested before
+    originals persistence landed has a NULL ``text_pointer`` and an
+    unrecoverable original — a second owner re-uploading identical
+    content is the only chance to capture the bytes. Already-set pointer
+    (or missing row) → no-op, zero storage calls, never a duplicate
+    object. The ``UPDATE … WHERE text_pointer IS NULL`` predicate makes
+    the pointer write race-safe and idempotent: a concurrent backfill
+    loses the update harmlessly (its object becomes an orphan under the
+    same accepted posture as orphan vectors).
+
+    Storage failures propagate (fail-the-ingest posture, AGENTS.md);
+    the caller upserts ``user_library`` *before* invoking this, so a
+    loud failure here still leaves the user's library converged and the
+    NULL pointer retryable on the next dup-hit.
+    """
+    sf = get_sync_session_factory()
+    with sf() as session:
+        row = session.execute(
+            select(GlobalBook.text_pointer).where(GlobalBook.book_id == book_id),
+        ).one_or_none()
+    if row is None or row[0] is not None:
+        return
+    key = storage.put_original(book_id=book_id, filename=filename, data=original)
+    with sf() as session, session.begin():
+        session.execute(
+            update(GlobalBook)
+            .where(GlobalBook.book_id == book_id, GlobalBook.text_pointer.is_(None))
+            .values(text_pointer=key),
+        )
+
+
 def _upsert_user_library(*, user_id: UUID, book_id: UUID) -> None:
     """Ensure a ``user_library`` row binding *user_id* → *book_id* exists.
 
@@ -202,7 +255,7 @@ def ingest_markdown(
     dedup_index: Dedup | None = None,
     title: str | None = None,
     author: str | None = None,
-    text_pointer: str | None = None,
+    original: bytes | Path | None = None,
 ) -> IngestResult:
     """Dedup-aware ingest from already-extracted markdown.
 
@@ -216,6 +269,12 @@ def ingest_markdown(
     *client* and *dedup_index* default to the process-wide singletons
     when not supplied; pass them explicitly from tests that want to
     isolate state.
+
+    *original* is the raw upload — bytes or a path to the on-disk file
+    (Phase 31). New books upload it to ``originals/{book_id}/…`` and
+    record the key in ``global_books.text_pointer``; dup-hits backfill
+    the existing row's NULL pointer. ``None`` (the synthetic-markdown
+    test seam) skips persistence entirely.
     """
     title = title if title is not None else filename
     sig = dedup.signature(markdown)
@@ -223,7 +282,11 @@ def ingest_markdown(
 
     existing = index.find_duplicate(sig)
     if existing is not None:
+        # Library row first: a loud backfill failure below still leaves
+        # the user's ownership converged (retry is a no-op upsert).
         _upsert_user_library(user_id=user_id, book_id=existing)
+        if original is not None:
+            _backfill_original(book_id=existing, filename=filename, original=original)
         return IngestResult(
             book_id=existing,
             was_duplicate=True,
@@ -232,6 +295,15 @@ def ingest_markdown(
 
     client = client if client is not None else make_client()
     book_id = uuidlib.uuid4()
+    # Persist the original before any chunk/embed/insert work: fail fast
+    # while nothing has been written, and never commit a text_pointer
+    # whose object doesn't exist (crash after upload → orphan object,
+    # the accepted posture — see module docstring).
+    text_pointer = (
+        storage.put_original(book_id=book_id, filename=filename, data=original)
+        if original is not None
+        else None
+    )
     chunks = chunk(markdown)
     rows_inserted = 0
     if chunks:
@@ -272,13 +344,13 @@ def ingest(
     user_id: UUID,
     client: MilvusClient | None = None,
     dedup_index: Dedup | None = None,
-    text_pointer: str | None = None,
 ) -> IngestResult:
     """Run the full ingest pipeline. Returns the ``IngestResult``.
 
-    *text_pointer* records where the raw upload lives (R2/B2 key in
-    Phase 14+, local path before that). Stored on ``global_books`` only
-    when the book is new.
+    The file at *path* is the raw original; Phase 31 persists it to the
+    originals bucket and records the object key in
+    ``global_books.text_pointer`` (new books) or backfills a NULL
+    pointer (dup-hits) — see ``ingest_markdown``.
     """
     return ingest_markdown(
         markdown=extract(path),
@@ -287,7 +359,7 @@ def ingest(
         client=client,
         dedup_index=dedup_index,
         title=path.stem,
-        text_pointer=text_pointer,
+        original=path,
     )
 
 

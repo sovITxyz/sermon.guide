@@ -110,7 +110,7 @@ from typing import Any
 from db import UserLibraryEntry
 from embedding import embed
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pymilvus import MilvusClient
 from retrieval import (
     DENSE_FANOUT,
@@ -148,7 +148,12 @@ class SearchRequest(BaseModel):
 
     No ``user_id`` field — that always comes from the JWT (see module docstring).
     No ``book_ids`` field — the library is resolved server-side.
+    ``extra="forbid"`` (Phase 18) makes that mechanical: a smuggled
+    ``user_id``/``book_ids`` is a hard 422, not a silently-dropped key
+    backed by a reviewer-enforced rule (closes Phase 12 deviation d).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1, max_length=1024)
     limit: int = Field(default=10, ge=1, le=100)

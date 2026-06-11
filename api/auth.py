@@ -40,7 +40,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,6 +61,11 @@ _BCRYPT_MAX_BYTES = 72
 
 
 class SignupRequest(BaseModel):
+    # Phase 18 posture: unknown fields in inbound bodies are a hard 422,
+    # never a silently-dropped key (a smuggled ``user_id`` must fail loud —
+    # tenant invariant). Applies to every request model in api/.
+    model_config = ConfigDict(extra="forbid")
+
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
 
@@ -71,6 +76,8 @@ class SignupResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # Phase 18 — see SignupRequest
+
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
 

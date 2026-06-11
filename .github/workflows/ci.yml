@@ -382,14 +382,21 @@ jobs:
       # Golden rows skip on the missing corpus until Phase 23; the ingest
       # dedup-roundtrip e2e, the embedding weight-parity trio, and the
       # golden embedder-dim guard run live today.
+      # The secret rides in under a DIFFERENT name and is exported AFTER the
+      # .env source: `make up` creates infra/.env from the example, whose
+      # empty `DEEPINFRA_API_KEY=` line would clobber a step-env injection
+      # under the real name (`set -a` exports everything sourced). The
+      # live-gate guard below caught exactly this on the job's first
+      # activation (PR #44).
       - name: Run keyed suites (golden + ingest e2e + embedding parity)
         shell: bash
         env:
-          DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
+          DEEPINFRA_API_KEY_SECRET: ${{ secrets.DEEPINFRA_API_KEY }}
           COLUMNS: "200"
         run: |
           set -euo pipefail
           set -a && . infra/.env && set +a
+          export DEEPINFRA_API_KEY="$DEEPINFRA_API_KEY_SECRET"
           cd worker
           uv run pytest tests/test_retrieval_golden.py tests/test_ingest.py tests/test_embedding.py -v -rs 2>&1 | tee /tmp/pytest-golden-live.log
       # With compose up and the key wired, infra/key/WordNet skips are wiring

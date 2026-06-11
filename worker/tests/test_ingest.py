@@ -31,10 +31,10 @@ import numpy as np
 import pytest
 
 from chunking import Chunk
-from db import GlobalBook, User, UserLibraryEntry, get_sync_session_factory
+from db import GlobalBook, UploadTask, User, UserLibraryEntry, get_sync_session_factory
 from db.settings import settings as db_settings
 from embedding import EMBED_DIM
-from ingest import _build_rows, ingest_markdown
+from ingest import _build_rows, _record_claim, ingest_markdown
 from scripts.bootstrap_milvus import COLLECTION_NAME
 
 # Five short distinct sentences across two ATX headings. SemanticSplitter
@@ -344,3 +344,167 @@ def test_dedup_roundtrip_across_two_tenants(
         client.flush(collection_name=COLLECTION_NAME)
     finally:
         _cleanup_users_and_orphan_books([user_a, user_b])
+
+
+# ---------------------------------------------------------------------------
+# Phase 20 — task-id claim: redelivery after a mid-window crash converges.
+
+# Distinct from SYNTHETIC_MARKDOWN so the two e2e tests can never dedup-collide
+# through leftover state.
+PHASE20_MARKDOWN = """\
+# Preface
+
+The lighthouse keeper counted the waves at dusk. Every seventh wave carried foam.
+
+# Chapter One
+
+Gulls wheeled over the harbor while the tide drew back. The keeper logged the
+storm-glass reading and trimmed the lamp before night fell across the water.
+"""
+
+
+@pytest.mark.skipif(
+    not _remote_embeddings_available(),
+    reason="DEEPINFRA_API_KEY unset — remote embeddings unavailable",
+)
+@pytest.mark.skipif(
+    not _wordnet_available(),
+    reason="NLTK WordNet corpus not installed; run `nltk.download('wordnet')` to enable.",
+)
+def test_task_claim_redelivery_converges(
+    milvus_clean_test_books: None,  # noqa: ARG001 — fixture used for setup/teardown
+) -> None:
+    """Phase 20 verify path: the Phase 9 crash window converges via the claim.
+
+    Reconstructs the exact mid-window state a SIGKILL leaves behind —
+    ``upload_tasks.book_id`` claimed + partial vectors flushed to Milvus,
+    but NO ``global_books``/``chunks`` commit (so no MinHash signature:
+    the dedup gate cannot converge this; only the claim can) — then runs
+    the redelivered task and asserts one consistent record, zero orphans.
+    A second redelivery after the full commit pins the converge-and-stop
+    path. The real kill -9 drill against a live worker is the phase's
+    operator verify; this is its deterministic regression.
+    """
+    if not _milvus_reachable():
+        host, port = _milvus_host_port()
+        pytest.skip(f"Milvus unreachable at {host}:{port}; run `make up`.")
+    if not _postgres_reachable():
+        pytest.skip(
+            f"Postgres unreachable at {db_settings.host}:{db_settings.port}; run `make up`."
+        )
+
+    from pymilvus import MilvusClient
+
+    host, port = _milvus_host_port()
+    client = MilvusClient(uri=f"http://{host}:{port}")
+    if not client.has_collection(collection_name=COLLECTION_NAME):
+        pytest.skip(f"Collection '{COLLECTION_NAME}' missing — run `make bootstrap-milvus`.")
+
+    from dedup import Dedup
+
+    user = _make_user()
+    task_id = uuid.uuid4()
+    claimed_book_id = uuid.uuid4()
+
+    # The api-shaped precondition: POST /upload committed the ownership row
+    # before send_task (api/uploads.py ordering contract).
+    sf = get_sync_session_factory()
+    with sf() as session, session.begin():
+        session.add(UploadTask(task_id=task_id, user_id=user, filename="phase20.md"))
+
+    try:
+        # Crashed first attempt: claim recorded, partial vectors flushed,
+        # Postgres commit never reached.
+        _record_claim(task_id=task_id, book_id=claimed_book_id)
+        partial_rows = [
+            {
+                "vector": [0.0] * EMBED_DIM,
+                "book_id": str(claimed_book_id),
+                "content_chunk": f"partial chunk {i} from the crashed attempt",
+                "metadata": {
+                    "filename": "phase20.md",
+                    "chunk_index": i,
+                    "parent_section": None,
+                },
+            }
+            for i in range(3)
+        ]
+        client.insert(collection_name=COLLECTION_NAME, data=partial_rows)
+        client.flush(collection_name=COLLECTION_NAME)
+
+        # Redelivery: same task_id. Fresh empty dedup index — the crashed
+        # attempt never committed its signature, exactly like production.
+        dedup_index = Dedup(session_factory=get_sync_session_factory())
+        dedup_index._load_from([])  # noqa: SLF001 — documented test seam
+        result = ingest_markdown(
+            markdown=PHASE20_MARKDOWN,
+            filename="phase20.md",
+            user_id=user,
+            client=client,
+            dedup_index=dedup_index,
+            title="_test_phase20_claim",
+            task_id=task_id,
+        )
+        assert not result.was_duplicate
+        assert result.book_id == claimed_book_id, (
+            "Redelivery must re-run under the CLAIMED book_id — a fresh id "
+            "would orphan the crashed attempt's vectors (the Phase 9 window)."
+        )
+        assert result.rows_inserted > 0
+
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f'book_id == "{claimed_book_id}"',
+            output_fields=["book_id"],
+            limit=result.rows_inserted + 10,
+        )
+        assert len(rows) == result.rows_inserted, (
+            "Vector count must equal exactly one clean run — the crashed "
+            "attempt's partial rows must be scrubbed, not duplicated."
+        )
+
+        # Second redelivery AFTER the full commit (again with an empty dedup
+        # index, so only the claim can converge it): no new vectors, same book.
+        dedup_index_2 = Dedup(session_factory=get_sync_session_factory())
+        dedup_index_2._load_from([])  # noqa: SLF001 — documented test seam
+        result_2 = ingest_markdown(
+            markdown=PHASE20_MARKDOWN,
+            filename="phase20.md",
+            user_id=user,
+            client=client,
+            dedup_index=dedup_index_2,
+            title="_test_phase20_claim",
+            task_id=task_id,
+        )
+        assert result_2.was_duplicate
+        assert result_2.book_id == claimed_book_id
+        assert result_2.rows_inserted == 0
+        rows_after = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f'book_id == "{claimed_book_id}"',
+            output_fields=["book_id"],
+            limit=result.rows_inserted + 10,
+        )
+        assert len(rows_after) == result.rows_inserted
+
+        # Ownership landed for the (single) user.
+        from sqlalchemy import select
+
+        with sf() as session:
+            owners = list(
+                session.execute(
+                    select(UserLibraryEntry.user_id).where(
+                        UserLibraryEntry.book_id == claimed_book_id
+                    ),
+                ).scalars()
+            )
+        assert owners == [user]
+
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            filter=f'book_id == "{claimed_book_id}"',
+        )
+        client.flush(collection_name=COLLECTION_NAME)
+    finally:
+        # upload_tasks rows cascade with the user delete (FK ondelete).
+        _cleanup_users_and_orphan_books([user])

@@ -337,16 +337,39 @@ module docstring):
   (with worker PID + hostname) the moment a worker claims the task, so
   Phase 10's `GET /tasks/{id}` can distinguish "queued" from "running".
 
-**Idempotency caveat.** The pipeline is *not* crash-safe between the
-Milvus insert and the Postgres commit. Phase 12 adds `chunks` rows
-alongside `global_books` in a single Postgres transaction (see
-`ingest.py:_insert_book_with_chunks`) so a crash either lands both
-Postgres rows or neither — but a crash *after* the Milvus flush and
-*before* the Postgres commit still leaves orphan vectors (`library_vectors`
-rows with no matching `global_books`/`chunks`). The dedup gate catches
-*content* re-uploads at the MinHash layer, so most re-runs converge to
-the right end state. Phase 10+ should add a task-id-keyed idempotency
-token before exposing the queue to untrusted upload traffic.
+**Idempotency — the task-id claim (Phase 20).** The pipeline still
+writes Milvus before the Postgres commit (Phase 12 made
+`global_books` + `chunks` one transaction via
+`ingest.py:_insert_book_with_chunks`, so Postgres lands both-or-neither),
+and a crash after the Milvus flush and before that commit used to orphan
+the attempt's vectors forever: the redelivered task found no committed
+MinHash signature, missed the dedup gate, and re-ran under a fresh
+`book_id`. Phase 20 closes that window for api-enqueued tasks with a
+claim on the `upload_tasks` row (the row `POST /upload` commits before
+`send_task`):
+
+- The new-book path records its freshly minted `book_id` on the row
+  (`ingest.py:_record_claim`) BEFORE the first non-transactional write
+  (MinIO original, Milvus vectors). Keep that ordering — a claim written
+  after the writes it covers is worthless.
+- A redelivered task consults the claim first
+  (`ingest.py:ingest_markdown`): committed `global_books` row → converge
+  (upsert `user_library`, return duplicate); uncommitted → scrub the
+  partial vectors (`_scrub_partial_vectors`) and re-run under the SAME
+  `book_id`, which also overwrites the same
+  `originals/{book_id}/{filename}` object key. **Invariant: a redelivered
+  api-enqueued task converges to one consistent record — zero orphan
+  vectors, zero duplicate vector sets, zero orphan originals objects.**
+  The live-gated regression is
+  `tests/test_ingest.py::test_task_claim_redelivery_converges`.
+- Claim-less runs (manual CLI / `make enqueue` — no `upload_tasks` row)
+  keep the legacy Phase 9 posture: `_record_claim` is a 0-row UPDATE and
+  a mid-window crash orphans that attempt's vectors. Acceptable because
+  those paths are operator-driven, not untrusted upload traffic.
+- Residual (accepted): *concurrent* duplicate execution — the 300 s
+  visibility timeout expiring under a still-RUNNING task redelivers it
+  while the first attempt is alive; the claim is task-id-keyed, not
+  leased, so attempts can interleave. Same exposure as before Phase 20.
 
 ## Dedup
 

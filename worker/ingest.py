@@ -50,6 +50,37 @@ chunking before that point on every re-upload of the same content, so
 the second call costs one ``GlobalBook`` lookup + one ``user_library``
 upsert.
 
+## Task-id claim (Phase 20) — crash convergence on the new-book path
+
+Content dedup only converges re-runs of *fully committed* ingests — a
+crash between the Milvus flush and the ``global_books`` commit never
+committed the MinHash signature, so the redelivered task used to re-run
+the whole new-book path under a fresh ``book_id`` and orphan the crashed
+attempt's vectors (and its originals object) forever: the documented
+Phase 9 window.
+
+API-enqueued tasks now carry a task-id-keyed claim in ``upload_tasks``
+(the row the api commits before ``send_task``). On the new-book path the
+worker records the freshly minted ``book_id`` on that row *before* the
+first non-transactional write. A redelivered task consults the claim
+before minting anything:
+
+- claim present + ``global_books`` row committed → previous attempt
+  finished; converge by upserting ``user_library`` and stop.
+- claim present + no ``global_books`` row → previous attempt died inside
+  the window; scrub its partial Milvus vectors and re-run under the SAME
+  ``book_id`` — the originals re-upload overwrites the same
+  ``originals/{book_id}/{filename}`` key, so the MinIO object converges
+  too. End state: one consistent record, zero orphans.
+- no ``upload_tasks`` row (manual CLI / ``make enqueue``) → legacy
+  posture: no claim, the Phase 9 window applies as documented.
+
+Residual (documented, accepted): *concurrent* duplicate execution — a
+still-RUNNING task whose broker visibility timeout (300 s) expires gets
+redelivered while the first attempt is alive; the claim is keyed by
+task_id, not leased, so the two attempts can interleave. Same exposure
+as before this phase; bounded by the visibility timeout.
+
 CLI (run from ``worker/``):
 
     uv run python -m ingest path/to/book.epub --user-id <uuid>
@@ -62,6 +93,7 @@ CLI (run from ``worker/``):
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import uuid as uuidlib
 from dataclasses import dataclass
@@ -78,11 +110,13 @@ import dedup
 import storage
 from chunking import Chunk, chunk
 from db import Chunk as ChunkRow
-from db import GlobalBook, UserLibraryEntry, get_sync_session_factory
+from db import GlobalBook, UploadTask, UserLibraryEntry, get_sync_session_factory
 from dedup import Dedup
 from embedding import embed
 from extractors import extract
 from scripts.bootstrap_milvus import COLLECTION_NAME, make_client
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +262,72 @@ def _backfill_original(*, book_id: UUID, filename: str, original: bytes | Path) 
         )
 
 
+def _read_claim(task_id: UUID) -> UUID | None:
+    """Return the in-flight ``book_id`` recorded for *task_id*, if any.
+
+    ``None`` covers both "no ``upload_tasks`` row" (manual CLI /
+    ``make enqueue`` — legacy posture, no claim machinery) and "row exists
+    but no attempt has reached the new-book path yet". Either way the
+    caller mints a fresh ``book_id`` and (when the row exists) records it.
+    """
+    sf = get_sync_session_factory()
+    with sf() as session:
+        row = session.execute(
+            select(UploadTask.book_id).where(UploadTask.task_id == task_id),
+        ).one_or_none()
+    return row[0] if row is not None else None
+
+
+def _record_claim(*, task_id: UUID, book_id: UUID) -> None:
+    """Durably record *book_id* as *task_id*'s in-flight new-book claim.
+
+    MUST commit before the first non-transactional write (MinIO original,
+    Milvus vectors) — the claim is only useful if a crash anywhere after
+    those writes leaves it readable for the redelivered attempt.
+
+    ``WHERE book_id IS NULL`` keeps the first claim stable: a concurrent
+    duplicate attempt (visibility-timeout redelivery of a still-running
+    task — see module docstring) no-ops here instead of flapping the
+    claim. UPDATE-only by design: no ``upload_tasks`` row (manual
+    enqueue) means no claim, and this is then a harmless 0-row UPDATE.
+    """
+    sf = get_sync_session_factory()
+    with sf() as session, session.begin():
+        session.execute(
+            update(UploadTask)
+            .where(UploadTask.task_id == task_id, UploadTask.book_id.is_(None))
+            .values(book_id=book_id),
+        )
+
+
+def _book_committed(book_id: UUID) -> bool:
+    """True when a ``global_books`` row exists for *book_id*.
+
+    The ``global_books`` commit is the LAST step of the new-book path's
+    transactional tail, so its presence is the authoritative "previous
+    attempt finished" signal for a claimed book_id.
+    """
+    sf = get_sync_session_factory()
+    with sf() as session:
+        row = session.execute(
+            select(GlobalBook.book_id).where(GlobalBook.book_id == book_id),
+        ).first()
+    return row is not None
+
+
+def _scrub_partial_vectors(*, client: MilvusClient, book_id: UUID) -> None:
+    """Delete whatever vectors a crashed attempt flushed for *book_id*.
+
+    Runs only on the redelivery path, before re-inserting under the same
+    ``book_id`` — without the scrub the re-run would double every vector.
+    A 0-row delete (crash landed before the Milvus insert) is harmless.
+    ``book_id`` is a UUID object minted by this module, never client
+    input, so the filter interpolation cannot be injected into.
+    """
+    client.delete(collection_name=COLLECTION_NAME, filter=f'book_id == "{book_id}"')
+    client.flush(collection_name=COLLECTION_NAME)
+
+
 def _upsert_user_library(*, user_id: UUID, book_id: UUID) -> None:
     """Ensure a ``user_library`` row binding *user_id* → *book_id* exists.
 
@@ -256,6 +356,7 @@ def ingest_markdown(
     title: str | None = None,
     author: str | None = None,
     original: bytes | Path | None = None,
+    task_id: UUID | None = None,
 ) -> IngestResult:
     """Dedup-aware ingest from already-extracted markdown.
 
@@ -275,6 +376,13 @@ def ingest_markdown(
     record the key in ``global_books.text_pointer``; dup-hits backfill
     the existing row's NULL pointer. ``None`` (the synthetic-markdown
     test seam) skips persistence entirely.
+
+    *task_id* is the Celery task UUID (Phase 20). When the matching
+    ``upload_tasks`` row exists, the new-book path records its minted
+    ``book_id`` there before any non-transactional write, and a
+    redelivered task converges instead of orphaning the crashed
+    attempt's vectors — see the module docstring ("Task-id claim").
+    ``None`` (manual CLI) keeps the legacy posture.
     """
     title = title if title is not None else filename
     sig = dedup.signature(markdown)
@@ -294,11 +402,42 @@ def ingest_markdown(
         )
 
     client = client if client is not None else make_client()
-    book_id = uuidlib.uuid4()
+    book_id: UUID | None = None
+    if task_id is not None:
+        claimed = _read_claim(task_id)
+        if claimed is not None:
+            if _book_committed(claimed):
+                # Previous attempt finished its transactional tail; only
+                # the ack (or the user_library upsert) was lost. Converge.
+                logger.warning(
+                    "task %s: redelivery after full commit of book %s — converged via claim",
+                    task_id,
+                    claimed,
+                )
+                _upsert_user_library(user_id=user_id, book_id=claimed)
+                return IngestResult(book_id=claimed, was_duplicate=True, rows_inserted=0)
+            # Previous attempt died inside the Milvus-flush → Postgres-commit
+            # window. Scrub its partial vectors and re-run under the SAME
+            # book_id so the originals object key converges too.
+            logger.warning(
+                "task %s: redelivery with uncommitted claim %s — scrubbing partial "
+                "vectors and re-running under the same book_id",
+                task_id,
+                claimed,
+            )
+            _scrub_partial_vectors(client=client, book_id=claimed)
+            book_id = claimed
+    if book_id is None:
+        book_id = uuidlib.uuid4()
+        if task_id is not None:
+            # Claim BEFORE the first non-transactional write (originals
+            # upload below, Milvus insert further down) — see _record_claim.
+            _record_claim(task_id=task_id, book_id=book_id)
     # Persist the original before any chunk/embed/insert work: fail fast
     # while nothing has been written, and never commit a text_pointer
-    # whose object doesn't exist (crash after upload → orphan object,
-    # the accepted posture — see module docstring).
+    # whose object doesn't exist (crash after upload → orphan object on
+    # the claim-less path; claimed re-runs overwrite the same key — see
+    # module docstring).
     text_pointer = (
         storage.put_original(book_id=book_id, filename=filename, data=original)
         if original is not None
@@ -344,13 +483,16 @@ def ingest(
     user_id: UUID,
     client: MilvusClient | None = None,
     dedup_index: Dedup | None = None,
+    task_id: UUID | None = None,
 ) -> IngestResult:
     """Run the full ingest pipeline. Returns the ``IngestResult``.
 
     The file at *path* is the raw original; Phase 31 persists it to the
     originals bucket and records the object key in
     ``global_books.text_pointer`` (new books) or backfills a NULL
-    pointer (dup-hits) — see ``ingest_markdown``.
+    pointer (dup-hits) — see ``ingest_markdown``. *task_id* is the
+    Celery task UUID for the Phase 20 idempotency claim (``None`` on
+    the manual CLI path).
     """
     return ingest_markdown(
         markdown=extract(path),
@@ -360,6 +502,7 @@ def ingest(
         dedup_index=dedup_index,
         title=path.stem,
         original=path,
+        task_id=task_id,
     )
 
 

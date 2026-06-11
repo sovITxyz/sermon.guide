@@ -35,15 +35,18 @@ failed". This module picks **restart picks it up cleanly**:
   (BGE-Large embeddings on CPU); prefetching N reservations behind a
   busy worker would block them on a single slow task.
 
-**Idempotency caveat.** The Phase 6/8 pipeline is NOT crash-safe between
-the Milvus insert and the ``global_books`` write. A re-delivery after a
-mid-task crash can produce orphan vectors (book_id present in Milvus
-with no matching ``global_books`` row). This is a known Phase-9 cost;
-Phase 10+ should add an idempotency token (task-id-keyed dedup row)
-before exposing the queue to untrusted upload traffic. The dedup gate
-*does* catch content re-uploads at the signature layer, so a re-queued
-task that re-runs cleanly converges to the right end state — the orphan
-risk is only between partial inserts.
+**Idempotency (Phase 20).** The pipeline still writes Milvus before the
+``global_books`` commit, but api-enqueued tasks now carry a
+task-id-keyed claim in ``upload_tasks`` (``worker/ingest.py``
+"Task-id claim"): the new-book path records its minted ``book_id`` on
+the row before any non-transactional write, so a redelivery after a
+mid-window crash scrubs the partial vectors and re-runs under the same
+``book_id`` — one consistent record, zero orphans. Claim-less runs
+(manual CLI / ``make enqueue``, no ``upload_tasks`` row) keep the old
+Phase-9 posture: a mid-window crash orphans that attempt's vectors,
+and only the MinHash dedup gate converges fully-committed re-uploads.
+Residual for both: concurrent duplicate execution when the visibility
+timeout expires under a still-running task (documented in ingest.py).
 """
 
 # Celery 5 ships without `py.typed`; same relaxation pattern used in

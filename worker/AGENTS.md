@@ -47,6 +47,48 @@ Make targets (also run from `worker/`):
 | `migrate-down`      | `alembic downgrade -1` (one revision). `make migrate-down REV=base` wipes all the way. |
 | `migrate-new`       | `make migrate-new MSG="describe change"` → `alembic revision --autogenerate`. Review the generated file before committing — autogenerate misses `server_default`, enum diffs, and may rename indexes cosmetically. |
 
+## CI gates (Phase 17)
+
+`.github/workflows/ci.yml` runs four worker-relevant jobs. Post-Phase-16b
+(ADR 0006) there are no local models and no HF cache to provision in CI —
+embeddings are remote DeepInfra calls keyed by `DEEPINFRA_API_KEY`.
+
+- **worker** — lint + typecheck + `uv run pytest` with NO infra and no
+  secrets. Infra-gated tests skip here BY DESIGN; never "fix" a skip by
+  wiring infra into this job.
+- **tenant-isolation** — boots `infra/docker-compose.yml` (`make up`,
+  healthcheck `--wait`), runs `migrate-up` + `bootstrap-milvus` + the
+  WordNet download, then `make -C worker test-isolation` plus the
+  storage + dedup suites with `infra/.env` sourced. A no-skip guard
+  FAILS the job if any of those tests report SKIPPED — the gates must
+  run for real (red, not skipped). Keyless and zero spend: isolation
+  vectors are synthetic (Phase 3) and the Phase 31 storage paths avoid
+  remote embeddings by construction. This is the job to mark REQUIRED
+  in branch protection. Adding a new infra-gated test to those suites?
+  It must pass under the compose stack, or the guard will (correctly)
+  go red.
+- **retrieval-golden** — keyless flavor; skip-passes today (no corpus,
+  no key) but the `golden-loud-skip-guard` step emits a `::warning` +
+  job summary naming the activation path, so the vacuous green is
+  never silent.
+- **retrieval-golden-live** — activates automatically once the operator
+  runs `gh secret set DEEPINFRA_API_KEY` (the filter job probes secret
+  presence; no workflow edit needed). Boots compose and runs the golden
+  + ingest-e2e + embedding weight-parity suites with the key wired —
+  cents per run, cold ingest every run (ephemeral infra means Phase 8
+  dedup idempotency never applies in CI). The golden query rows stay
+  skipped until Phase 23 commits a public-domain CI corpus; infra/key
+  skips in this job are treated as failures, only the corpus-gap skip
+  is tolerated. Fork PRs never receive secrets, so the job skips there.
+
+Env trap to keep in mind for any new CI step: `db/settings.py` and
+`celery_app.py` defaults bake in the dev box's host-port remaps
+(Postgres 54322, Redis 63792), while the compose stack created from
+`infra/.env.example` listens on the standard 5432/6379. Any CI step
+that touches Postgres must source the env first
+(`set -a && . infra/.env && set +a`). Milvus (19530) and MinIO (9000)
+defaults happen to align, which makes a missing source easy to miss.
+
 ## Banned APIs
 
 Enforced via `[tool.ruff.lint.flake8-tidy-imports.banned-api]` in

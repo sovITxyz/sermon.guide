@@ -57,12 +57,16 @@ when needed.
 
 ## Local enforcement vs CI
 
-CI's ``retrieval-golden`` job is gated on ``queries.jsonl`` existing
-(Phase 0 wired it). Without Milvus + corpus in CI, every row skips
-cleanly — the local ``make test-retrieval-golden`` is the real
-enforcement point until a future phase brings Milvus + a curated corpus
-volume online in CI. This mirrors Phase 3's ``test-isolation`` deferral
-note.
+Phase 17 gives CI two flavors of this suite. The keyless
+``retrieval-golden`` job runs it with no infra and no key — every row
+skips, and a loud-skip guard turns that into a ``::warning`` so the
+green is never silent. The keyed ``retrieval-golden-live`` job
+(activates automatically once the ``DEEPINFRA_API_KEY`` repo secret
+exists) boots the compose stack, migrates, bootstraps Milvus, and runs
+this suite live — but the query rows still skip until Phase 23 commits
+a public-domain CI corpus, so the local ``make test-retrieval-golden``
+against the dev corpus remains the ranking-quality enforcement point
+until then.
 """
 
 # pymilvus 2.6 stubs are loose; same relaxations as the rest of worker/.
@@ -179,10 +183,12 @@ def _ensure_golden_user() -> None:
 def golden_corpus() -> Iterator[dict[str, uuid.UUID]]:
     """Ingest every referenced sample once per session; return filename → book_id.
 
-    First-time ingest is slow (BGE-Large CPU ~minutes per book); subsequent
-    sessions are cheap because Phase 8 dedup short-circuits the chunk →
-    embed → insert path on identical content. The fixture is session-scoped
-    so every parametrized test reuses the same corpus.
+    First-time ingest embeds remotely (DeepInfra, ADR 0006 — seconds per
+    book, ~$0.006/book); subsequent sessions are cheap because Phase 8
+    dedup short-circuits the chunk → embed → insert path on identical
+    content. Ephemeral CI infra never gets that discount — every CI run
+    is a cold ingest. The fixture is session-scoped so every
+    parametrized test reuses the same corpus.
     """
     filenames = _referenced_filenames()
     if not filenames:

@@ -28,8 +28,9 @@ test-isolation:
 	uv run pytest tests/test_tenant_isolation.py -v
 
 # Phase 11 golden retrieval regression suite. Requires live Milvus + Postgres
-# + BGE-Large in HF cache + the local sample corpus under tests/samples/.
-# Skips cleanly when any of those are missing — see the module docstring.
+# + DEEPINFRA_API_KEY (embeddings are remote since Phase 16b — ADR 0006) + the
+# local sample corpus under tests/samples/. Skips cleanly when any of those
+# are missing — see the module docstring.
 test-retrieval-golden:
 	set -a && . ../infra/.env && set +a && \
 		uv run pytest tests/test_retrieval_golden.py -v

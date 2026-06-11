@@ -192,6 +192,10 @@ services:
     <<: *logging
     environment:
       <<: *backend-env
+      # Phase 18 boot-guard posture. "prod" is already the ApiSettings
+      # default (fail closed); pinned here so nobody can disarm the
+      # JWT-secret guard by leaking SERMON_API_ENV=dev into the host env.
+      SERMON_API_ENV: prod
       SERMON_API_JWT_SECRET: ${SERMON_API_JWT_SECRET:?generate with `openssl rand -hex 48`}
       SERMON_API_CORS_ORIGINS: ${SERMON_API_CORS_ORIGINS:?JSON list, e.g. ["https://1.2.3.4"]}
       SERMON_API_LLM_PROVIDER: ${SERMON_API_LLM_PROVIDER:-google}

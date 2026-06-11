@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models — Postgres schema for sermon.guide.
 
-The five tables here are the executable form of ``ARCHITECTURE.md`` §4. Keep
+The tables here are the executable form of ``ARCHITECTURE.md`` §4. Keep
 this module schema-only (no queries, no business logic); ``api/`` and worker
 ingest do all the reading and writing.
 
@@ -193,6 +193,55 @@ class UserLibraryEntry(Base):
         UniqueConstraint("user_id", "book_id", name="uq_user_library_user_book"),
         # Hot path: resolve a user's full book_id set for every Milvus search.
         Index("ix_user_library_user_id", "user_id"),
+    )
+
+
+class UploadTask(Base):
+    """Ownership + idempotency record for one enqueued ingest task (Phase 20).
+
+    One row per ``POST /upload``. Two jobs:
+
+    - **Ownership.** ``GET /tasks/{task_id}`` resolves the row scoped to the
+      JWT-derived ``user_id`` — a non-owned or nonexistent task is a uniform
+      404, replacing the Phase 10 "122-bit task_id is the capability" model.
+      The api inserts (and commits) the row *before* ``send_task`` so a crash
+      between the two can never produce a running task its owner cannot see.
+    - **Idempotency claim.** ``book_id`` records the in-flight book a worker
+      attempt minted on the new-book path, written *before* the first
+      non-transactional write (MinIO original, Milvus vectors). On Celery
+      redelivery after a mid-window crash, ``worker/ingest.py`` reads the
+      claim, scrubs the partial vectors, and re-runs under the SAME book_id —
+      converging to one consistent record instead of orphaning the crashed
+      attempt's vectors (the documented Phase 9 window).
+
+    ``task_id`` is the Celery task UUID, minted by the api and passed to
+    ``send_task(task_id=...)`` — never a column default. ``book_id``
+    deliberately has NO foreign key to ``global_books``: the claim exists
+    precisely to name a book whose ``global_books`` row may never land.
+    """
+
+    __tablename__ = "upload_tasks"
+
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # In-flight claim — see class docstring. NULL until a worker attempt
+    # reaches the new-book path; dup-hits never claim (that path is already
+    # idempotent end to end).
+    book_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Hot path: "my uploads" listings + the per-poll ownership check.
+        Index("ix_upload_tasks_user_id", "user_id"),
     )
 
 

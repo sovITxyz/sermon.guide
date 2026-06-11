@@ -42,6 +42,11 @@ dependencies = [
   "psycopg[binary]>=3,<4",
   "celery>=5.4,<6",
   "redis>=5,<9",
+  # Phase 31 originals persistence: minio-py over boto3 — ships `py.typed`
+  # (zero stub relaxations under pyright strict), ~5 small transitive deps
+  # vs botocore's ~80MB, and speaks plain S3 so the future R2/B2 swap stays
+  # endpoint+credentials. Rationale recorded in AGENTS.md.
+  "minio>=7.2,<8",
 ]
 
 [dependency-groups]
@@ -76,6 +81,6 @@ pythonpath = ["."]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["extractors", "chunking.py", "db", "embedding.py", "inference.py", "ingest.py", "scripts", "tests", "celery_app.py", "tasks"]
+include = ["extractors", "chunking.py", "db", "embedding.py", "inference.py", "ingest.py", "scripts", "storage.py", "tests", "celery_app.py", "tasks"]
 venvPath = "."
 venv = ".venv"

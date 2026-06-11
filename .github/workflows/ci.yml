@@ -1,3 +1,26 @@
+# CI — unit gates run keyless and infra-free; the compose-backed job below is
+# where the infra-gated suites must actually RUN (Phase 17). Post-Phase-16b
+# (ADR 0006) there are no local models and no HF cache to provision:
+# embeddings are remote DeepInfra calls, so the only resources CI boots are
+# the docker-compose services (Postgres / Redis / MinIO / Milvus + etcd).
+#
+# Job map:
+#   filter              package-existence outputs + changed-path gate for the
+#                       compose-backed jobs (docs-only PRs skip the infra boot)
+#   worker/api/web      lint + typecheck + unit tests — no infra, no secrets;
+#                       infra-gated tests skip here BY DESIGN. Never "fix" a
+#                       skip by wiring infra into these jobs; that is what
+#                       tenant-isolation is for.
+#   tenant-isolation    boots infra/docker-compose.yml and runs the Phase 3
+#                       isolation + Phase 31 storage + Phase 8 dedup suites
+#                       for real — keyless, zero spend (synthetic vectors; the
+#                       storage paths avoid remote embeddings by design). A
+#                       no-skip guard FAILS the job on any SKIPPED test, so a
+#                       vacuous green is impossible. Operators: mark this job
+#                       REQUIRED in branch protection.
+#   retrieval-golden    Phase 11 regression gate (keyless flavor)
+#   phases-row-flipped  PHASES.md bookkeeping gate for phase-N/* PRs
+
 name: CI
 
 on:
@@ -14,15 +37,19 @@ concurrency:
 
 jobs:
   filter:
-    name: Detect packages with source
+    name: Detect packages + changed paths
     runs-on: ubuntu-latest
     outputs:
       worker: ${{ steps.detect.outputs.worker }}
       api: ${{ steps.detect.outputs.api }}
       web: ${{ steps.detect.outputs.web }}
       retrieval_golden: ${{ steps.detect.outputs.retrieval_golden }}
+      infra_stack: ${{ steps.paths.outputs.infra_stack }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history so the changed-path gate can diff against the PR base.
+          fetch-depth: 0
       - id: detect
         shell: bash
         run: |
@@ -32,6 +59,33 @@ jobs:
             echo "web=$([ -f web/package.json ] && echo true || echo false)"
             echo "retrieval_golden=$([ -f worker/tests/golden/queries.jsonl ] && echo true || echo false)"
           } >> "$GITHUB_OUTPUT"
+      # Changed-path gate for the compose-backed jobs: docs-only PRs must not
+      # pay the multi-minute infra boot. Pushes to main always run the full
+      # gate. Detection failures fail OPEN (run the gate) — this guards a
+      # security check, so "accidentally ran" beats "accidentally skipped".
+      - id: paths
+        name: Changed-path gate for infra jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "push event — infra gates always run on main"
+            echo "infra_stack=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="origin/${GITHUB_BASE_REF}"
+          if ! changed="$(git diff --name-only "${base}...HEAD")"; then
+            echo "::warning title=Changed-path gate failed open::git diff against ${base} failed; running infra gates anyway."
+            echo "infra_stack=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Changed files vs ${base}:"
+          printf '%s\n' "$changed"
+          if printf '%s\n' "$changed" | grep -Eq '^(worker/|api/|infra/|Makefile$|\.github/workflows/ci\.yml$)'; then
+            echo "infra_stack=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "infra_stack=false" >> "$GITHUB_OUTPUT"
+          fi
 
   worker:
     name: worker (lint + typecheck + test)
@@ -98,6 +152,81 @@ jobs:
         run: cd web && pnpm biome check
       - name: Test
         run: cd web && pnpm vitest run
+
+  # Phase 17: the compose-backed gate. Everything here is keyless and free —
+  # isolation vectors are synthetic (Phase 3), the Phase 31 storage tests
+  # avoid remote embeddings by construction, and dedup needs only the WordNet
+  # download. Runs in parallel with `worker` (compose boot overlaps lint).
+  # Cold runs pull ~3-5 GB of images (Milvus dominates); expect ~5-8 min.
+  tenant-isolation:
+    name: tenant-isolation (infra gates)
+    runs-on: ubuntu-latest
+    needs: filter
+    if: needs.filter.outputs.worker == 'true' && needs.filter.outputs.infra_stack == 'true'
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      # `make up` self-creates infra/.env from infra/.env.example (root
+      # Makefile `env` target) and blocks until every compose healthcheck
+      # passes (`docker compose up -d --wait`).
+      - name: Boot infra stack (docker compose --wait)
+        run: make up
+      - name: Install worker deps
+        run: cd worker && uv sync --all-extras --dev
+      # Fresh Postgres has zero tables, and migration 0003 seeds the `meta`
+      # embedding-model row. The make target sources infra/.env itself —
+      # required, because db/settings.py defaults to the dev box's remapped
+      # port (54322) while compose listens on 5432 (see worker/AGENTS.md).
+      - name: Run migrations
+        run: make -C worker migrate-up
+      - name: Bootstrap Milvus collection
+        run: make -C worker bootstrap-milvus
+      - name: Install WordNet corpus (dedup + storage dup-hit gates)
+        run: cd worker && uv run python -c "import nltk; nltk.download('wordnet')"
+      # Exact local enforcement command (CLAUDE.md / ARCHITECTURE.md §7.1).
+      # Milvus env defaults (localhost:19530) match compose; no sourcing needed.
+      - name: Tenant-isolation suite (Phase 3 hard gate)
+        shell: bash
+        env:
+          COLUMNS: "200"
+        run: |
+          set -euo pipefail
+          make -C worker test-isolation 2>&1 | tee /tmp/pytest-isolation.log
+      # Storage layers 2-3 + the whole dedup module run for real with the
+      # stack up. infra/.env MUST be sourced here (Postgres port trap above).
+      - name: Storage + dedup suites (Phase 31 / Phase 8 gates)
+        shell: bash
+        env:
+          COLUMNS: "200"
+        run: |
+          set -euo pipefail
+          set -a && . infra/.env && set +a
+          cd worker
+          uv run pytest tests/test_storage.py tests/test_dedup.py -v -rs 2>&1 | tee /tmp/pytest-storage-dedup.log
+      # The reason this job exists: before Phase 17 these suites skip-passed
+      # in CI and tenant isolation was only ever enforced on the dev box.
+      # Any SKIPPED here means broken wiring, and the job goes RED — the
+      # mutation-proof contract from docs/PHASES.md Phase 17.
+      - name: No-skip guard (gates must run — red, not skipped)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -iE "skipped" /tmp/pytest-isolation.log /tmp/pytest-storage-dedup.log; then
+            echo "::error title=Vacuous green blocked::Infra-gated tests reported SKIPPED with the compose stack up. The matching lines above name the broken wiring — fix it; do not exempt the test."
+            exit 1
+          fi
+          echo "OK: every infra-gated test executed for real."
+      - name: Compose logs (debug)
+        if: failure()
+        run: docker compose -f infra/docker-compose.yml --env-file infra/.env logs --tail=200
+      - name: Teardown infra stack
+        if: always()
+        shell: bash
+        run: |
+          if [ -f infra/.env ]; then make down; else echo "stack never booted"; fi
 
   retrieval-golden:
     name: retrieval-golden (regression gate)

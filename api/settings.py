@@ -5,11 +5,13 @@ have to thread env-var literals through the codebase. ``infra/.env``
 carries the local-dev defaults; Make targets source it before invoking
 uvicorn (see ``api/Makefile``).
 
-The JWT secret default is a placeholder marked ``noqa: S105`` and is
-overridden in production via ``SERMON_API_JWT_SECRET`` — a startup-time
-assertion would also catch a forgotten override, but pydantic's required
-field semantics serve the same purpose if the deployment unsets the
-default. Keep it required-in-spirit: never ship the default to prod.
+The JWT secret defaults to ``DEV_JWT_SECRET`` — a publicly-known
+placeholder (it lives in this repo). ``main.py``'s lifespan guard
+(Phase 18) refuses to boot while it is in effect — unset/empty or still
+the placeholder — unless ``SERMON_API_ENV=dev`` explicitly opts into
+local-dev mode. Production must set ``SERMON_API_JWT_SECRET``; the prod
+compose additionally hard-fails at compose-up without it
+(``infra/docker-compose.prod.yml``).
 """
 
 from __future__ import annotations
@@ -20,11 +22,26 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The local-dev JWT signing secret. Publicly known, so signing tokens with it
+# is equivalent to no auth at all — anyone could mint a valid JWT for any
+# user_id (total tenant-isolation defeat). One constant serves as both the
+# field default and the boot guard's comparand (``main.py``) so the two can
+# never drift.
+DEV_JWT_SECRET = "change-me-in-production-this-is-local-dev-only"  # noqa: S105 — dev placeholder; boot-guarded
+
 
 class ApiSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SERMON_API_", extra="ignore")
 
-    jwt_secret: str = "change-me-in-production-this-is-local-dev-only"  # noqa: S105
+    # Deployment posture (SERMON_API_ENV). Default "prod" = fail closed: any
+    # environment that does not explicitly declare itself dev gets the full
+    # boot guards in ``main.py:lifespan`` (Phase 18 JWT-secret guard; Phase
+    # 19 adds the CORS prod-origin guard). ``make dev`` sources
+    # ``infra/.env``, which sets SERMON_API_ENV=dev — never set "dev" on a
+    # deployment that faces real users.
+    env: Literal["dev", "prod"] = "prod"
+
+    jwt_secret: str = DEV_JWT_SECRET
     jwt_algorithm: str = "HS256"
     # 1 hour token lifetime — long enough for a typical upload flow, short
     # enough that a leaked token's blast radius is bounded. Refresh-token
@@ -64,6 +81,16 @@ class ApiSettings(BaseSettings):
     # gateway (ppq) forwards it is a provider property, probed live per phase
     # row, not assumed.
     llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
+
+    @field_validator("env", mode="before")
+    @classmethod
+    def _empty_env_is_prod(cls, value: object) -> object:
+        """Compose's ``${VAR:-}`` pattern delivers ``""`` for unset — fail closed.
+
+        An empty SERMON_API_ENV must mean "prod posture" (guards armed),
+        not a Literal validation error and not an accidental dev opt-out.
+        """
+        return "prod" if value == "" else value
 
     @field_validator("llm_reasoning_effort", mode="before")
     @classmethod

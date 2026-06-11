@@ -7,8 +7,9 @@ import { NextResponse } from "next/server";
 /**
  * Proxy a Celery task-status poll to the API with the bearer from the cookie.
  * `taskId` is URL-encoded before interpolation so a crafted path segment can't
- * escape the `/tasks/{id}` route on the upstream. (The API treats the task_id
- * as the capability; see api/uploads.py.)
+ * escape the `/tasks/{id}` route on the upstream. (Since Phase 20 the API
+ * authorizes by upload_tasks ownership — non-owned and unknown ids are a
+ * uniform 404, passed through verbatim below; see api/uploads.py.)
  */
 export async function GET(
   _req: Request,

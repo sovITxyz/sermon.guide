@@ -96,11 +96,12 @@ from functools import lru_cache
 
 import openai
 from db import GlobalBook
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import ratelimit
 from auth import CurrentUserDep, SessionDep
 from search import SearchHit, run_search
 from settings import settings
@@ -440,7 +441,21 @@ async def _resolve_titles(
     return {book_id: title for book_id, title in rows}
 
 
-@router.post("", response_model=SummaryResponse)
+async def _summary_rate_limit(current_user: CurrentUserDep) -> None:
+    """Per-USER limiter (Phase 19) — runs BEFORE the expensive pipeline.
+
+    Keyed on the JWT-derived ``user_id``, never the IP: behind the prod web
+    proxy every browser shares one source address, so per-IP keying would
+    let a single user exhaust everyone (and never brake that user). Wired
+    as a route-decorator dependency so a 429 fires before retrieval or the
+    paid LLM call burns anything; FastAPI's per-request dependency cache
+    means ``get_current_user`` still runs exactly once. Defined here (not
+    in ratelimit.py) so ratelimit never imports auth — no import cycle.
+    """
+    await ratelimit.enforce("summary_user", str(current_user.user_id))
+
+
+@router.post("", response_model=SummaryResponse, dependencies=[Depends(_summary_rate_limit)])
 async def search_summary(
     payload: SummaryRequest,
     current_user: CurrentUserDep,

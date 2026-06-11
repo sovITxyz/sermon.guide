@@ -30,15 +30,38 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEV_JWT_SECRET = "change-me-in-production-this-is-local-dev-only"  # noqa: S105 — dev placeholder; boot-guarded
 
 
+def parse_rate(value: str) -> tuple[int, int]:
+    """Parse a ``"<max requests>/<window seconds>"`` rate string, e.g. ``"10/60"``.
+
+    Single source of truth for the rate-limit bucket format (Phase 19):
+    the field validator below rejects malformed env values at process
+    start with a self-diagnosing error, and ``ratelimit.py`` re-parses
+    the validated value at request time.
+    """
+    limit_raw, sep, window_raw = value.partition("/")
+    try:
+        limit, window = int(limit_raw), int(window_raw)
+    except ValueError:
+        sep = ""  # fall through to the shared error below
+        limit = window = 0
+    if not sep or limit < 1 or window < 1:
+        msg = (
+            f"Invalid rate limit {value!r}: expected '<max requests>/<window seconds>' "
+            "with both positive integers, e.g. '10/60'."
+        )
+        raise ValueError(msg)
+    return limit, window
+
+
 class ApiSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SERMON_API_", extra="ignore")
 
     # Deployment posture (SERMON_API_ENV). Default "prod" = fail closed: any
     # environment that does not explicitly declare itself dev gets the full
     # boot guards in ``main.py:lifespan`` (Phase 18 JWT-secret guard; Phase
-    # 19 adds the CORS prod-origin guard). ``make dev`` sources
-    # ``infra/.env``, which sets SERMON_API_ENV=dev — never set "dev" on a
-    # deployment that faces real users.
+    # 19 CORS prod-origin guard). ``make dev`` sources ``infra/.env``, which
+    # sets SERMON_API_ENV=dev — never set "dev" on a deployment that faces
+    # real users.
     env: Literal["dev", "prod"] = "prod"
 
     jwt_secret: str = DEV_JWT_SECRET
@@ -57,7 +80,31 @@ class ApiSettings(BaseSettings):
     # a single misbehaving client from filling /tmp.
     upload_max_bytes: int = 200 * 1024 * 1024
 
+    # Must list the exact prod browser origin(s) outside dev — the lifespan
+    # guard in ``main.py`` (Phase 19) refuses to boot a non-dev process whose
+    # list is empty or contains a wildcard/empty/localhost origin, because
+    # ``main.py`` pairs it with ``allow_credentials=True``.
     cors_origins: list[str] = ["http://localhost:3000"]
+
+    # Phase 19 — client-IP trust for rate limiting. When True, the per-IP
+    # limiter keys on the first X-Forwarded-For entry instead of the TCP
+    # peer. ONLY safe when every network path to this process goes through
+    # a proxy that sets the header itself (prod compose: Caddy discards
+    # client-supplied XFF and writes the real peer; the web proxy forwards
+    # it). Default False = fail closed to the TCP peer address — never
+    # enable where clients can reach :8000 directly.
+    trust_proxy_headers: bool = False
+
+    # Phase 19 — Redis-backed rate-limit buckets, "<max requests>/<window
+    # seconds>" per named bucket (see api/AGENTS.md for the table and
+    # ``ratelimit.py`` for the mechanics). Adding a bucket = one field here
+    # (named ``ratelimit_<bucket>``) + one route dependency. ``enabled`` is
+    # an operational kill switch (false-positive lockouts); Redis-down
+    # already fails open at request time.
+    ratelimit_enabled: bool = True
+    ratelimit_signup_ip: str = "5/60"
+    ratelimit_login_ip: str = "10/60"
+    ratelimit_summary_user: str = "5/60"
 
     # LLM summary agent (Phase 14, transport re-cut in Phase 14b / ADR 0005;
     # ``deepinfra`` provider added Phase 16b / ADR 0006). ``llm_provider`` picks
@@ -91,6 +138,13 @@ class ApiSettings(BaseSettings):
         not a Literal validation error and not an accidental dev opt-out.
         """
         return "prod" if value == "" else value
+
+    @field_validator("ratelimit_signup_ip", "ratelimit_login_ip", "ratelimit_summary_user")
+    @classmethod
+    def _rate_strings_must_parse(cls, value: str) -> str:
+        """A malformed bucket must fail at process start, not at request time."""
+        parse_rate(value)  # raises ValueError with a self-diagnosing message
+        return value
 
     @field_validator("llm_reasoning_effort", mode="before")
     @classmethod

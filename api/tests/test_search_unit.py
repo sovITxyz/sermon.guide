@@ -16,7 +16,10 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from pydantic import ValidationError
 from retrieval import RetrievalHit, _build_milvus_filter, rrf_fuse
+
+from search import SearchRequest
 
 
 def test_build_milvus_filter_quotes_each_uuid() -> None:
@@ -128,3 +131,13 @@ def test_rrf_fuse_respects_limit() -> None:
 
 def test_rrf_fuse_empty_both_arms_returns_empty() -> None:
     assert rrf_fuse(dense=[], sparse=[], limit=10, k=60) == []
+
+
+def test_search_request_forbids_extra_fields() -> None:
+    """Phase 18: a smuggled ``user_id``/``book_ids`` is a hard 422 — the
+    tenant scope comes from the JWT only (closes Phase 12 deviation d).
+    ``model_validate`` because pyright already rejects unknown kwargs."""
+    with pytest.raises(ValidationError):
+        SearchRequest.model_validate({"query": "grace", "user_id": str(uuid.uuid4())})
+    with pytest.raises(ValidationError):
+        SearchRequest.model_validate({"query": "grace", "book_ids": [str(uuid.uuid4())]})

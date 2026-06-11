@@ -1,0 +1,53 @@
+"""Unit tests for ``ApiSettings`` env parsing — the Phase 18 posture field.
+
+``SERMON_API_ENV`` decides whether the boot guards in ``main.py`` are
+armed. The parsing rules pinned here are security-relevant: the default
+and the compose ``${VAR:-}`` empty-string case must BOTH resolve to
+``"prod"`` (fail closed — guards armed), and only the explicit ``"dev"``
+string may opt out. The lifespan guard itself is covered in
+``test_main_unit.py``; this file owns the settings layer.
+"""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from settings import DEV_JWT_SECRET, ApiSettings
+
+
+def test_env_defaults_to_prod(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset SERMON_API_ENV must mean guards armed, not an accidental opt-out."""
+    monkeypatch.delenv("SERMON_API_ENV", raising=False)
+    assert ApiSettings().env == "prod"
+
+
+def test_env_dev_is_an_explicit_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SERMON_API_ENV", "dev")
+    assert ApiSettings().env == "dev"
+
+
+def test_env_empty_string_is_prod(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compose's ``${VAR:-}`` delivers ``""`` for unset — must fail closed."""
+    monkeypatch.setenv("SERMON_API_ENV", "")
+    assert ApiSettings().env == "prod"
+
+
+def test_env_rejects_unknown_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo like ``production`` must fail loud, not silently arm/disarm."""
+    monkeypatch.setenv("SERMON_API_ENV", "production")
+    with pytest.raises(ValidationError):
+        ApiSettings()
+
+
+def test_default_jwt_secret_is_the_guard_comparand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One constant serves as field default AND guard comparand — no drift.
+
+    If the field default ever diverges from ``DEV_JWT_SECRET``, the boot
+    guard in ``main.py`` would stop recognizing the placeholder and a
+    forgotten ``SERMON_API_JWT_SECRET`` would serve forgeable JWTs.
+    """
+    monkeypatch.delenv("SERMON_API_JWT_SECRET", raising=False)
+    assert ApiSettings().jwt_secret == DEV_JWT_SECRET

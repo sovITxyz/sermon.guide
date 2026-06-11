@@ -16,8 +16,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi import HTTPException
 from jose import jwt
+from pydantic import ValidationError
 
-from auth import _hash_password, _issue_token, _verify_password
+from auth import LoginRequest, SignupRequest, _hash_password, _issue_token, _verify_password
 from settings import settings
 
 
@@ -49,3 +50,21 @@ def test_issue_token_encodes_sub_and_exp() -> None:
     exp = datetime.fromtimestamp(claims["exp"], tz=UTC)
     assert exp > now
     assert exp <= now + timedelta(seconds=settings.jwt_ttl_seconds + 5)
+
+
+def test_signup_request_forbids_extra_fields() -> None:
+    """Phase 18 posture: a smuggled field is a hard 422, never dropped.
+
+    ``model_validate`` rather than kwargs — pyright's synthesized
+    ``__init__`` rejects unknown kwargs at type-check time, but the wire
+    payload arrives as a dict.
+    """
+    with pytest.raises(ValidationError):
+        SignupRequest.model_validate(
+            {"email": "a@example.com", "password": "longenough", "user_id": "evil"}
+        )
+
+
+def test_login_request_forbids_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        LoginRequest.model_validate({"email": "a@example.com", "password": "pw", "role": "admin"})

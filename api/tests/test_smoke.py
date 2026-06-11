@@ -22,6 +22,7 @@ def test_healthz_route_is_registered() -> None:
 
     paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
     assert "/healthz" in paths
+    assert "/readyz" in paths
     assert "/auth/signup" in paths
     assert "/auth/login" in paths
     assert "/upload" in paths

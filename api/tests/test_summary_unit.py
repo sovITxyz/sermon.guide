@@ -145,6 +145,18 @@ def test_request_defaults_and_bounds() -> None:
         summary_module.SummaryRequest(query="q", limit_chunks=0)
 
 
+def test_request_forbids_extra_fields() -> None:
+    """Phase 18: smuggled tenant-scope fields are a hard 422, never dropped.
+
+    ``model_validate`` because pyright already rejects unknown kwargs at
+    type-check time — the wire payload arrives as a dict.
+    """
+    with pytest.raises(ValidationError):
+        summary_module.SummaryRequest.model_validate({"query": "q", "user_id": "evil"})
+    with pytest.raises(ValidationError):
+        summary_module.SummaryRequest.model_validate({"query": "q", "book_ids": ["x"]})
+
+
 # --- citation labels -------------------------------------------------------
 
 

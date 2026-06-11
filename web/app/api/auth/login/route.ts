@@ -1,5 +1,5 @@
 import { apiBaseUrl } from "@/lib/config";
-import { errorDetail } from "@/lib/http";
+import { clientIpHeaders, errorDetail } from "@/lib/http";
 import { SESSION_COOKIE, sessionCookieOptions } from "@/lib/session";
 import { NextResponse } from "next/server";
 
@@ -17,9 +17,11 @@ export async function POST(req: Request): Promise<Response> {
     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
   }
 
+  // clientIpHeaders: the API's per-IP login limiter (Phase 19) needs the real
+  // client address — without it every browser collapses into this server's IP.
   const res = await fetch(`${apiBaseUrl()}/auth/login`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...clientIpHeaders(req) },
     body: JSON.stringify({ email: body.email, password: body.password }),
     cache: "no-store",
   });

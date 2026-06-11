@@ -26,6 +26,7 @@ from inference import MissingInferenceKeyError, RemoteInferenceError
 
 import auth
 import library
+import readyz
 import search
 import summary
 import uploads
@@ -111,6 +112,7 @@ app.include_router(library.router)
 app.include_router(uploads.router)
 app.include_router(search.router)
 app.include_router(summary.router)
+app.include_router(readyz.router)
 
 
 @app.get("/healthz", tags=["meta"])

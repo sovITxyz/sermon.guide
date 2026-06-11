@@ -87,12 +87,14 @@ class ApiSettings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000"]
 
     # Phase 19 — client-IP trust for rate limiting. When True, the per-IP
-    # limiter keys on the first X-Forwarded-For entry instead of the TCP
-    # peer. ONLY safe when every network path to this process goes through
-    # a proxy that sets the header itself (prod compose: Caddy discards
-    # client-supplied XFF and writes the real peer; the web proxy forwards
-    # it). Default False = fail closed to the TCP peer address — never
-    # enable where clients can reach :8000 directly.
+    # limiter keys on the RIGHTMOST X-Forwarded-For entry (the hop written
+    # by our own proxy — unforgeable whether Caddy replaces inbound XFF,
+    # the modern >=2.5 default, or appends; see ratelimit.client_ip) and
+    # only if it parses as an IP address. ONLY safe when every network
+    # path to this process goes through a proxy that sets the header
+    # itself (prod compose: Caddy -> web -> api). Default False = fail
+    # closed to the TCP peer address — never enable where clients can
+    # reach :8000 directly.
     trust_proxy_headers: bool = False
 
     # Phase 19 — Redis-backed rate-limit buckets, "<max requests>/<window

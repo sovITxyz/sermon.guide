@@ -47,4 +47,12 @@ EXPOSE 8000
 # requests fine. The Phase 16b RAM rationale (N × 3.7GB of models) is gone,
 # but the box is small and the bottleneck is provider wall-time, not async
 # I/O — revisit only if traffic data says otherwise.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# --no-proxy-headers (Phase 19): uvicorn DEFAULTS proxy_headers to on, which
+# silently rewrites request.client from X-Forwarded-For for peers in its
+# allow-list (default 127.0.0.1) — an invisible second trust knob that let
+# loopback clients spoof the per-IP rate-limit buckets in dev. Disabling it
+# makes request.client always the true TCP peer; XFF trust is exclusively
+# the explicit, env-gated SERMON_API_TRUST_PROXY_HEADERS decision in
+# ratelimit.client_ip (api/AGENTS.md "Rate limiting").
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

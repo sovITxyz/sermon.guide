@@ -24,10 +24,10 @@ Design notes:
   monkeypatched tests are honored at request time, never frozen at
   import.
 - **Keys**: per-IP buckets key on :func:`client_ip` — the TCP peer by
-  default, or the first ``X-Forwarded-For`` entry when
-  ``SERMON_API_TRUST_PROXY_HEADERS=true`` (only safe behind a proxy hop
-  that writes the header itself; prod compose: Caddy discards
-  client-supplied XFF, the web proxies forward Caddy's value). Per-user
+  default, or the RIGHTMOST ``X-Forwarded-For`` entry when
+  ``SERMON_API_TRUST_PROXY_HEADERS=true`` (rightmost = written by our own
+  proxy hop, unforgeable by clients whether Caddy replaces inbound XFF
+  (modern default) or appends to it; see :func:`client_ip`). Per-user
   buckets key on the JWT-derived ``user_id`` — behind the prod web proxy
   every browser shares ONE source IP, so per-IP keying there would let
   one user exhaust everyone.
@@ -132,17 +132,24 @@ def client_ip(request: Request) -> str:
     """Best-available client identity for per-IP buckets.
 
     Fail-closed default: the TCP peer address. Only when
-    ``SERMON_API_TRUST_PROXY_HEADERS=true`` does the first
-    ``X-Forwarded-For`` entry win — set it ONLY where every network path
-    to this process crosses a proxy that writes the header itself
-    (prod compose; see settings.py). With trust off, a client-supplied
-    XFF is ignored entirely, so it can't be used to dodge the bucket.
+    ``SERMON_API_TRUST_PROXY_HEADERS=true`` does ``X-Forwarded-For`` win —
+    and then the RIGHTMOST entry, never the leftmost. Rationale: the
+    rightmost hop is the one written by the proxy closest to us, the only
+    part of the list a client cannot forge. Modern Caddy (≥2.5) replaces a
+    client-supplied XFF outright (single, attested entry — rightmost ==
+    leftmost), but if any hop ever APPENDS instead (older proxies, config
+    drift), a client-prepended ``spoofed, real-ip`` list still keys on
+    ``real-ip``. Leftmost parsing would let an attacker rotate the bucket
+    per request. Our web proxy forwards Caddy's header verbatim and adds
+    no hop of its own (web/lib/http.ts). Revisit only if a CDN/multi-hop
+    chain lands in front of Caddy. With trust off, client-supplied XFF is
+    ignored entirely.
     """
     if settings.trust_proxy_headers:
         forwarded = request.headers.get("x-forwarded-for", "")
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
+        last = forwarded.split(",")[-1].strip()
+        if last:
+            return last
     return request.client.host if request.client else "unknown"
 
 

@@ -170,12 +170,27 @@ def test_client_ip_defaults_to_tcp_peer_and_ignores_xff(
     assert ratelimit.client_ip(req) == "10.0.0.7"
 
 
-def test_client_ip_uses_first_xff_entry_when_trusted(
+def test_client_ip_uses_rightmost_xff_entry_when_trusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Rightmost = written by our own proxy; leftmost is client-forgeable.
+
+    A client prepending ``spoofed,`` to the list (the append-style proxy
+    world) must NOT rotate the bucket key — the proxy-written rightmost
+    entry wins. With modern Caddy (replaces inbound XFF) the list is a
+    single attested entry and rightmost == leftmost.
+    """
     monkeypatch.setattr(settings, "trust_proxy_headers", True)
-    req = _request({"X-Forwarded-For": "203.0.113.9, 10.0.0.2"})
+    # Single attested entry (modern Caddy replace behavior).
+    req = _request({"X-Forwarded-For": "203.0.113.9"})
     assert ratelimit.client_ip(req) == "203.0.113.9"
+    # Append-style world: client prepended a spoof; rightmost still wins.
+    req = _request({"X-Forwarded-For": "6.6.6.6, 203.0.113.9"})
+    assert ratelimit.client_ip(req) == "203.0.113.9"
+    # Spoof rotation attempt: different leftmost, same attested rightmost
+    # -> same bucket key.
+    req2 = _request({"X-Forwarded-For": "7.7.7.7, 203.0.113.9"})
+    assert ratelimit.client_ip(req2) == ratelimit.client_ip(req)
 
 
 def test_client_ip_trusted_but_no_header_falls_back_to_peer(

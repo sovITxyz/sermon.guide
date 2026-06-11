@@ -1,11 +1,13 @@
 /**
  * Forward the real client IP to the API for per-IP rate limiting (Phase 19).
  *
- * In prod the inbound X-Forwarded-For is trustworthy end-to-end: Caddy is the
- * only host-published service and it DISCARDS any client-supplied XFF (no
- * trusted_proxies configured), writing the true TCP peer instead — so the
- * value this handler receives is Caddy-attested, and forwarding it verbatim
- * preserves that attestation. The API only honors the header when
+ * In prod the inbound X-Forwarded-For comes from Caddy, the only
+ * host-published service. Modern Caddy (>=2.5, no trusted_proxies) REPLACES a
+ * client-supplied XFF with the true TCP peer; even if a hop ever APPENDED
+ * instead, the rightmost entry is still proxy-written. This handler forwards
+ * the header verbatim and adds no hop of its own, and the API keys on the
+ * RIGHTMOST entry (api/ratelimit.py:client_ip) — unforgeable under both
+ * proxy behaviors. The API only honors the header when
  * SERMON_API_TRUST_PROXY_HEADERS=true (set by the prod compose); in dev the
  * API ignores it and keys on the TCP peer, so forwarding unconditionally here
  * is safe everywhere.

@@ -55,14 +55,24 @@ celery_client.conf.update(
 )
 
 
-def enqueue_ingest(*, path: str, user_id: str) -> str:
+def enqueue_ingest(*, path: str, user_id: str, task_id: str) -> str:
     """Enqueue a single ingest task and return the Celery ``task_id``.
 
     Strings are passed by name to match the worker's task signature
     (``tasks.ingest.ingest_book(path, user_id)``). Both are
     JSON-serializable — Celery's default serializer is ``json``.
+
+    *task_id* is REQUIRED and minted by the caller (Phase 20): the
+    ``/upload`` route commits the ``upload_tasks`` ownership/idempotency
+    row under that UUID *before* this call, so the id must exist before
+    Celery sees the message. Letting Celery mint it here would reopen
+    the crash window where a task runs without an owner row.
     """
-    async_result = celery_client.send_task(INGEST_TASK_NAME, args=[path, user_id])
+    async_result = celery_client.send_task(
+        INGEST_TASK_NAME,
+        args=[path, user_id],
+        task_id=task_id,
+    )
     return async_result.id
 
 

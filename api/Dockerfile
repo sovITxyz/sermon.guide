@@ -31,8 +31,11 @@ RUN uv sync --frozen --no-dev
 FROM python:3.12-slim
 # ca-certificates: HTTPS to the inference endpoints (api.deepinfra.com) and
 # the LLM endpoint (generativelanguage.googleapis.com / api.ppq.ai).
+# libmagic1: the Phase 20 /upload content sniff — python-magic is a ctypes
+# wrapper, the shared library is a system package (worker/AGENTS.md
+# "System binaries"; GitHub's ubuntu runners ship it with `file`).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/api/.venv /app/api/.venv
 COPY worker/ /app/worker/

@@ -202,10 +202,13 @@ jobs:
         run: make -C worker migrate-up
       - name: Bootstrap Milvus collection
         run: make -C worker bootstrap-milvus
-      # nltk.download() returns False on failure WITHOUT raising — first live
-      # run proved it (download died in 200ms, step exited 0, the no-skip
-      # guard caught the cascade). raise_on_error + retry + verify with the
-      # EXACT probe the suites use, so a download problem fails HERE.
+      # Two live-run findings baked in here: (1) nltk.download() returns False
+      # on failure WITHOUT raising — the first run died silently in 200ms and
+      # the no-skip guard caught the cascade; (2) nltk 3.9 leaves wordnet as
+      # an UNEXTRACTED zip that nltk.data.find("corpora/wordnet") — the exact
+      # probe the suites and worker/dedup.py use — cannot resolve (the dev box
+      # only works because its copy was extracted long ago). So: raise_on_error
+      # + retry, extract the zip, then verify with the real probe.
       - name: Install WordNet corpus (dedup + storage dup-hit gates)
         shell: bash
         run: |
@@ -218,7 +221,19 @@ jobs:
             echo "::warning::nltk wordnet download attempt ${attempt} failed; retrying"
             sleep 5
           done
-          uv run python -c "import nltk; print('WordNet at:', nltk.data.find('corpora/wordnet'))"
+          uv run python - <<'PY'
+          import pathlib
+          import zipfile
+
+          import nltk
+
+          for p in map(pathlib.Path, nltk.data.path):
+              z = p / "corpora" / "wordnet.zip"
+              if z.exists() and not (p / "corpora" / "wordnet").exists():
+                  zipfile.ZipFile(z).extractall(p / "corpora")
+                  print(f"extracted {z}")
+          print("WordNet at:", nltk.data.find("corpora/wordnet"))
+          PY
       # Exact local enforcement command (CLAUDE.md / ARCHITECTURE.md §7.1).
       # Milvus env defaults (localhost:19530) match compose; no sourcing needed.
       - name: Tenant-isolation suite (Phase 3 hard gate)
@@ -337,8 +352,8 @@ jobs:
         run: make -C worker migrate-up
       - name: Bootstrap Milvus collection
         run: make -C worker bootstrap-milvus
-      # Same hardened install as tenant-isolation: raise_on_error + retry +
-      # probe-verify (nltk.download() returns False without raising).
+      # Same hardened install as tenant-isolation: raise_on_error + retry,
+      # extract the nltk-3.9 unextracted zip, probe-verify.
       - name: Install WordNet corpus
         shell: bash
         run: |
@@ -351,7 +366,19 @@ jobs:
             echo "::warning::nltk wordnet download attempt ${attempt} failed; retrying"
             sleep 5
           done
-          uv run python -c "import nltk; print('WordNet at:', nltk.data.find('corpora/wordnet'))"
+          uv run python - <<'PY'
+          import pathlib
+          import zipfile
+
+          import nltk
+
+          for p in map(pathlib.Path, nltk.data.path):
+              z = p / "corpora" / "wordnet.zip"
+              if z.exists() and not (p / "corpora" / "wordnet").exists():
+                  zipfile.ZipFile(z).extractall(p / "corpora")
+                  print(f"extracted {z}")
+          print("WordNet at:", nltk.data.find("corpora/wordnet"))
+          PY
       # Golden rows skip on the missing corpus until Phase 23; the ingest
       # dedup-roundtrip e2e, the embedding weight-parity trio, and the
       # golden embedder-dim guard run live today.

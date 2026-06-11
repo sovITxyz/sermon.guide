@@ -31,6 +31,16 @@ updates:
     groups:
       web-deps:
         patterns: ["*"]
+    # Majors deferred while the v2 sermon-workflow phases (31-46) build on the
+    # locked stack: Next 15 + React 19 + Tailwind v3 (Phase 15 deviation iii)
+    # + TS 5 + Biome 1 + Vitest 2 — the TipTap/calendar designs were
+    # fact-checked against exactly these (docs/PHASES.md v2 Product Backlog).
+    # Patches/minors keep flowing. Revisit at the post-Phase-30 re-audit as a
+    # deliberate migration phase; PR #33 (7-update major group) closed under
+    # this policy 2026-06-11.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker
     directory: /infra

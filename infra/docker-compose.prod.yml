@@ -197,7 +197,23 @@ services:
       # JWT-secret guard by leaking SERMON_API_ENV=dev into the host env.
       SERMON_API_ENV: prod
       SERMON_API_JWT_SECRET: ${SERMON_API_JWT_SECRET:?generate with `openssl rand -hex 48`}
+      # Phase 19 lifespan guard: outside dev the api refuses to boot when this
+      # is empty or contains a wildcard/empty/localhost origin — it is paired
+      # with allow_credentials=True. List the EXACT browser origin(s).
       SERMON_API_CORS_ORIGINS: ${SERMON_API_CORS_ORIGINS:?JSON list, e.g. ["https://1.2.3.4"]}
+      # Phase 19 — api-layer rate limiting (second layer behind Caddy's edge
+      # zones; Redis db 2, see api/AGENTS.md). TRUST_PROXY_HEADERS is safe
+      # here and ONLY here: the api has no published port, its TCP peers are
+      # compose services, and the web auth proxies forward the Caddy-attested
+      # X-Forwarded-For (Caddy discards client-supplied XFF). Never enable it
+      # where clients can reach :8000 directly. Limits are "<max>/<window s>";
+      # ENABLED=false is the operational kill switch (Redis-down already
+      # fails open at request time).
+      SERMON_API_TRUST_PROXY_HEADERS: "true"
+      SERMON_API_RATELIMIT_ENABLED: ${SERMON_API_RATELIMIT_ENABLED:-true}
+      SERMON_API_RATELIMIT_SIGNUP_IP: ${SERMON_API_RATELIMIT_SIGNUP_IP:-5/60}
+      SERMON_API_RATELIMIT_LOGIN_IP: ${SERMON_API_RATELIMIT_LOGIN_IP:-10/60}
+      SERMON_API_RATELIMIT_SUMMARY_USER: ${SERMON_API_RATELIMIT_SUMMARY_USER:-5/60}
       SERMON_API_LLM_PROVIDER: ${SERMON_API_LLM_PROVIDER:-google}
       SERMON_API_LLM_MODEL: ${SERMON_API_LLM_MODEL:-}
       # Phase 16b latency lever: "none" disables Gemini 2.5 Flash thinking on

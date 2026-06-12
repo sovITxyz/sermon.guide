@@ -1,7 +1,9 @@
 "use client";
 
+import { readHref } from "@/lib/library";
 import { displaySection, formatElapsed, searchQueryProblem, segmentSummary } from "@/lib/summary";
 import type { SummaryResponse } from "@/lib/types";
+import Link from "next/link";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 // Cards clamp the passage to a few lines; only passages long enough to
@@ -180,6 +182,12 @@ export function SearchPanel() {
                         {section ? `${section} · ` : ""}
                         chunk {citation.chunk_index}
                       </span>
+                      <Link
+                        href={readHref(citation.book_id, citation.chunk_index)}
+                        className="text-blue-600 text-xs hover:underline"
+                      >
+                        Read in context
+                      </Link>
                     </div>
                     <p
                       className={`whitespace-pre-wrap text-gray-600 text-sm ${

@@ -17,6 +17,11 @@ load.
   the active provider's pinned model through `chat.completions.create`, and
   fails loud (502) on an upstream `openai.APIError`, an empty completion, or
   a choices-less response.
+- Reasoning effort: with SERMON_API_LLM_REASONING_EFFORT unset, the active
+  provider row's `default_reasoning_effort` rides extra_body — "none" on
+  deepinfra (whose served Gemini 2.5 Flash otherwise inlines a literal
+  <think> block into the summary text; live finding 2026-06-12), omitted on
+  google/ppq. A set env value always wins.
 - Provider resolution (Phase 14b, ADR 0005): default is deepinfra (operator
   decision 2026-06-12, amending ADR 0005's original google default); flipping
   to google/ppq picks that arm's base_url/model/key; SERMON_API_LLM_MODEL
@@ -318,14 +323,19 @@ def test_generate_summary_wires_config_and_returns_text(monkeypatch: pytest.Monk
     assert "q?" in user["content"]
 
 
-def test_generate_summary_omits_reasoning_effort_by_default(
+@pytest.mark.parametrize("provider", ["google", "ppq"])
+def test_generate_summary_omits_reasoning_effort_by_default_on_google_and_ppq(
     monkeypatch: pytest.MonkeyPatch,
+    provider: str,
 ) -> None:
-    """Unset SERMON_API_LLM_REASONING_EFFORT → nothing extra on the wire.
+    """Unset SERMON_API_LLM_REASONING_EFFORT → nothing extra on the wire (google/ppq).
 
-    Phase 16b: the knob must be opt-in — gateways that reject unknown
-    params (or models that error on them) keep working untouched.
+    Phase 16b: the knob must be opt-in on these rows — ppq's chat.completions
+    tolerance of reasoning_effort is unprobed (ADR 0006), and google's compat
+    layer already keeps thinking out of the returned text. Gateways that
+    reject unknown params keep working untouched.
     """
+    monkeypatch.setattr(summary_module.settings, "llm_provider", provider)
     monkeypatch.setattr(summary_module.settings, "llm_reasoning_effort", None)
     fake = _FakeClient(text="ok")
     monkeypatch.setattr(summary_module, "_client", lambda: fake)
@@ -334,6 +344,28 @@ def test_generate_summary_omits_reasoning_effort_by_default(
     summary_module._generate_summary(query="q", sources=sources)
 
     assert fake.calls[0]["extra_body"] is None
+
+
+def test_generate_summary_defaults_reasoning_none_on_deepinfra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset SERMON_API_LLM_REASONING_EFFORT + deepinfra → reasoning_effort=none.
+
+    DeepInfra-served Gemini 2.5 Flash otherwise inlines a literal
+    <think>...</think> block into message.content (live finding 2026-06-12),
+    so the row's default_reasoning_effort="none" must reach the wire with no
+    operator env edits. deepinfra is the default provider, so this IS the
+    out-of-the-box request shape.
+    """
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "deepinfra")
+    monkeypatch.setattr(summary_module.settings, "llm_reasoning_effort", None)
+    fake = _FakeClient(text="ok")
+    monkeypatch.setattr(summary_module, "_client", lambda: fake)
+    sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
+
+    summary_module._generate_summary(query="q", sources=sources)
+
+    assert fake.calls[0]["extra_body"] == {"reasoning_effort": "none"}
 
 
 def test_generate_summary_sends_reasoning_effort_when_configured(
@@ -346,6 +378,7 @@ def test_generate_summary_sends_reasoning_effort_when_configured(
     extra_body (not the SDK's typed param) so values the SDK literal
     hasn't caught up to still pass through.
     """
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
     monkeypatch.setattr(summary_module.settings, "llm_reasoning_effort", "none")
     fake = _FakeClient(text="ok")
     monkeypatch.setattr(summary_module, "_client", lambda: fake)
@@ -354,6 +387,25 @@ def test_generate_summary_sends_reasoning_effort_when_configured(
     summary_module._generate_summary(query="q", sources=sources)
 
     assert fake.calls[0]["extra_body"] == {"reasoning_effort": "none"}
+
+
+def test_generate_summary_env_reasoning_effort_beats_provider_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A set SERMON_API_LLM_REASONING_EFFORT overrides the deepinfra row default.
+
+    The env knob stays the operator's lever: e.g. "medium" re-enables thinking
+    on deepinfra despite the row's default_reasoning_effort="none".
+    """
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "deepinfra")
+    monkeypatch.setattr(summary_module.settings, "llm_reasoning_effort", "medium")
+    fake = _FakeClient(text="ok")
+    monkeypatch.setattr(summary_module, "_client", lambda: fake)
+    sources = summary_module._build_sources([_hit(1, 0)], {uuid.UUID(int=1): "Faith"})
+
+    summary_module._generate_summary(query="q", sources=sources)
+
+    assert fake.calls[0]["extra_body"] == {"reasoning_effort": "medium"}
 
 
 def test_generate_summary_raises_502_on_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -601,9 +653,14 @@ def test_provider_defaults_to_deepinfra(monkeypatch: pytest.MonkeyPatch) -> None
     """
     monkeypatch.delenv("SERMON_API_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("SERMON_API_LLM_MODEL", raising=False)
+    monkeypatch.delenv("SERMON_API_LLM_REASONING_EFFORT", raising=False)
     fresh = ApiSettings()
     assert fresh.llm_provider == "deepinfra"
     assert fresh.llm_model is None
+    # The settings-level knob stays None by default — the think-free default
+    # experience is the deepinfra row's default_reasoning_effort, NOT a global
+    # settings default (ppq's chat.completions tolerance is unprobed).
+    assert fresh.llm_reasoning_effort is None
 
 
 def test_provider_map_pins_endpoints_models_keys() -> None:
@@ -612,15 +669,23 @@ def test_provider_map_pins_endpoints_models_keys() -> None:
     assert google.base_url == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert google.default_model == "gemini-2.5-flash"
     assert google.key_env_var == "GOOGLE_API_KEY"
+    assert google.default_reasoning_effort is None
     ppq = summary_module._PROVIDERS["ppq"]
     assert ppq.base_url == "https://api.ppq.ai/v1"
     assert ppq.default_model == "google/gemini-2.5-flash"
     assert ppq.key_env_var == "PPQ_API_KEY"
+    # ppq's chat.completions tolerance of reasoning_effort is unprobed (ADR
+    # 0006) — the row must never grow a default that puts it on the wire
+    # without a live probe first.
+    assert ppq.default_reasoning_effort is None
     # Phase 16b: DeepInfra reuses the embeddings base_url + DEEPINFRA_API_KEY.
     deepinfra = summary_module._PROVIDERS["deepinfra"]
     assert deepinfra.base_url == "https://api.deepinfra.com/v1/openai"
     assert deepinfra.default_model == "google/gemini-2.5-flash"
     assert deepinfra.key_env_var == "DEEPINFRA_API_KEY"
+    # Think-free by default: DeepInfra inlines <think> into the summary text
+    # without it (live finding 2026-06-12).
+    assert deepinfra.default_reasoning_effort == "none"
 
 
 def test_deepinfra_flip_constructs_client_with_deepinfra_base_url_and_key(

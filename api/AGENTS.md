@@ -45,7 +45,15 @@ rules are here so the audit isn't your first line of defense.
   dense arm — the sparse arm is just a different index, the tenant
   scoping rule is identical.
 - **Every SQLAlchemy query against `user_library` / `highlights` /
-  `collections` MUST filter by `user_id`** derived from the JWT.
+  `collections` / `reading_positions` MUST filter by `user_id`** derived
+  from the JWT. For `reading_positions` that includes JOINs: the
+  `/library` progress join is ON (user_id AND book_id) — `book_id` alone
+  leaks another tenant's position for a shared deduped book (Phase 32).
+- **`chunks` has no `user_id` BY DESIGN** — the tenant gate for reading
+  a book's text is `user_library` membership, resolved per request
+  (`reader._membership_stmt`) BEFORE any chunk query runs. Non-owned,
+  nonexistent, and non-UUID `book_id`s are the same 404 (the
+  cross-tenant-404 rule below).
 
 ## Adding a route
 

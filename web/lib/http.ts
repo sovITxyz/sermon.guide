@@ -18,6 +18,23 @@ export function clientIpHeaders(req: Request): Record<string, string> {
 }
 
 /**
+ * Re-emit an upstream response byte-for-byte: status + body bytes +
+ * content-type, nothing else. The reader proxies use this for the uniform
+ * 404 — api/reader.py collapses non-UUID, nonexistent, and non-owned book
+ * ids into one identical `{"detail": "Book not found."}` body (the
+ * no-existence-oracle contract), and passing it through verbatim keeps that
+ * parity a property of the API alone instead of one this layer re-derives.
+ */
+export async function passthroughResponse(res: Response): Promise<Response> {
+  const headers: Record<string, string> = {};
+  const contentType = res.headers.get("content-type");
+  if (contentType) {
+    headers["content-type"] = contentType;
+  }
+  return new Response(await res.arrayBuffer(), { status: res.status, headers });
+}
+
+/**
  * Extract a human-readable message from a FastAPI error response without
  * leaking internals to the browser. FastAPI returns `{detail: string}` for
  * handled HTTPExceptions and `{detail: [...]}` for 422 validation errors; we

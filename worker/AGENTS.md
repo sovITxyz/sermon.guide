@@ -163,6 +163,10 @@ skips when absent so CI doesn't fail on a 503.
 and `end_idx` are character offsets into the source markdown — they are
 the citation anchor downstream. `parent_section` is the nearest ATX heading
 above the chunk, best-effort; `None` for chunks before the first heading.
+**Invariant (Phase 21):** `parent_section` is stripped of markup at capture
+via `chunking.clean_heading()` (headings that strip to empty are dropped,
+falling back to the previous real heading or `None` — never `""`);
+maintenance/backfill scripts MUST reuse that function, not reimplement it.
 
 CLI (from `worker/`):
 
@@ -530,6 +534,31 @@ uv run python -m scripts.backfill_chunks --book-id <uuid>
 Idempotent via the `uq_chunks_book_chunk` unique constraint; safe to
 re-run. The script reads from Milvus (`content_chunk` + `metadata`) so
 it does not re-extract from disk.
+
+### Maintenance scripts (Phase 21)
+
+Two operator scripts share `backfill_chunks`' conventions (argparse,
+`make_client()` + `get_sync_session_factory()`, per-book transactions,
+Makefile targets sourcing `../infra/.env`) but invert its dry-run flag:
+**they delete data, so the default is a dry-run and `--execute` applies**
+(`make clean-parent-sections ARGS=--execute`, `make sweep-orphans
+ARGS=--execute`).
+
+- `scripts/clean_parent_sections.py` — strips HTML debris from stored
+  `chunks.parent_section` and the matching Milvus `metadata.parent_section`
+  by importing `chunking.clean_heading` (the capture-time sanitizer — see
+  the Phase 21 invariant above). Milvus rows are rewritten via query →
+  delete-by-id → reinsert because `library_vectors` has an `auto_id` PK
+  and no partial JSON update; reinsert mints NEW vector ids, so nothing
+  may assume Milvus id stability across a maintenance pass
+  (`highlights.vector_id` is unwritten today).
+- `scripts/sweep_orphans.py` — deletes Milvus vectors whose `book_id` has
+  no `global_books` row, and `global_books` rows with zero `user_library`
+  refs + zero chunks + zero vectors. Any tenant-reachable candidate aborts
+  the whole run (exit 3); in-flight `upload_tasks` claims are skipped;
+  Milvus exprs are built only from allowlist-validated book_ids.
+
+Both are idempotent — a second run finds nothing to do.
 
 ## Milvus client init
 

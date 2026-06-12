@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from chunking import Chunk, _heading_offsets, _parent_section_for, chunk
+from chunking import Chunk, _heading_offsets, _parent_section_for, chunk, clean_heading
 
 SAMPLES = Path(__file__).resolve().parent / "samples"
 EPUB_SAMPLE = SAMPLES / "sample.epub"
@@ -80,6 +80,120 @@ def test_parent_section_before_first_heading_is_none() -> None:
     md = "Preamble text.\n\n# First Heading\n\nbody\n"
     headings = _heading_offsets(md)
     assert _parent_section_for(0, headings) is None
+
+
+# Real parent_section debris captured from the dev DB (Phase 21). pandoc
+# wraps long heading lines at ~72 cols and the ATX regex is per-line, so
+# most of these are truncated mid-tag — the human-readable title sat on the
+# continuation line and was never captured, hence the empty expectations.
+LIVE_DEBRIS: list[tuple[str, str]] = [
+    ('<a href="part0002.html#pt03ch_01" class="calibre4"><span', ""),
+    ('<a href="part0002.html#atp_01" class="calibre4"><span class="bold">About', "About"),
+    ('<a href="part0002.html#pt04ch_10" class="calibre4"><span', ""),
+    ('<a href="part0002.html#pt01ch_03" class="calibre4"><span', ""),
+    ('<a href="part0002.html#pt04ch_11" class="calibre4"><span', ""),
+    ('<a href="part0002.html#pt04ch_06" class="calibre4"><span', ""),
+]
+
+
+@pytest.mark.parametrize(("raw", "expected"), LIVE_DEBRIS)
+def test_clean_heading_live_debris_samples(raw: str, expected: str) -> None:
+    """Every real dirty sample cleans to plain text with no markup left."""
+    cleaned = clean_heading(raw)
+    assert cleaned == expected
+    assert "<" not in cleaned
+
+
+def test_clean_heading_anchor_only_strips_to_empty() -> None:
+    """Anchor-only headings carry no text — empty signals 'drop me'."""
+    assert clean_heading('<span id="anchor_only"></span>') == ""
+
+
+def test_clean_heading_nested_tags_and_gt_in_attribute() -> None:
+    """A real parser survives nesting and `>` inside quoted attributes."""
+    raw = '<a href="x.html#c1"><span class="bold">Chapter 11</span></a>'
+    assert clean_heading(raw) == "Chapter 11"
+    assert clean_heading('<a title="a>b"><span>Title</span></a>') == "Title"
+
+
+def test_clean_heading_unescapes_entities_exactly_once() -> None:
+    assert clean_heading("War &amp; Peace") == "War & Peace"
+    # `&amp;lt;` must become `&lt;` (one unescape), never `<` (double).
+    assert clean_heading("&amp;lt;not a tag&amp;gt;") == "&lt;not a tag&gt;"
+
+
+def test_clean_heading_preserves_plain_text_lt() -> None:
+    """`a < b` is prose, not markup — `<` only opens a tag when one follows."""
+    assert clean_heading("a < b") == "a < b"
+    assert clean_heading("5 < 7 < 9") == "5 < 7 < 9"
+
+
+def test_clean_heading_collapses_whitespace() -> None:
+    assert clean_heading("  Chapter\t 1:   The   Beginning  ") == "Chapter 1: The Beginning"
+    assert clean_heading("<span>Two</span> <span>Words</span>") == "Two Words"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        *[sample for sample, _ in LIVE_DEBRIS],
+        "a < b",
+        '<a href="x.html#c1"><span>Chapter 11</span></a>',
+        "War &amp; Peace",
+        "  spaced   out  ",
+        "",
+    ],
+)
+def test_clean_heading_is_idempotent(raw: str) -> None:
+    once = clean_heading(raw)
+    assert clean_heading(once) == once
+
+
+def test_heading_offsets_strip_html_debris() -> None:
+    """Capture path: parent_section flows through clean_heading, and
+    anchor-only headings are dropped so chunks fall back to the previous
+    real heading rather than ever storing an empty string."""
+    md = (
+        '# <a href="part0002.html#ch01" class="calibre4"><span>Chapter 1</span></a>\n'
+        "\n"
+        "body one\n"
+        "\n"
+        '## <span id="anchor_only"></span>\n'
+        "\n"
+        "body two\n"
+    )
+    headings = _heading_offsets(md)
+    assert [text for _, text in headings] == ["Chapter 1"]
+    assert _parent_section_for(md.index("body one"), headings) == "Chapter 1"
+    # The anchor-only heading between the two bodies was dropped, so body
+    # two falls back to the nearest preceding real heading.
+    assert _parent_section_for(md.index("body two"), headings) == "Chapter 1"
+
+
+def test_truncated_pandoc_heading_falls_back_to_previous_real_heading() -> None:
+    """The live failure mode: pandoc wrapped a long heading, the regex
+    captured an unterminated tag fragment, and it must not become a
+    parent_section."""
+    md = (
+        "# Introduction\n"
+        "\n"
+        "intro body\n"
+        "\n"
+        '## <a href="part0002.html#pt03ch_11" class="calibre4"><span\n'
+        "\n"
+        "chapter body\n"
+    )
+    headings = _heading_offsets(md)
+    assert [text for _, text in headings] == ["Introduction"]
+    assert _parent_section_for(md.index("chapter body"), headings) == "Introduction"
+
+
+def test_anchor_only_heading_before_any_real_heading_yields_none() -> None:
+    """No real heading anywhere above -> None, never the empty string."""
+    md = '# <span id="anchor"></span>\n\nbody\n'
+    headings = _heading_offsets(md)
+    assert headings == []
+    assert _parent_section_for(md.index("body"), headings) is None
 
 
 def _remote_embeddings_available() -> bool:

@@ -96,10 +96,26 @@ the failed arm named in the response's ``degraded`` list. Both arms
 down → 503 with a fixed detail (a dependency outage is retryable and
 NOT a bug, so it must not surface as a 500 stack; the detail never
 carries the exception — connection errors can embed hosts/DSNs, the
-Phase 18 never-body-the-failure rule). The dense arm's Milvus RPC is
-deadline-bounded (``worker/retrieval.py`` + ``MILVUS_TIMEOUT_SECONDS``)
-so Milvus-down degrades in ~2.5 s instead of pymilvus's 12 s retry
-long-tail.
+Phase 18 never-body-the-failure rule).
+
+Milvus-down is bounded by the arm budget, not by the RPC deadline alone:
+the 2.5 s client/RPC deadlines (``worker/retrieval.py`` +
+``MILVUS_TIMEOUT_SECONDS``) bound steady-state-down calls (sub-second
+closed-channel fast-fail) but NOT a warm connection's first failure —
+pymilvus 2.6 runs an in-request reconnect with a hardcoded 10 s wait
+*before* its deadline check. The dense arm therefore wraps its whole
+Milvus leg (client checkout + search RPC) in ``asyncio.wait_for`` under
+``DENSE_ARM_BUDGET_SECONDS`` (4 s), so a Milvus-down request degrades in
+≤4 s worst case; the budget-expired worker thread is orphaned, not
+cancelled, and drains within pymilvus's own 10 s ceiling. On any
+dense-arm ``MilvusException`` the process-wide client singleton is
+dropped (``_reset_client``) so the next request reconstructs it — without
+the reset a once-failed client stays dead past the outage, because
+pymilvus closes the channel after a failed in-band recovery and never
+retries the resulting non-gRPC errors. Recovery of pymilvus's cached
+connection entry is additionally gated by its 30 s idle health-check
+threshold, so the dense arm can stay (bounded-fast) degraded after Milvus
+returns until construction attempts are ≥30 s apart.
 
 Rerank and highlight each degrade independently: a
 ``RemoteInferenceError`` (the whole realistic failure surface since
@@ -138,7 +154,7 @@ from embedding import embed
 from fastapi import APIRouter, HTTPException, status
 from inference import RemoteInferenceError
 from pydantic import BaseModel, ConfigDict, Field
-from pymilvus import MilvusClient
+from pymilvus import MilvusClient, MilvusException
 from retrieval import (
     DENSE_FANOUT,
     SPARSE_FANOUT,
@@ -159,9 +175,49 @@ router = APIRouter(prefix="/search", tags=["search"])
 
 logger = logging.getLogger(__name__)
 
+# Hard ceiling on the dense arm's Milvus leg (client checkout + search RPC),
+# enforced with ``asyncio.wait_for`` in ``_dense_arm``.
+#
+# Why it exists: ``MILVUS_TIMEOUT_SECONDS`` (2.5 s) does NOT bound a warm
+# connection's FIRST failure. pymilvus 2.6's retry decorator calls its
+# connection-recovery hook BEFORE the deadline check, and that hook runs an
+# in-request reconnect with a HARDCODED 10 s channel-ready wait
+# (``grpc_handler.reconnect(timeout=10)``) — live-measured at ~10-11 s for
+# the first search after Milvus dies. 4 s clears the legitimate worst case
+# (a fresh 2.5 s channel-ready wait at (re)construction, or a healthy search
+# running up to its 2.5 s RPC deadline, plus thread-scheduling slack) while
+# cutting that 10 s tail out of the request.
+#
+# Caveat — orphaned thread: ``wait_for`` cannot interrupt the ``to_thread``
+# worker. On budget expiry the response degrades immediately but the thread
+# keeps running (bounded by pymilvus's own 10 s reconnect ceiling); its
+# eventual ``MilvusException`` still fires the singleton reset below, and an
+# eventual success means the client was healthy-but-slow and is kept.
+DENSE_ARM_BUDGET_SECONDS = 4.0
+
 # Process-wide Milvus client. Lazily constructed so import-time doesn't
 # require Milvus to be reachable (tests / type-check / lint shouldn't
 # need a live broker).
+#
+# Phase 22: RESET on dense-arm ``MilvusException`` (``_reset_client``).
+# After a failed in-band recovery pymilvus closes the gRPC channel and every
+# later call raises a closed-channel error wrapped to ``MilvusException`` —
+# never a ``grpc.RpcError`` — so pymilvus's UNAVAILABLE-driven recovery never
+# refires and a pinned client stays dead PAST the outage (live-confirmed:
+# dense never came back over 5+ min after Milvus restarted). Dropping the
+# reference makes the next request reconstruct via ``make_client()``;
+# construction is self-validating (``MilvusClient.__init__`` ends with a live
+# ``get_server_type`` RPC), so a broken client can never be (re)published.
+# While Milvus is down each rebuild attempt stays bounded: 2.5 s
+# channel-ready wait on a fresh connection, sub-second closed-channel
+# fast-fail on pymilvus's cached registry entry.
+#
+# Lock-free like the original singleton: the reference swap is atomic,
+# ``make_client()`` fully constructs before publication (no half-built client
+# is ever visible to another request), and the identity guard in
+# ``_reset_client`` keeps a stale failure from clobbering a newer healthy
+# client — the worst interleaving is a benign double-reset costing one extra
+# reconstruct.
 _milvus_client: MilvusClient | None = None
 
 
@@ -170,6 +226,19 @@ def _client() -> MilvusClient:
     if _milvus_client is None:
         _milvus_client = make_client()
     return _milvus_client
+
+
+def _reset_client(failed: MilvusClient) -> None:
+    """Drop the singleton iff it is still the client that just failed.
+
+    The identity guard makes a late reset (e.g. from a budget-orphaned
+    thread) a no-op once another request has already published a fresh
+    client. Benign double-reset is acceptable; clobbering a healthy
+    replacement is not.
+    """
+    global _milvus_client  # noqa: PLW0603 — module-level singleton, see module docstring
+    if _milvus_client is failed:
+        _milvus_client = None
 
 
 class SearchRequest(BaseModel):
@@ -223,15 +292,48 @@ def _embed_query(query: str) -> list[float]:
     return arr[0].tolist()
 
 
+def _dense_milvus_leg(query_vec: list[float], book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+    """Client checkout + Milvus search — the arm's whole Milvus surface. Sync.
+
+    Runs in a worker thread under the ``DENSE_ARM_BUDGET_SECONDS``
+    ``wait_for`` in ``_dense_arm``. Client construction lives INSIDE the
+    budget (and off the event loop) on purpose: a rebuild after a reset can
+    itself stall — 2.5 s channel-ready wait on a fresh connection, and
+    pymilvus's idle health check can even run its hardcoded-10 s reconnect
+    inside ``make_client``. On ``MilvusException`` the singleton is reset so
+    the next request reconstructs; this also fires from a budget-orphaned
+    thread when its in-flight call eventually fails — exactly the case where
+    the client is known bad. A construction failure needs no reset: nothing
+    was published.
+    """
+    client = _client()
+    try:
+        return dense_search(
+            client=client,
+            query_vec=query_vec,
+            book_ids=book_ids,
+            limit=DENSE_FANOUT,
+        )
+    except MilvusException:
+        _reset_client(client)
+        raise
+
+
 async def _dense_arm(query: str, book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
-    """Embed the query + run the Milvus search, both off the event loop."""
+    """Embed the query, then run the budget-bounded Milvus leg — off the event loop.
+
+    Only the Milvus leg sits under the ``wait_for`` budget: the remote embed
+    has its own ``RemoteInferenceError`` taxonomy and retry budget
+    (``worker/inference.py``), and a blanket arm budget would cut those
+    legitimate retries short. Budget expiry raises ``TimeoutError`` — an
+    ``Exception``, so the gather in ``run_search`` degrades the arm; genuine
+    cancellation re-raises ``CancelledError`` through ``wait_for`` and stays
+    flow control (pinned in tests).
+    """
     query_vec = await asyncio.to_thread(_embed_query, query)
-    return await asyncio.to_thread(
-        dense_search,
-        client=_client(),
-        query_vec=query_vec,
-        book_ids=book_ids,
-        limit=DENSE_FANOUT,
+    return await asyncio.wait_for(
+        asyncio.to_thread(_dense_milvus_leg, query_vec, book_ids),
+        timeout=DENSE_ARM_BUDGET_SECONDS,
     )
 
 
@@ -350,7 +452,9 @@ async def run_search(
     degraded: list[str] = []
     dense_hits = _surviving_arm_hits("dense", dense_result, degraded)
     sparse_hits = _surviving_arm_hits("sparse", sparse_result, degraded)
-    if degraded == ["dense", "sparse"]:
+    # Order-insensitive on purpose: a list compare would silently couple
+    # both-down detection to the unpack order above.
+    if set(degraded) == {"dense", "sparse"}:
         # Both arms down: there is nothing to degrade TO. 503, not 500 — a
         # dependency outage is a known, retryable service state (the /readyz
         # and unconfigured-key precedents), not a bug deserving a stack; and

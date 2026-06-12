@@ -33,8 +33,21 @@ distinguishable from a missing-Milvus run in CI logs:
 
 - ``queries.jsonl`` absent → parametrization yields zero tests; pytest
   reports the file with zero collected, the job is green-but-empty.
-- Any referenced sample missing from ``worker/tests/samples/`` → skip
-  with the missing filename(s) listed.
+- ALL referenced samples missing from ``worker/tests/samples/`` → the
+  whole session skips with the filenames listed (the CI posture —
+  sample files are never committed).
+- SOME samples missing (Phase 23) → only the rows whose every expected
+  file is absent skip, per-row, each listing its absent filename(s);
+  rows with at least one expected file on disk run against the present
+  subset. Dev-corpus rows and seeded-corpus rows therefore activate
+  independently — a box with only the dev samples runs the original
+  rows and reports each seeded row as a visible corpus-shape skip.
+
+Every missing-sample skip reason contains the substring
+``corpus sample(s) missing`` — load-bearing API shared with the CI
+live-gate guard (``.github/workflows/ci.yml``, retrieval-golden-live)
+and ``scripts/test_live.sh``, which tolerate exactly that pattern and
+fail on any other skip. Change all three in lockstep or none.
 - Milvus or Postgres unreachable → skip with the host:port.
 - ``DEEPINFRA_API_KEY`` unset → skip (Phase 16b: query + ingest
   embeddings are remote calls; the suite IS the live-DeepInfra gate).
@@ -63,10 +76,11 @@ skips, and a loud-skip guard turns that into a ``::warning`` so the
 green is never silent. The keyed ``retrieval-golden-live`` job
 (activates automatically once the ``DEEPINFRA_API_KEY`` repo secret
 exists) boots the compose stack, migrates, bootstraps Milvus, and runs
-this suite live — but the query rows still skip until Phase 23 commits
-a public-domain CI corpus, so the local ``make test-retrieval-golden``
-against the dev corpus remains the ranking-quality enforcement point
-until then.
+this suite live — but the query rows still skip there as corpus-shape
+skips (Phase 23 ships ``seeds/manifest.jsonl`` + the docs/SEED_CORPUS.md
+download runbook instead of committing sample files), so the local
+``make test-live`` against a downloaded corpus is the ranking-quality
+enforcement point.
 """
 
 # pymilvus 2.6 stubs are loose; same relaxations as the rest of worker/.
@@ -196,10 +210,14 @@ def golden_corpus() -> Iterator[dict[str, uuid.UUID]]:
 
     paths = {fn: SAMPLES_DIR / fn for fn in filenames}
     missing = sorted(fn for fn, p in paths.items() if not p.exists())
-    if missing:
+    if len(missing) == len(filenames):
+        # Nothing to ingest at all (the CI posture — sample files are never
+        # committed). Skip the whole session BEFORE probing infra so the
+        # reason names the corpus gap, not whatever else is also down.
         pytest.skip(
             f"Golden corpus sample(s) missing under {SAMPLES_DIR}: {missing}. "
-            "Add the files locally to run; CI runs without copyrighted samples.",
+            "Add the dev samples and/or download the seeded corpus per "
+            "docs/SEED_CORPUS.md; CI runs without sample files.",
         )
 
     if not _milvus_reachable():
@@ -228,8 +246,14 @@ def golden_corpus() -> Iterator[dict[str, uuid.UUID]]:
     # would pay that cost even when this file is skipped.
     from ingest import ingest
 
+    # Ingest only what's on disk; rows whose every expected file is absent
+    # skip per-row in the test body (corpus-shape skip), so a partially
+    # downloaded corpus still runs every row it can.
+    absent = set(missing)
     book_ids: dict[str, uuid.UUID] = {}
     for fn in filenames:
+        if fn in absent:
+            continue
         result = ingest(path=paths[fn], user_id=GOLDEN_USER_ID)
         book_ids[fn] = result.book_id
 
@@ -299,7 +323,19 @@ class TestRetrievalAccuracy:
         client = MilvusClient(uri=f"http://{host}:{port}")
 
         expected_filenames: list[str] = row["expected_filenames"]
-        expected_book_ids = {golden_corpus[fn] for fn in expected_filenames}
+        absent = sorted(fn for fn in expected_filenames if fn not in golden_corpus)
+        expected_book_ids = {golden_corpus[fn] for fn in expected_filenames if fn in golden_corpus}
+        if not expected_book_ids:
+            # Corpus-shape skip: this row's book(s) aren't on disk; the rest
+            # of the suite still runs. The substring "corpus sample(s)
+            # missing" is load-bearing — it's the ONLY skip reason the CI
+            # live-gate guard and scripts/test_live.sh tolerate; any other
+            # skip fails `make test-live`. Change all three in lockstep.
+            pytest.skip(
+                f"Golden corpus sample(s) missing under {SAMPLES_DIR}: {absent}. "
+                "Row is corpus-shape gated — download the file(s) "
+                "(docs/SEED_CORPUS.md for seeded books) to activate it.",
+            )
 
         # Library = every corpus book (the golden user owns all of them).
         # We're testing ranking quality, not isolation — Phase 3 owns the
@@ -343,6 +379,7 @@ class TestRetrievalAccuracy:
             f"RETRIEVAL REGRESSION on golden query.\n"
             f"  query: {row['query']!r}\n"
             f"  expected (any of): {expected_filenames}\n"
+            f"  absent from samples dir (not in play this run): {absent}\n"
             f"  expected book_ids: {sorted(expected_book_ids)}\n"
             f"  per-arm min_score floor: {floor}\n"
             f"  top-{len(fused)} (book_id, rrf, dense, sparse): {hits_repr}\n"

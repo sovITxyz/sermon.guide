@@ -11,7 +11,7 @@
 # - `test-live`  the keyed live gate (Phase 23): sources infra/.env and
 #                FAILS on any key/infra skip — see the target comment.
 
-.PHONY: lint format format-check typecheck test test-live test-isolation test-retrieval-golden bootstrap-milvus backfill-chunks clean-parent-sections sweep-orphans ingest worker enqueue migrate-up migrate-down migrate-new
+.PHONY: lint format format-check typecheck test test-live test-isolation test-retrieval-golden bootstrap-milvus backfill-chunks clean-parent-sections sweep-orphans seed-corpus ingest worker enqueue migrate-up migrate-down migrate-new
 
 lint:
 	uv run ruff check .
@@ -81,6 +81,16 @@ clean-parent-sections:
 
 sweep-orphans:
 	set -a && . ../infra/.env && set +a && uv run python -m scripts.sweep_orphans $(ARGS)
+
+# Phase 23 seed: bulk-ingest the public-domain corpus manifest
+# (seeds/manifest.jsonl) through the Celery + dedup path with
+# deterministic Phase 20 idempotency claims — re-runs converge, crashed
+# runs resume under the same book_id. Expects the downloaded EPUBs under
+# tests/samples/ (gitignored; the repo holds the manifest only) and a
+# running `make worker` in another terminal. Preview: ARGS=--dry-run.
+# Full operator recipe: docs/SEED_CORPUS.md.
+seed-corpus:
+	set -a && . ../infra/.env && set +a && uv run python -m scripts.seed_corpus $(ARGS)
 
 # Single-book dedup-aware ingest CLI (Phase 8):
 #   detect → extract → MinHash dedup → (skip on hit | chunk → embed → insert) →

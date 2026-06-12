@@ -184,6 +184,8 @@ model and citation contract ride all three. The api carries its own
 `deepinfra_api_key` (unprefixed `DEEPINFRA_API_KEY` alias, same pattern as
 the worker's), so no key is silently cross-paired between providers.
 
+*Amended 2026-06-12: `deepinfra` is now the default provider per operator decision (see ADR 0005's amendment); `google`/`ppq` remain selectable.*
+
 ### Latency bonus: `reasoning_effort`
 
 Google's OpenAI-compat layer accepts `reasoning_effort` —

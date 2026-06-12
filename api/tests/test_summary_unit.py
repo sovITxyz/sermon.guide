@@ -44,7 +44,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 import summary as summary_module
-from search import SearchHit
+from search import SearchHit, SearchOutcome
 from settings import ApiSettings
 
 # --- fakes -----------------------------------------------------------------
@@ -404,9 +404,9 @@ async def test_handler_503_when_key_unset(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(summary_module.settings, "google_api_key", None)
     called = {"run_search": False}
 
-    async def _fake_run_search(**_: Any) -> list[SearchHit]:  # noqa: ANN401
+    async def _fake_run_search(**_: Any) -> SearchOutcome:  # noqa: ANN401
         called["run_search"] = True
-        return []
+        return SearchOutcome(hits=[], degraded=[])
 
     monkeypatch.setattr(summary_module, "run_search", _fake_run_search)
     user: Any = _FakeUser()
@@ -429,8 +429,8 @@ async def test_handler_no_context_message_when_empty(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
     gen_called = {"x": False}
 
-    async def _fake_run_search(**_: Any) -> list[SearchHit]:  # noqa: ANN401
-        return []
+    async def _fake_run_search(**_: Any) -> SearchOutcome:  # noqa: ANN401
+        return SearchOutcome(hits=[], degraded=[])
 
     def _fake_gen(**_: Any) -> str:  # noqa: ANN401
         gen_called["x"] = True
@@ -467,7 +467,7 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
         do_rerank: bool,
         user_id: uuid.UUID,
         session: Any,  # noqa: ANN401
-    ) -> list[SearchHit]:
+    ) -> SearchOutcome:
         recorded.update(
             query=query,
             limit=limit,
@@ -475,7 +475,7 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
             user_id=user_id,
             session=session,
         )
-        return [_hit(1, 7, content="grace abounds")]
+        return SearchOutcome(hits=[_hit(1, 7, content="grace abounds")], degraded=[])
 
     async def _fake_resolve_titles(_session: Any, _book_ids: Any) -> dict[uuid.UUID, str]:  # noqa: ANN401
         return {b1: "Romans"}
@@ -507,6 +507,84 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
     assert resp.citations[0].chunk_index == 7
     assert resp.citations[0].title == "Romans"
     assert resp.citations[0].content == "grace abounds"
+    # Phase 22: a healthy pipeline reports no degraded stages.
+    assert resp.degraded == []
+
+
+# --- degraded retrieval (Phase 22) -------------------------------------------
+
+
+async def test_handler_degraded_retrieval_proceeds_with_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proceed-with-flag (Phase 22 decision): a degraded retrieval still
+    summarizes over the surviving arm's context — never a 503 — and the
+    response carries ``degraded`` verbatim so clients can caveat the answer."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
+    b1 = uuid.UUID(int=1)
+
+    async def _fake_run_search(**_: Any) -> SearchOutcome:  # noqa: ANN401
+        return SearchOutcome(
+            hits=[_hit(1, 7, content="grace abounds")],
+            degraded=["dense"],
+        )
+
+    async def _fake_resolve_titles(_session: Any, _book_ids: Any) -> dict[uuid.UUID, str]:  # noqa: ANN401
+        return {b1: "Romans"}
+
+    monkeypatch.setattr(summary_module, "run_search", _fake_run_search)
+    monkeypatch.setattr(summary_module, "_resolve_titles", _fake_resolve_titles)
+    monkeypatch.setattr(
+        summary_module,
+        "_client",
+        lambda: _FakeClient(text="Grace is central [Romans:7]."),
+    )
+
+    user: Any = _FakeUser()
+    session: Any = object()
+    resp = await summary_module.search_summary(
+        payload=summary_module.SummaryRequest(query="grace?"),
+        current_user=user,
+        session=session,
+    )
+
+    assert resp.summary == "Grace is central [Romans:7]."
+    assert [c.marker for c in resp.citations] == ["[Romans:7]"]
+    assert resp.degraded == ["dense"]
+
+
+async def test_handler_degraded_empty_keeps_no_llm_guard_and_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded-EMPTY retrieval still short-circuits to the deterministic
+    no-context message (no LLM call) but carries the degraded flags so the
+    client can tell outage-emptiness from genuine corpus-emptiness."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
+    gen_called = {"x": False}
+
+    async def _fake_run_search(**_: Any) -> SearchOutcome:  # noqa: ANN401
+        return SearchOutcome(hits=[], degraded=["sparse"])
+
+    def _fake_gen(**_: Any) -> str:  # noqa: ANN401
+        gen_called["x"] = True
+        return "should not be reached"
+
+    monkeypatch.setattr(summary_module, "run_search", _fake_run_search)
+    monkeypatch.setattr(summary_module, "_generate_summary", _fake_gen)
+    user: Any = _FakeUser()
+    session: Any = object()
+
+    resp = await summary_module.search_summary(
+        payload=summary_module.SummaryRequest(query="q"),
+        current_user=user,
+        session=session,
+    )
+    assert resp.summary == summary_module._NO_CONTEXT_MESSAGE
+    assert resp.citations == []
+    assert resp.degraded == ["sparse"]
+    assert gen_called["x"] is False
 
 
 # --- provider resolution (Phase 14b, ADR 0005) -------------------------------

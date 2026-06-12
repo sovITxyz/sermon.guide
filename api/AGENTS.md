@@ -286,11 +286,15 @@ JWT user was already authorized to read — never `user_id`/JWT/email
 The `/search-summary` LLM (Phase 14; transport re-cut in Phase 14b,
 [ADR 0005](../docs/adr/0005-llm-transport.md)) follows the same shape:
 a network call through the `openai` SDK to an OpenAI-compatible
-endpoint — Google's compat endpoint by default, ppq.ai via
-`SERMON_API_LLM_PROVIDER=ppq`, with `summary.py:_PROVIDERS` as the
-single provider map and the unprefixed `GOOGLE_API_KEY` /
-`PPQ_API_KEY` as keys. `SERMON_API_LLM_REASONING_EFFORT=none` (Phase
-16b) disables Gemini 2.5 Flash thinking on providers that honor it.
+endpoint — DeepInfra's compat endpoint by default (operator decision
+2026-06-12, amending ADR 0005's original google default: the summary
+LLM rides the same `DEEPINFRA_API_KEY` as embeddings/rerank/highlight,
+one vendor + one key), Google via `SERMON_API_LLM_PROVIDER=google`,
+ppq.ai via `SERMON_API_LLM_PROVIDER=ppq`, with `summary.py:_PROVIDERS`
+as the single provider map and the unprefixed `DEEPINFRA_API_KEY` /
+`GOOGLE_API_KEY` / `PPQ_API_KEY` as keys.
+`SERMON_API_LLM_REASONING_EFFORT=none` (Phase 16b) disables Gemini 2.5
+Flash thinking on providers that honor it.
 
 The rerank + highlight stages run *after* both retrieval arms' tenant
 filters have already executed. They take a `Sequence[RetrievalHit]`

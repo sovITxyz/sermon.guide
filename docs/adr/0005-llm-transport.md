@@ -1,6 +1,7 @@
 # ADR 0005 — LLM transport: openai SDK over OpenAI-compatible endpoints
 
 - **Status:** Accepted
+- **Amended:** 2026-06-12 — default provider is now `deepinfra` per operator decision (ADR 0006's consolidation row); the `google (default)` labels below are historical, and `google`/`ppq` remain fully selectable.
 - **Date:** 2026-06-04
 - **Deciders:** Cameron (sovITxyz)
 - **Consulted:** ppq.ai API docs (<https://ppq.ai/api-docs>); ppq.ai public model catalog (<https://api.ppq.ai/v1/models>); Google "OpenAI compatibility" Gemini docs (<https://ai.google.dev/gemini-api/docs/openai>); GitHub issue #24

@@ -299,4 +299,10 @@ user by design.)
 4. `make -C worker seed-corpus` — already-seeded books converge as
    duplicates; only the new book ingests.
 5. If the book should be golden-gated, add a row to
-   `worker/tests/golden/queries.jsonl` referencing the same filename.
+   `worker/tests/golden/queries.jsonl` referencing the same filename
+   (`min_score` 0.45 for dense-strength rows, 0.0 for BM25-strength —
+   see the `test_retrieval_golden.py` docstring). Rows whose file is
+   absent skip per-row with the `corpus sample(s) missing` reason (the
+   only skip `make -C worker test-live` tolerates), so the row can land
+   before the download — it shows up as a visible corpus-shape skip
+   until step 3 puts the file on disk; the other rows keep running.

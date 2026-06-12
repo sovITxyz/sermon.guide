@@ -64,8 +64,11 @@ can see how aggressively each chunk was pruned without re-scoring.
 ## Failure mode
 
 Same as ``api/rerank.py`` — a remote failure raises
-``RemoteInferenceError`` into the FastAPI layer, which maps it to a 502
-(unset key → 503; see ``api/main.py``). The empty-input path is cheap,
+``RemoteInferenceError``; since Phase 22 the retrieval caller
+(``search.run_search``) catches it and returns the hits unpruned with
+``"highlight"`` in the response's ``degraded`` list (logged loudly with
+the traceback). Callers outside that path get the Phase 16b mapping in
+``api/main.py`` (502; unset key → 503). The empty-input path is cheap,
 key-free, and makes no remote call.
 """
 

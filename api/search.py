@@ -87,15 +87,39 @@ Per-arm ``dense_score`` and ``sparse_score`` are on the internal
 ``RetrievalHit`` but are not in the public ``SearchHit`` schema —
 clients see only the final ordering score and the chunk metadata.
 
-## Failure mode
+## Failure mode — graceful degradation (Phase 22)
 
-Same as Phase 12 for the storage arms: ``asyncio.gather`` lacks
-``return_exceptions=True`` on the dense/sparse fan-out, so a Milvus or
-Postgres blip becomes a 500 (documented in the Phase 12 audit,
-docs/PHASES.md row 12; held over to a future ops-resilience pass).
-Remote-inference failures are mapped in ``api/main.py`` since Phase
-16b: unset ``DEEPINFRA_API_KEY`` → 503 naming the env var, upstream
-failure after retry → 502 naming the provider + leg.
+A single dependency blip no longer means a bare 500. The dense/sparse
+fan-out runs with ``return_exceptions=True``: one arm down → the
+surviving arm's (still tenant-scoped) results flow through fusion with
+the failed arm named in the response's ``degraded`` list. Both arms
+down → 503 with a fixed detail (a dependency outage is retryable and
+NOT a bug, so it must not surface as a 500 stack; the detail never
+carries the exception — connection errors can embed hosts/DSNs, the
+Phase 18 never-body-the-failure rule). The dense arm's Milvus RPC is
+deadline-bounded (``worker/retrieval.py`` + ``MILVUS_TIMEOUT_SECONDS``)
+so Milvus-down degrades in ~2.5 s instead of pymilvus's 12 s retry
+long-tail.
+
+Rerank and highlight each degrade independently: a
+``RemoteInferenceError`` (the whole realistic failure surface since
+Phase 16b — both stages are pure remote calls; anything else out of
+them is a pipeline bug that should fail loud) falls back to the raw RRF
+top-K — the same list ``rerank=false`` returns — flagged as
+``"rerank"`` / ``"highlight"``. A rerank failure does NOT skip
+highlight: highlight needs only a hit list and the query, so it still
+prunes the RRF-ordered fallback (and if the failure was a provider
+outage it simply degrades too — same provider, both flags appear).
+
+Every degraded path is fail-loud in the logs (``exc_info``) and soft in
+the response. Scope can never widen: the surviving arm already executed
+with the request's JWT-derived ``book_id`` filter, and no fallback
+re-queries anything — see ``run_search``.
+
+Remote-inference failures OUTSIDE ``run_search`` are still mapped in
+``api/main.py`` (Phase 16b): unset ``DEEPINFRA_API_KEY`` → 503 naming
+the env var, upstream failure after retry → 502 naming the provider +
+leg.
 """
 
 # pymilvus 2.6 ships without `py.typed`; same relaxation as worker/.
@@ -104,12 +128,15 @@ failure after retry → 502 naming the provider + leg.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from db import UserLibraryEntry
 from embedding import embed
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
+from inference import RemoteInferenceError
 from pydantic import BaseModel, ConfigDict, Field
 from pymilvus import MilvusClient
 from retrieval import (
@@ -129,6 +156,8 @@ from highlight import highlight
 from rerank import RERANK_FANOUT, rerank
 
 router = APIRouter(prefix="/search", tags=["search"])
+
+logger = logging.getLogger(__name__)
 
 # Process-wide Milvus client. Lazily constructed so import-time doesn't
 # require Milvus to be reachable (tests / type-check / lint shouldn't
@@ -173,7 +202,19 @@ class SearchHit(BaseModel):
 
 
 class SearchResponse(BaseModel):
+    """``POST /search`` response.
+
+    ``degraded`` (Phase 22) names the pipeline stages that failed and were
+    bypassed for this response, in pipeline order — any of ``"dense"``,
+    ``"sparse"``, ``"rerank"``, ``"highlight"``. Always present and ``[]``
+    when healthy (no optional-omission: a stable, always-there field is
+    counter-friendly for the Phase 27 metrics and additive for clients —
+    response models don't set ``extra="forbid"``, and web's TS interfaces
+    ignore unknown JSON fields until a web phase renders it).
+    """
+
     hits: list[SearchHit]
+    degraded: list[str] = Field(default_factory=list)
 
 
 def _embed_query(query: str) -> list[float]:
@@ -203,6 +244,58 @@ def _to_search_hit(hit: RetrievalHit) -> SearchHit:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SearchOutcome:
+    """``run_search``'s result: the final hits plus the degraded-stage flags.
+
+    ``degraded`` lists the pipeline stages that failed and were bypassed
+    (``"dense"`` / ``"sparse"`` / ``"rerank"`` / ``"highlight"``, pipeline
+    order); ``[]`` means the full pipeline ran. Both HTTP callers copy it
+    verbatim onto their response models.
+    """
+
+    hits: list[SearchHit]
+    degraded: list[str]
+
+
+# Fixed 503 detail for the both-arms-down case. Per-arm exceptions are
+# already in the log (exc_info); the body never carries failure detail —
+# connection errors can embed hosts and DSNs (the Phase 18 /readyz rule).
+_RETRIEVAL_UNAVAILABLE_DETAIL = "Search is temporarily unavailable; please retry shortly."
+
+
+def _surviving_arm_hits(
+    arm: str,
+    result: list[RetrievalHit] | BaseException,
+    degraded: list[str],
+) -> list[RetrievalHit]:
+    """Unpack one ``return_exceptions=True`` gather arm (Phase 22).
+
+    Hits pass through; an ``Exception`` degrades — logged loudly with the
+    traceback, named in *degraded*, and replaced by an empty arm so RRF
+    fusion reduces to the surviving arm's ranking. No ``except`` clause is
+    involved (the gather hands us exception *objects*), and the breadth is
+    deliberate: the dense arm's failure surface spans four libraries
+    (pymilvus ``MilvusException``, ``RemoteInferenceError`` from the remote
+    embed, ``psycopg`` errors + ``RuntimeError`` from the embedding-space
+    guard) and the sparse arm raises SQLAlchemy/asyncpg DBAPI errors —
+    enumerating them would couple this module to transport internals.
+    Non-``Exception`` ``BaseException``s (``CancelledError``) are flow
+    control, not dependency failures, and are re-raised.
+    """
+    if isinstance(result, BaseException):
+        if not isinstance(result, Exception):
+            raise result
+        logger.warning(
+            "retrieval %s arm failed; degrading to the surviving arm",
+            arm,
+            exc_info=result,
+        )
+        degraded.append(arm)
+        return []
+    return result
+
+
 async def run_search(
     *,
     query: str,
@@ -210,7 +303,7 @@ async def run_search(
     do_rerank: bool,
     user_id: uuid.UUID,
     session: AsyncSession,
-) -> list[SearchHit]:
+) -> SearchOutcome:
     """Hybrid → (rerank → highlight) retrieval over *user_id*'s library, minus HTTP.
 
     The reusable core of ``POST /search``. Phase 14's ``/search-summary``
@@ -223,16 +316,28 @@ async def run_search(
     *user_id* MUST be the JWT-derived ``current_user.user_id`` (never a
     client-supplied value), and the ``book_id`` set is resolved server-side
     from ``user_library`` for that user. An empty library short-circuits to
-    ``[]`` before any embedding or model load.
+    an empty outcome before any embedding or remote call.
+
+    Degradation (Phase 22) NEVER widens that scope: ``book_ids`` is resolved
+    exactly once above the fan-out and the same list parameterizes both arms
+    (Milvus ``book_id in [...]``, SQL ``book_id = ANY(...)``) — a surviving
+    arm's hits already cleared the tenant filter, and every fallback below is
+    a pure reshuffle/truncation of in-memory hits (no re-query, no recomputed
+    filter; both arms still raise on an empty ``book_id`` set rather than
+    search unfiltered). Both arms down → 503 (see the module docstring for
+    the status-code rationale).
     """
     stmt = select(UserLibraryEntry.book_id).where(
         UserLibraryEntry.user_id == user_id,
     )
     book_ids: list[uuid.UUID] = list((await session.execute(stmt)).scalars().all())
     if not book_ids:
-        return []
+        return SearchOutcome(hits=[], degraded=[])
 
-    dense_hits, sparse_hits = await asyncio.gather(
+    # Phase 22: return_exceptions=True so one arm's failure degrades to the
+    # surviving arm instead of bubbling up as a 500 (the Phase 12 audit's
+    # one-arm-down failure mode).
+    dense_result, sparse_result = await asyncio.gather(
         _dense_arm(query, book_ids),
         bm25_search(
             session=session,
@@ -240,7 +345,22 @@ async def run_search(
             book_ids=book_ids,
             limit=SPARSE_FANOUT,
         ),
+        return_exceptions=True,
     )
+    degraded: list[str] = []
+    dense_hits = _surviving_arm_hits("dense", dense_result, degraded)
+    sparse_hits = _surviving_arm_hits("sparse", sparse_result, degraded)
+    if degraded == ["dense", "sparse"]:
+        # Both arms down: there is nothing to degrade TO. 503, not 500 — a
+        # dependency outage is a known, retryable service state (the /readyz
+        # and unconfigured-key precedents), not a bug deserving a stack; and
+        # not 502 — Milvus/Postgres are internal infra, not an upstream
+        # gateway. Both tracebacks are already logged above.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_RETRIEVAL_UNAVAILABLE_DETAIL,
+        )
+
     # Fan-out depends on whether the post-retrieval stages run: keep 30
     # so the cross-encoder has the full recall pool to reorder; cap at
     # `limit` when skipping rerank so we don't ship more rows than the
@@ -249,20 +369,43 @@ async def run_search(
     fused = rrf_fuse(dense=dense_hits, sparse=sparse_hits, limit=fused_limit)
 
     if not do_rerank:
-        return [_to_search_hit(h) for h in fused]
+        return SearchOutcome(hits=[_to_search_hit(h) for h in fused], degraded=degraded)
 
-    reranked = await asyncio.to_thread(
-        rerank,
-        query=query,
-        hits=fused,
-        top_n=limit,
-    )
-    pruned = await asyncio.to_thread(
-        highlight,
-        query=query,
-        hits=reranked,
-    )
-    return [_to_search_hit(h) for h in pruned]
+    # Phase 22: rerank + highlight each degrade independently to the raw RRF
+    # ordering instead of 500ing. RemoteInferenceError is the entire realistic
+    # failure surface (both stages are pure remote calls since Phase 16b, and
+    # it covers MissingInferenceKeyError); anything else is a pipeline bug
+    # that must fail loud. Falling back to RRF scores can't break a consumer:
+    # nothing thresholds the rerank score (ADR 0006) — ``score`` simply
+    # carries RRF semantics, same as ``rerank=false``.
+    try:
+        ranked = await asyncio.to_thread(
+            rerank,
+            query=query,
+            hits=fused,
+            top_n=limit,
+        )
+    except RemoteInferenceError:
+        logger.warning("rerank failed; falling back to raw RRF top-%d", limit, exc_info=True)
+        degraded.append("rerank")
+        ranked = list(fused[:limit])
+
+    # A rerank failure does NOT skip highlight: highlight needs only the
+    # query and a hit list, so it prunes the RRF-ordered fallback just as
+    # well. If the rerank failure was a provider outage, this call simply
+    # degrades too (same provider) and both flags appear.
+    try:
+        pruned = await asyncio.to_thread(
+            highlight,
+            query=query,
+            hits=ranked,
+        )
+    except RemoteInferenceError:
+        logger.warning("highlight failed; returning unpruned hits", exc_info=True)
+        degraded.append("highlight")
+        pruned = ranked
+
+    return SearchOutcome(hits=[_to_search_hit(h) for h in pruned], degraded=degraded)
 
 
 @router.post("", response_model=SearchResponse)
@@ -278,13 +421,14 @@ async def search(
     true (default), the top-30 fused list flows through the remote
     reranker (→ top ``limit``) and BGE-M3 sentence-level pruning (drops
     sentences below threshold 0.5). When false, the raw RRF top-K is
-    returned (Phase 12 behavior).
+    returned (Phase 12 behavior). ``degraded`` names any pipeline stage
+    that failed and was bypassed (Phase 22; module docstring).
     """
-    hits = await run_search(
+    outcome = await run_search(
         query=payload.query,
         limit=payload.limit,
         do_rerank=payload.rerank,
         user_id=current_user.user_id,
         session=session,
     )
-    return SearchResponse(hits=hits)
+    return SearchResponse(hits=outcome.hits, degraded=outcome.degraded)

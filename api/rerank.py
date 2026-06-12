@@ -42,12 +42,14 @@ provenance is still visible from a single returned hit.
 
 ## Failure mode
 
-A remote failure raises ``RemoteInferenceError`` through to the FastAPI
-layer, which maps it to a 502 naming the provider (``api/main.py``;
-the Phase 14b pattern) — an unset ``DEEPINFRA_API_KEY`` maps to a 503.
-Graceful degradation (fall back to raw RRF top-K when rerank fails)
-would mask provider issues from operators; defer until traffic data
-motivates it (same posture Phase 13 took for model-load failures).
+A remote failure raises ``RemoteInferenceError`` (an unset
+``DEEPINFRA_API_KEY`` raises its ``MissingInferenceKeyError`` subclass).
+Since Phase 22 the retrieval caller (``search.run_search``) catches it
+and falls back to the raw RRF top-K with ``"rerank"`` in the response's
+``degraded`` list — logged loudly with the traceback, so the operator
+still sees the provider issue. Callers outside that path get the Phase
+16b mapping in ``api/main.py`` (502 naming the provider + leg; unset
+key → 503).
 """
 
 from __future__ import annotations

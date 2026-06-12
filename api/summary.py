@@ -62,9 +62,29 @@ Two layers keep the answer grounded (Phase 14 verify: "query nothing-in-corpus
   in ``rerank.py`` / ``highlight.py`` — import / lint / test never need a key
   or network.
 - An upstream API error or an empty completion becomes a 502. Other
-  unexpected failures fall through to a 500, the same fail-loud posture the
-  retrieval arms take (``search.py`` module docstring; ``api/AGENTS.md``
-  open gaps).
+  unexpected failures fall through to a 500 — fail loud on bugs; dependency
+  blips degrade instead (next section).
+
+## Degraded retrieval: proceed with the flag, never a 503 (Phase 22)
+
+``run_search`` degrades gracefully when a retrieval arm / rerank /
+highlight fails (``search.py`` module docstring) and reports the bypassed
+stages on ``SearchOutcome.degraded``. This endpoint's posture — decided in
+Phase 22 — is **proceed-with-flag**: a degraded-retrieval summary still
+runs over the surviving arm's context and the response's ``degraded`` list
+carries the flags so clients can caveat the answer. Rationale: the
+surviving arm's hits passed the exact same JWT-derived ``user_library``
+filter as the happy path (degradation never widens scope), so the result
+is *narrower* grounding, not *wrong* grounding — the citation contract
+holds unchanged (every returned citation resolves to a chunk the user is
+authorized to read), and a partial answer with a caveat beats refusing the
+user's question outright. A 503 here would also be dishonest about
+recoverability: the summary leg itself is healthy. Both retrieval arms
+down is the exception — ``run_search`` raises a real 503 (there is nothing
+to summarize over). A degraded-EMPTY retrieval keeps the deterministic
+no-context guard (no LLM call) but still carries the flags, so the client
+can distinguish "your library has nothing on this" from "search was
+partially down, the empty result may reflect the outage".
 
 ## Tenant surface
 
@@ -229,8 +249,17 @@ class Citation(BaseModel):
 
 
 class SummaryResponse(BaseModel):
+    """``POST /search-summary`` response.
+
+    ``degraded`` (Phase 22) is copied verbatim from ``run_search``'s outcome
+    — same stage names and always-present-``[]``-when-healthy convention as
+    ``search.SearchResponse.degraded`` (see the module docstring for why a
+    degraded summary proceeds with the flag instead of 503ing).
+    """
+
     summary: str
     citations: list[Citation]
+    degraded: list[str] = Field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,17 +507,25 @@ async def search_summary(
             detail=f"Summary service is not configured; set {provider.key_env_var}.",
         )
 
-    hits = await run_search(
+    outcome = await run_search(
         query=payload.query,
         limit=payload.limit_chunks,
         do_rerank=True,
         user_id=current_user.user_id,
         session=session,
     )
+    hits = outcome.hits
     if not hits:
         # Deterministic half of the hallucination guard: nothing retrieved →
-        # say so, never call the LLM.
-        return SummaryResponse(summary=_NO_CONTEXT_MESSAGE, citations=[])
+        # say so, never call the LLM. Phase 22: a degraded-empty retrieval
+        # short-circuits the same way (nothing to ground on) but keeps the
+        # flags so the client can caveat that the emptiness may reflect the
+        # outage, not the corpus.
+        return SummaryResponse(
+            summary=_NO_CONTEXT_MESSAGE,
+            citations=[],
+            degraded=outcome.degraded,
+        )
 
     titles = await _resolve_titles(session, [h.book_id for h in hits])
     sources = _build_sources(hits, titles)
@@ -499,4 +536,11 @@ async def search_summary(
         sources=sources,
     )
     citations = _extract_citations(summary_text, sources)
-    return SummaryResponse(summary=summary_text, citations=citations)
+    # Proceed-with-flag (Phase 22, module docstring): a degraded retrieval
+    # still produced tenant-scoped context, so summarize it and let the
+    # flags ride along rather than 503ing a recoverable partial answer.
+    return SummaryResponse(
+        summary=summary_text,
+        citations=citations,
+        degraded=outcome.degraded,
+    )

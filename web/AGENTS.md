@@ -45,7 +45,8 @@ This is load-bearing; do not weaken it.
   `api/` directly.
 - `lib/` split: `config.ts` + `api-server.ts` carry `import "server-only"` (a
   build error if pulled into a client bundle). `session.ts`, `validation.ts`,
-  `tasks.ts`, `http.ts` are pure (no `server-only`) so middleware and Vitest can
+  `tasks.ts`, `http.ts`, `summary.ts`, `reader.ts`, `reader-view.ts`,
+  `library.ts` are pure (no `server-only`) so middleware and Vitest can
   import them.
 
 ## Tests

@@ -379,6 +379,47 @@ same PR, same rule as the `_sanitize_filename` mirror. Runtime needs
 the `libmagic` system library (`api/Dockerfile` installs `libmagic1`;
 GitHub's ubuntu runners ship it).
 
+## Graceful degradation (Phase 22)
+
+A single dependency blip must not 500 the retrieval path. The contract
+lives in `search.run_search` (mechanics in the `search.py` module
+docstring; the summary posture in `summary.py`'s "Degraded retrieval"
+section):
+
+- **Dense/sparse fan-out** runs with `return_exceptions=True`. One arm
+  down → the surviving arm's results + the failed arm's name in the
+  response's `degraded` list. Both arms down → **503** with a fixed
+  detail (retryable dependency outage, not a bug → not 500; internal
+  infra, not a gateway → not 502; detail never carries the exception —
+  the `/readyz` never-body-the-failure rule).
+- **Milvus-down is fast, not a 12 s long-tail**: `make_client` sets a
+  client-level connect timeout and `dense_search` passes a per-RPC
+  deadline (both `MILVUS_TIMEOUT_SECONDS = 2.5` in
+  `worker/scripts/bootstrap_milvus.py`) so the arm fails typed in
+  ~2.5 s.
+- **Rerank, then highlight, each degrade independently**: a
+  `RemoteInferenceError` (their entire realistic failure surface since
+  Phase 16b; covers `MissingInferenceKeyError`) falls back to the raw
+  RRF top-K, flagged `"rerank"` / `"highlight"`. A rerank failure does
+  not skip highlight — it prunes the RRF-ordered fallback. Any other
+  exception is a pipeline bug and still fails loud.
+- **`degraded: list[str]`** rides both `SearchResponse` and
+  `SummaryResponse`: stage names `dense`/`sparse`/`rerank`/`highlight`
+  in pipeline order, always present, `[]` when healthy (stable +
+  counter-friendly for Phase 27; additive for clients).
+- **`/search-summary` proceeds with the flag, never 503s on partial
+  retrieval** (decision made + documented in Phase 22, rationale in
+  `summary.py`): degraded grounding is narrower, not wrong — the
+  citation contract holds. A degraded-EMPTY retrieval keeps the
+  no-LLM-call guard but carries the flags.
+- **Degradation NEVER widens scope**: `book_ids` is resolved once from
+  the JWT user's `user_library` and the same list parameterizes both
+  arms; every fallback is a reshuffle/truncation of already-filtered
+  in-memory hits — no retry, no re-query, no recomputed filter. Both
+  arms still raise on an empty `book_id` set.
+- Every degraded path logs the failure with `exc_info` (fail-loud in
+  logs, soft in the response).
+
 ## Open trust gaps
 
 - **No library cap on the search filter.** A user with 10K books
@@ -388,13 +429,18 @@ GitHub's ubuntu runners ship it).
   it in practice at v0 scale; introducing a chunked-filter or
   partition-key narrowing strategy is the next phase to do this
   properly.
-- **No graceful degradation when retrieval infra fails.** Phase 12
-  noted `asyncio.gather` lacks `return_exceptions=True` on the
-  dense/sparse fan-out — a Milvus or Postgres blip is still a 500.
-  Phase 16b *did* centralize the inference failure mapping (remote
-  call fails after retry → 502, key unset → 503, `main.py`), but
-  there is no fallback path (e.g. raw-RRF-on-rerank-failure); same
-  posture held over to a future ops-resilience pass.
+- **Degraded responses lose signal quality silently beyond the flag.**
+  Phase 22 closed the one-arm-down-⇒-500 gap (see "Graceful degradation"
+  above), but the *semantics* of a degraded response are weaker than the
+  flag alone conveys: a sparse-arm-down response loses BM25's
+  corpus-presence filtering (the Phase 12 audit showed dense-only
+  retrieval surfaces false positives at 0.5–0.6 COSINE for
+  nothing-in-corpus queries — with no sparse signal, RRF cannot suppress
+  them, and if rerank also degraded nothing else will); a rerank-degraded
+  response carries RRF scores in `score` (the documented `rerank=false`
+  semantics — and ADR 0006 confirms nothing thresholds the rerank score).
+  Clients see only `degraded: [...]`; per-stage quality caveats in the UI
+  are a later web phase. Phase 27 emits the flags as counters.
 - **Inference wall-time moved off-box (Phase 16b).** The in-process-era
   numbers (~30 s warm rerank on dev CPU; Phase 14b: warm
   `/search-summary` E2E ≈ 134 s = ~71–76 s retrieval/rerank/highlight +

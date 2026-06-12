@@ -1172,8 +1172,10 @@ exists anywhere.
   leave plain `test` keyless-fast. The runbook documents which target gives
   which coverage.
 - Runbook in docs/: clean infra → seeded corpus, reproducible — including the
-  live-env recipe (tracked `.env.example` values + operator key +
-  `SERMON_POSTGRES_PORT=54322`, the 5432-vs-54322 trap from worker/AGENTS.md).
+  live-env recipe (tracked `.env.example` values + operator key + the Postgres
+  port from `infra/.env`; per Phase 21 finding iii the live mapping is **5432**
+  and 54322 is the stale CODE default in `worker/db/settings.py` — align or
+  document in the runbook, don't hardcode either).
 
 ## Verify
 - Seed run ingests the manifest; dedup converges on re-run (no duplicate vectors);

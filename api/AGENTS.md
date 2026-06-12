@@ -392,11 +392,23 @@ section):
   detail (retryable dependency outage, not a bug → not 500; internal
   infra, not a gateway → not 502; detail never carries the exception —
   the `/readyz` never-body-the-failure rule).
-- **Milvus-down is fast, not a 12 s long-tail**: `make_client` sets a
-  client-level connect timeout and `dense_search` passes a per-RPC
+- **Milvus-down is budget-bounded, not a 10 s+ long-tail**: `make_client`
+  sets a client-level connect timeout and `dense_search` passes a per-RPC
   deadline (both `MILVUS_TIMEOUT_SECONDS = 2.5` in
-  `worker/scripts/bootstrap_milvus.py`) so the arm fails typed in
-  ~2.5 s.
+  `worker/scripts/bootstrap_milvus.py`), but pymilvus 2.6 runs a
+  hardcoded-10 s in-request reconnect BEFORE honoring that deadline on a
+  warm connection's first failure. `search.py` therefore (1) wraps the
+  dense arm's whole Milvus leg (client checkout + search RPC) in
+  `asyncio.wait_for` under `DENSE_ARM_BUDGET_SECONDS = 4.0` — budget
+  expiry degrades the response while the worker thread is orphaned (it
+  drains within pymilvus's own 10 s ceiling); and (2) resets the
+  process-wide client singleton on any dense-arm `MilvusException` so the
+  next request reconstructs it — without the reset, pymilvus's
+  post-recovery closed channel raises non-gRPC errors its recovery never
+  retries, leaving the dense arm dead past the outage. Residual caveat:
+  pymilvus health-checks its cached connection entry only after a 30 s
+  idle gap, so under sustained sub-30 s traffic the dense arm stays
+  (bounded-fast) degraded until construction attempts are ≥30 s apart.
 - **Rerank, then highlight, each degrade independently**: a
   `RemoteInferenceError` (their entire realistic failure surface since
   Phase 16b; covers `MissingInferenceKeyError`) falls back to the raw
@@ -429,6 +441,16 @@ section):
   it in practice at v0 scale; introducing a chunked-filter or
   partition-key narrowing strategy is the next phase to do this
   properly.
+- **The retrieval arms degrade on ANY `Exception`, including our own
+  bugs.** The arm fan-out's full-`Exception` breadth is deliberate (the
+  dense arm's failure surface spans four libraries; enumerating them
+  would couple `search.py` to transport internals), but it means an
+  in-our-code `TypeError`/`KeyError` inside either arm degrades the
+  response instead of 500ing — loud in the logs (`exc_info`), invisible
+  in status codes. Operators watching only 5xx rates could miss a
+  retrieval-arm code bug riding as permanent degradation. Phase 27's
+  metrics on the `degraded` flags are the planned mitigation: a non-zero
+  steady-state `degraded` counter with healthy dependencies is the tell.
 - **Degraded responses lose signal quality silently beyond the flag.**
   Phase 22 closed the one-arm-down-⇒-500 gap (see "Graceful degradation"
   above), but the *semantics* of a degraded response are weaker than the

@@ -17,6 +17,9 @@ to the exact weights that embed the chunks — and ingest no longer loads a
 recent Markdown ATX heading (`#`, `##`, …) at or before the chunk's start
 offset. This is a hint for citation UX, not a guarantee — a chunk that
 starts inside a heading-less preamble will have `parent_section=None`.
+Heading text is passed through `clean_heading` at capture, so the stored
+value (Postgres `chunks.parent_section` and Milvus row metadata alike) is
+plain text — never pandoc's inline-HTML tag soup.
 
 CLI (run from `worker/`):
 
@@ -34,6 +37,7 @@ import re
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import cast
 
@@ -71,8 +75,8 @@ class Chunk:
     `start_idx`/`end_idx` are character offsets into the original markdown
     so callers can reconstruct context, attach highlights, or render a
     citation pin. `parent_section` is the nearest enclosing ATX heading
-    text (without leading `#`s), or `None` if the chunk falls before any
-    heading.
+    text (without leading `#`s, stripped of inline HTML via
+    `clean_heading`), or `None` if the chunk falls before any heading.
     """
 
     text: str
@@ -81,9 +85,65 @@ class Chunk:
     parent_section: str | None
 
 
+class _TagStripper(HTMLParser):
+    """Collects the text content of an HTML fragment, dropping tags.
+
+    ``convert_charrefs=True`` (the stdlib default, set explicitly here)
+    makes the parser hand ``handle_data`` already-unescaped text, so
+    entities are decoded exactly once — a separate ``html.unescape`` pass
+    would double-unescape (``&amp;lt;`` → ``<`` instead of ``&lt;``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def clean_heading(raw: str) -> str:
+    """Strip HTML markup from captured heading text; collapse whitespace.
+
+    pandoc's GFM output keeps inline HTML from EPUB headings (anchors,
+    spans), and its ~72-col line wrapping means the per-line ATX regex can
+    capture tag soup truncated mid-tag (``<a href="..."><span``). A real
+    HTML parser — not a regex — survives nested tags, ``>`` inside quoted
+    attribute values, and plain text that merely looks like markup
+    (``a < b`` is preserved verbatim; an unterminated trailing tag
+    fragment is discarded). Entities are unescaped exactly once and
+    whitespace runs collapse to single spaces.
+
+    May return ``""`` (anchor-only headings, tag-only truncated
+    fragments). Callers must treat that as "no heading": `_heading_offsets`
+    drops empty headings from its list, so affected chunks fall back to the
+    nearest preceding real heading, or ``None`` when none exists — the
+    empty string is never stored as a ``parent_section``.
+
+    Maintenance/backfill scripts that clean stored ``parent_section``
+    values MUST import and reuse this function so capture-time and
+    backfill-time semantics can never drift.
+    """
+    parser = _TagStripper()
+    parser.feed(raw)
+    parser.close()
+    return " ".join("".join(parser.parts).split())
+
+
 def _heading_offsets(markdown: str) -> list[tuple[int, str]]:
-    """Return `(start_offset, heading_text)` for every ATX heading, in order."""
-    return [(m.start(), m.group(2).strip()) for m in _ATX_HEADING.finditer(markdown)]
+    """Return `(start_offset, heading_text)` for every ATX heading, in order.
+
+    Heading text is passed through `clean_heading`; headings that strip to
+    the empty string (anchor-only inline HTML, truncated tag fragments) are
+    omitted so the parent-section lookup falls back to the previous real
+    heading — both Postgres `chunks` rows and Milvus metadata derive from
+    the values produced here.
+    """
+    offsets: list[tuple[int, str]] = []
+    for m in _ATX_HEADING.finditer(markdown):
+        if cleaned := clean_heading(m.group(2)):
+            offsets.append((m.start(), cleaned))
+    return offsets
 
 
 def _parent_section_for(offset: int, headings: list[tuple[int, str]]) -> str | None:

@@ -374,9 +374,12 @@ def _install_dense_leg_seams(
     async def _sparse(**_: Any) -> list[RetrievalHit]:
         return list(sparse_hits or [])
 
+    def _fake_embed(_q: str) -> list[float]:
+        return [0.0]
+
     monkeypatch.setattr(search_module, "_milvus_client", None)
     monkeypatch.setattr(search_module, "make_client", _fake_make_client)
-    monkeypatch.setattr(search_module, "_embed_query", lambda _q: [0.0])
+    monkeypatch.setattr(search_module, "_embed_query", _fake_embed)
     monkeypatch.setattr(search_module, "dense_search", dense_search_fn)
     monkeypatch.setattr(search_module, "bm25_search", _sparse)
     return constructed

@@ -101,6 +101,6 @@ pythonVersion = "3.12"
 # `db` and friends live in `../worker`; same rationale as the pytest
 # pythonpath above.
 extraPaths = ["../worker"]
-include = ["main.py", "auth.py", "uploads.py", "search.py", "summary.py", "rerank.py", "highlight.py", "readyz.py", "ratelimit.py", "settings.py", "tasks_client.py", "tests"]
+include = ["main.py", "auth.py", "library.py", "reader.py", "uploads.py", "search.py", "summary.py", "rerank.py", "highlight.py", "readyz.py", "ratelimit.py", "settings.py", "tasks_client.py", "tests"]
 venvPath = "."
 venv = ".venv"

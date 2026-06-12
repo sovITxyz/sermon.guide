@@ -27,6 +27,7 @@ from inference import MissingInferenceKeyError, RemoteInferenceError
 
 import auth
 import library
+import reader
 import readyz
 import search
 import summary
@@ -154,6 +155,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(library.router)
+app.include_router(reader.router)
 app.include_router(uploads.router)
 app.include_router(search.router)
 app.include_router(summary.router)

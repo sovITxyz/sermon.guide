@@ -40,24 +40,24 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from db import User, get_sync_session_factory
 from tasks.ingest import ingest_book  # also imports celery_app, registering the task
 
-_LABEL_NAMESPACE = uuid.UUID("00000000-0000-0000-0000-000000000001")
-_LABEL_EMAIL_DOMAIN = "tenants.sermon.guide.local"
+LABEL_NAMESPACE = uuid.UUID("00000000-0000-0000-0000-000000000001")
+LABEL_EMAIL_DOMAIN = "tenants.sermon.guide.local"
 
 
-def _resolve_tenant(value: str) -> uuid.UUID:
+def resolve_tenant(value: str) -> uuid.UUID:
     """Map *value* to a ``users.user_id`` and ensure the row exists."""
     try:
         return uuid.UUID(value)
     except ValueError:
         pass
-    user_id = uuid.uuid5(_LABEL_NAMESPACE, f"{value}.{_LABEL_EMAIL_DOMAIN}")
+    user_id = uuid.uuid5(LABEL_NAMESPACE, f"{value}.{LABEL_EMAIL_DOMAIN}")
     sf = get_sync_session_factory()
     with sf() as session, session.begin():
         stmt = (
             pg_insert(User)
             .values(
                 user_id=user_id,
-                email=f"{value}@{_LABEL_EMAIL_DOMAIN}",
+                email=f"{value}@{LABEL_EMAIL_DOMAIN}",
                 password_hash="bcrypt$enqueue-test",  # noqa: S106 — local-dev test seed
             )
             .on_conflict_do_nothing(index_elements=["user_id"])
@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"FILE not found: {args.path}\n")
         return 2
 
-    user_id = _resolve_tenant(args.tenant)
+    user_id = resolve_tenant(args.tenant)
     async_result = ingest_book.delay(str(args.path), str(user_id))
     sys.stdout.write(
         f"Enqueued ingest task_id={async_result.id} path={args.path} user_id={user_id}\n",

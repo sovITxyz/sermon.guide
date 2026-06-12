@@ -44,6 +44,7 @@ Make targets (also run from `worker/`):
 | `ingest`            | `make ingest FILE=path/to/book.epub USER=<user_uuid>` — single-book dedup-aware pipeline (Phase 8). The book_id is decided by dedup, not passed in. |
 | `worker`            | `uv run celery -A celery_app worker --loglevel=info` — long-running Phase 9 Celery prefork worker. Sources `../infra/.env` for Redis broker. |
 | `enqueue`           | `make enqueue FILE=path TENANT=<uuid\|label>` — test producer for `worker`. Label form auto-derives a stable uuid5 and upserts a `users` row so the FK resolves. |
+| `seed-corpus`       | `make seed-corpus [ARGS=--dry-run]` — Phase 23 idempotent bulk-ingest of the public-domain seed manifest (`seeds/manifest.jsonl`) through Celery + dedup with deterministic Phase 20 claims. Needs a running `make worker`. See "Seed corpus (Phase 23)" below + `docs/SEED_CORPUS.md`. |
 | `migrate-up`        | `alembic upgrade head` against the docker-compose Postgres. Idempotent. |
 | `migrate-down`      | `alembic downgrade -1` (one revision). `make migrate-down REV=base` wipes all the way. |
 | `migrate-new`       | `make migrate-new MSG="describe change"` → `alembic revision --autogenerate`. Review the generated file before committing — autogenerate misses `server_default`, enum diffs, and may rename indexes cosmetically. |
@@ -560,6 +561,46 @@ ARGS=--execute`).
   Milvus exprs are built only from allowlist-validated book_ids.
 
 Both are idempotent — a second run finds nothing to do.
+
+### Seed corpus (Phase 23)
+
+`scripts/seed_corpus.py` bulk-ingests the tracked public-domain seed
+manifest — `worker/seeds/manifest.jsonl`, the repo's auditable rights
+record (policy: `docs/CORPUS_POLICY.md`; operator runbook:
+`docs/SEED_CORPUS.md`). It shares the maintenance-script conventions
+(argparse, sync session factory, env-sourcing Makefile target, pure
+helpers unit-tested keyless in `tests/test_seed_corpus.py`, store
+mutations validated live) and adds four invariants of its own:
+
+- **Manifest only, never files.** Ebook bytes live in `tests/samples/`
+  (gitignored) — deliberately the same directory the golden suite
+  resolves sample filenames from, so one download serves the live seed
+  AND the golden rows. The loader is strict (allowlisted `source`,
+  `license` must be exactly `public-domain`, lowercase-kebab
+  traversal-safe filenames, no unknown fields) and the committed
+  manifest is audited by a keyless unit test on every CI run.
+- **Deterministic Phase 20 claim.** The Celery task id is
+  `uuid5(SEED_TASK_NAMESPACE, "<sha256(file)>:<user_id>")` and the
+  matching `upload_tasks` row commits BEFORE `apply_async` (the
+  `api/uploads.py` ordering) — so unlike `make enqueue` (claim-less,
+  legacy Phase 9 posture) a crashed seed re-run finds its claim and
+  converges under the same `book_id`. Content hash, never filename, keys
+  the token: a replaced file mints a fresh token instead of inheriting a
+  stale claim. `SEED_TASK_NAMESPACE` and the seed identity are pinned by
+  unit tests — changing the namespace orphans prior runs' claims.
+- **Ownership.** Everything seeds under the `corpus-seed` label user
+  (`d296b559-28f8-54d6-9577-a5539913335c`), resolved through the same
+  `scripts.enqueue_ingest.resolve_tenant` label machinery `make enqueue`
+  uses (those names went public in Phase 23 — the derivation is now a
+  shared seam; keep `seed_user_id()` and `resolve_tenant` in lockstep).
+  No tenant's `user_library` is touched; the golden fixture re-ingests
+  under its own user and dedup-hits onto the shared `book_id`.
+- **Serial by default** (`--max-in-flight 1`, waits per book). The 300 s
+  broker visibility timeout plus a free worker slot can interleave a
+  redelivered copy with a still-running ingest (the Phase 20
+  concurrent-execution residual) and double a book's vectors — raise
+  parallelism only per the runbook's "Parallelism" section, and verify
+  per-book vector==chunk counts afterwards.
 
 ## Milvus client init
 

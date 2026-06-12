@@ -5,21 +5,42 @@ this file pins the small, deterministic pieces of ``worker/retrieval.py``
 that the API depends on so regressions in filter-expression shape,
 RRF fusion math, or short-circuit semantics surface without requiring
 infra.
+
+Phase 22 adds the ``run_search`` graceful-degradation contract, every
+I/O seam monkeypatched (``search._dense_arm`` / ``search.bm25_search`` /
+``search.rerank`` / ``search.highlight``):
+
+- One retrieval arm down → the surviving arm's results + the failed arm
+  named in ``degraded`` — and the surviving arm ran with the exact
+  JWT-derived ``book_id`` set resolved before the fan-out (degradation
+  never widens scope).
+- Both arms down → 503 with the fixed detail (never the exception text).
+- Rerank failure → raw RRF top-K fallback + ``"rerank"`` flag, and
+  highlight STILL runs on the RRF-ordered fallback.
+- Highlight failure → reranked hits pass through unpruned + flag.
+- Cancellation is flow control, never swallowed into a degraded response.
 """
 
 # Tests exercise module-internals on purpose. ``pytest.approx`` ships
-# loose stubs that pyright strict reports as Unknown — silence per-file.
-# pyright: reportPrivateUsage=false, reportUnknownMemberType=false
+# loose stubs that pyright strict reports as Unknown — silence per-file
+# (pymilvus ships no ``py.typed`` either; same relaxations as search.py).
+# pyright: reportPrivateUsage=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownVariableType=false, reportMissingTypeStubs=false
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from typing import Any
 
 import pytest
+from fastapi import HTTPException
+from inference import RemoteInferenceError
 from pydantic import ValidationError
+from pymilvus import MilvusException
 from retrieval import RetrievalHit, _build_milvus_filter, rrf_fuse
 
-from search import SearchRequest
+import search as search_module
+from search import SearchOutcome, SearchRequest
 
 
 def test_build_milvus_filter_quotes_each_uuid() -> None:
@@ -141,3 +162,302 @@ def test_search_request_forbids_extra_fields() -> None:
         SearchRequest.model_validate({"query": "grace", "user_id": str(uuid.uuid4())})
     with pytest.raises(ValidationError):
         SearchRequest.model_validate({"query": "grace", "book_ids": [str(uuid.uuid4())]})
+
+
+# --- run_search graceful degradation (Phase 22) ------------------------------
+
+
+class _FakeScalars:
+    def __init__(self, values: list[uuid.UUID]) -> None:
+        self._values = values
+
+    def all(self) -> list[uuid.UUID]:
+        return self._values
+
+
+class _FakeExecuteResult:
+    def __init__(self, values: list[uuid.UUID]) -> None:
+        self._values = values
+
+    def scalars(self) -> _FakeScalars:
+        return _FakeScalars(self._values)
+
+
+class _FakeSession:
+    """Duck-typed ``AsyncSession``: answers the user_library book_id query."""
+
+    def __init__(self, book_ids: list[uuid.UUID]) -> None:
+        self.book_ids = book_ids
+
+    async def execute(self, _stmt: Any) -> _FakeExecuteResult:  # noqa: ANN401
+        return _FakeExecuteResult(self.book_ids)
+
+
+# The JWT user's resolved library — what BOTH arms must be scoped to.
+_LIBRARY = [uuid.UUID(int=101), uuid.UUID(int=102)]
+
+
+async def _run(
+    *,
+    limit: int = 10,
+    do_rerank: bool = False,
+    book_ids: list[uuid.UUID] | None = None,
+) -> SearchOutcome:
+    session: Any = _FakeSession(_LIBRARY if book_ids is None else book_ids)
+    return await search_module.run_search(
+        query="q",
+        limit=limit,
+        do_rerank=do_rerank,
+        user_id=uuid.uuid4(),
+        session=session,
+    )
+
+
+async def test_run_search_empty_library_short_circuits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _explode(*_args: Any, **_kwargs: Any) -> list[RetrievalHit]:
+        pytest.fail("retrieval arm must not run for an empty library")
+
+    monkeypatch.setattr(search_module, "_dense_arm", _explode)
+    monkeypatch.setattr(search_module, "bm25_search", _explode)
+
+    outcome = await _run(book_ids=[])
+    assert outcome.hits == []
+    assert outcome.degraded == []
+
+
+async def test_run_search_healthy_reports_no_degraded_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = uuid.UUID(int=1)
+
+    async def _dense(_query: str, _book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        return [_hit(a, 0, score=0.9)]
+
+    async def _sparse(**_: Any) -> list[RetrievalHit]:
+        return [_hit(a, 1, score=0.5)]
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+
+    outcome = await _run()
+    assert outcome.degraded == []
+    assert len(outcome.hits) == 2
+
+
+async def test_run_search_dense_down_degrades_to_sparse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def _dense(_query: str, _book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        raise MilvusException(message="connection refused: milvus:19530")
+
+    async def _sparse(**kwargs: Any) -> list[RetrievalHit]:
+        seen["book_ids"] = list(kwargs["book_ids"])
+        return [_hit(uuid.UUID(int=1), 3, score=0.4)]
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+
+    outcome = await _run()
+    assert outcome.degraded == ["dense"]
+    assert [h.metadata["chunk_index"] for h in outcome.hits] == [3]
+    # Tenant pin: the surviving arm ran with the exact JWT-derived library
+    # set resolved once before the fan-out — degradation cannot widen scope.
+    assert seen["book_ids"] == _LIBRARY
+
+
+async def test_run_search_sparse_down_degrades_to_dense(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def _dense(_query: str, book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        seen["book_ids"] = list(book_ids)
+        return [_hit(uuid.UUID(int=2), 5, score=0.8)]
+
+    async def _sparse(**_: Any) -> list[RetrievalHit]:
+        msg = "postgres unreachable"
+        raise ConnectionRefusedError(msg)
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+
+    outcome = await _run()
+    assert outcome.degraded == ["sparse"]
+    assert [h.metadata["chunk_index"] for h in outcome.hits] == [5]
+    assert seen["book_ids"] == _LIBRARY
+
+
+async def test_run_search_both_arms_down_is_503_with_clean_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _dense(_query: str, _book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        raise MilvusException(message="connection refused: milvus:19530")
+
+    async def _sparse(**_: Any) -> list[RetrievalHit]:
+        msg = "postgres://user:hunter2@db:5432 unreachable"
+        raise ConnectionRefusedError(msg)
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _run()
+    assert excinfo.value.status_code == 503
+    # The body is the fixed message — never the exceptions (which can embed
+    # hosts and DSNs; the /readyz never-body-the-failure rule).
+    detail = str(excinfo.value.detail)
+    assert detail == search_module._RETRIEVAL_UNAVAILABLE_DETAIL
+    assert "milvus" not in detail.lower()
+    assert "hunter2" not in detail
+
+
+async def test_run_search_cancellation_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CancelledError is flow control (client disconnect / shutdown), not a
+    dependency failure — it must propagate, never become a degraded arm."""
+
+    async def _dense(_query: str, _book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        raise asyncio.CancelledError
+
+    async def _sparse(**_: Any) -> list[RetrievalHit]:
+        return []
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run()
+
+
+def _arms_with_dense_hits(
+    monkeypatch: pytest.MonkeyPatch,
+    hits: list[RetrievalHit],
+) -> None:
+    """Healthy arms: dense returns *hits*, sparse returns nothing — so the
+    RRF order deterministically mirrors the dense order."""
+
+    async def _dense(_query: str, _book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        return hits
+
+    async def _sparse(**_: Any) -> list[RetrievalHit]:
+        return []
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+
+
+async def test_run_search_rerank_failure_falls_back_to_rrf_and_still_highlights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, b, c = uuid.UUID(int=1), uuid.UUID(int=2), uuid.UUID(int=3)
+    _arms_with_dense_hits(monkeypatch, [_hit(a, 0), _hit(b, 1), _hit(c, 2)])
+
+    def _boom_rerank(**_: Any) -> list[RetrievalHit]:
+        msg = "DeepInfra rerank call failed: timeout"
+        raise RemoteInferenceError(msg)
+
+    highlighted: dict[str, Any] = {}
+
+    def _fake_highlight(*, query: str, hits: Any) -> list[RetrievalHit]:
+        highlighted["query"] = query
+        highlighted["hits"] = list(hits)
+        return list(hits)
+
+    monkeypatch.setattr(search_module, "rerank", _boom_rerank)
+    monkeypatch.setattr(search_module, "highlight", _fake_highlight)
+
+    outcome = await _run(limit=2, do_rerank=True)
+    assert outcome.degraded == ["rerank"]
+    # Raw RRF top-K passthrough — the same order + truncation rerank=false
+    # would have returned.
+    assert [h.book_id for h in outcome.hits] == [a, b]
+    # Highlight STILL ran, on the RRF-ordered fallback (a rerank failure
+    # must not skip pruning — highlight needs only the query + a hit list).
+    assert [h.book_id for h in highlighted["hits"]] == [a, b]
+    assert highlighted["query"] == "q"
+
+
+async def test_run_search_highlight_failure_keeps_reranked_hits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, b = uuid.UUID(int=1), uuid.UUID(int=2)
+    _arms_with_dense_hits(monkeypatch, [_hit(a, 0), _hit(b, 1)])
+
+    def _fake_rerank(**kwargs: Any) -> list[RetrievalHit]:
+        hits: list[RetrievalHit] = list(kwargs["hits"])
+        top_n: int = kwargs["top_n"]
+        return list(reversed(hits))[:top_n]
+
+    def _boom_highlight(**_: Any) -> list[RetrievalHit]:
+        msg = "DeepInfra embeddings call failed: timeout"
+        raise RemoteInferenceError(msg)
+
+    monkeypatch.setattr(search_module, "rerank", _fake_rerank)
+    monkeypatch.setattr(search_module, "highlight", _boom_highlight)
+
+    outcome = await _run(limit=2, do_rerank=True)
+    assert outcome.degraded == ["highlight"]
+    # The reranked order survives, content unpruned.
+    assert [h.book_id for h in outcome.hits] == [b, a]
+    assert [h.content_chunk for h in outcome.hits] == ["chunk-1", "chunk-0"]
+
+
+async def test_run_search_flags_accumulate_in_pipeline_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arm + stage failures in one request stack up: dense, sparse, rerank,
+    highlight — stable, counter-friendly ordering for Phase 27."""
+
+    async def _dense(_query: str, _book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        raise MilvusException(message="connection refused")
+
+    async def _sparse(**_: Any) -> list[RetrievalHit]:
+        return [_hit(uuid.UUID(int=1), 0, score=0.4)]
+
+    def _boom_rerank(**_: Any) -> list[RetrievalHit]:
+        msg = "rerank down"
+        raise RemoteInferenceError(msg)
+
+    def _fake_highlight(*, query: str, hits: Any) -> list[RetrievalHit]:
+        del query
+        return list(hits)
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+    monkeypatch.setattr(search_module, "rerank", _boom_rerank)
+    monkeypatch.setattr(search_module, "highlight", _fake_highlight)
+
+    outcome = await _run(limit=5, do_rerank=True)
+    assert outcome.degraded == ["dense", "rerank"]
+    assert len(outcome.hits) == 1
+
+
+def test_search_response_degraded_defaults_to_empty() -> None:
+    """The Phase 22 field is additive: always present, ``[]`` when healthy."""
+    resp = search_module.SearchResponse(hits=[])
+    assert resp.degraded == []
+    assert resp.model_dump()["degraded"] == []
+
+
+async def test_search_handler_carries_degraded_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_run_search(**_: Any) -> SearchOutcome:  # noqa: ANN401
+        return SearchOutcome(hits=[], degraded=["dense"])
+
+    monkeypatch.setattr(search_module, "run_search", _fake_run_search)
+    user: Any = type("U", (), {"user_id": uuid.uuid4()})()
+    session: Any = object()
+
+    resp = await search_module.search(
+        payload=SearchRequest(query="q"),
+        current_user=user,
+        session=session,
+    )
+    assert resp.degraded == ["dense"]
+    assert resp.hits == []

@@ -5,7 +5,7 @@
 # defaults can be overridden without exporting them in your shell. Pass
 # extra args via `make bootstrap-milvus ARGS=--force`.
 
-.PHONY: lint format format-check typecheck test test-isolation test-retrieval-golden bootstrap-milvus backfill-chunks ingest worker enqueue migrate-up migrate-down migrate-new
+.PHONY: lint format format-check typecheck test test-isolation test-retrieval-golden bootstrap-milvus backfill-chunks clean-parent-sections sweep-orphans ingest worker enqueue migrate-up migrate-down migrate-new
 
 lint:
 	uv run ruff check .
@@ -43,6 +43,19 @@ bootstrap-milvus:
 # `--dry-run` via ARGS to preview, or `--book-id <uuid>` to scope to one.
 backfill-chunks:
 	set -a && . ../infra/.env && set +a && uv run python -m scripts.backfill_chunks $(ARGS)
+
+# Phase 21 maintenance pair. Both are DESTRUCTIVE (Milvus delete+reinsert /
+# orphan deletes), so unlike backfill-chunks they default to a dry-run —
+# pass ARGS=--execute to apply.
+# - clean-parent-sections: strip HTML debris from chunks.parent_section and
+#   the matching Milvus metadata (reuses chunking.clean_heading).
+# - sweep-orphans: delete Milvus vectors with no global_books row and empty
+#   global_books rows; aborts if any candidate is tenant-reachable.
+clean-parent-sections:
+	set -a && . ../infra/.env && set +a && uv run python -m scripts.clean_parent_sections $(ARGS)
+
+sweep-orphans:
+	set -a && . ../infra/.env && set +a && uv run python -m scripts.sweep_orphans $(ARGS)
 
 # Single-book dedup-aware ingest CLI (Phase 8):
 #   detect → extract → MinHash dedup → (skip on hit | chunk → embed → insert) →

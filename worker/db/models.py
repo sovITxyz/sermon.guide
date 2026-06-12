@@ -18,6 +18,7 @@ from sqlalchemy import (
     BigInteger,
     Computed,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -277,6 +278,55 @@ class Highlight(Base):
         # Doubly-scoped queries (user_id AND book_id) per the tenant invariant
         # in CLAUDE.md.
         Index("ix_highlights_user_book", "user_id", "book_id"),
+    )
+
+
+class ReadingPosition(Base):
+    """Last-read location per (user, book) — the reader's resume point (Phase 32).
+
+    One row per user per book, upserted by ``PUT /books/{book_id}/position``
+    ON CONFLICT against ``uq_reading_positions_user_book``. ``chunk_index``
+    is the last-read chunk; ``offset_ratio`` optionally refines it to a
+    0.0–1.0 scroll position within that chunk (validated at the API layer,
+    per the schema-only rule above).
+
+    Doubly-scoped like ``highlights``: every query MUST filter by both
+    ``user_id`` (JWT-derived) and ``book_id``. The ``/library`` progress
+    join in particular must be ON (user_id AND book_id) — book_id alone
+    would leak another tenant's position for a shared deduped book.
+    """
+
+    __tablename__ = "reading_positions"
+
+    position_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("global_books.book_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    offset_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # One position per (user, book) — PUT upserts ON CONFLICT here. The
+        # backing unique index also serves every doubly-scoped lookup (and,
+        # via its user_id prefix, the per-user /library progress join), so
+        # no separate index is needed.
+        UniqueConstraint("user_id", "book_id", name="uq_reading_positions_user_book"),
     )
 
 

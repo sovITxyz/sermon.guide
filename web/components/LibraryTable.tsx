@@ -1,3 +1,4 @@
+import { formatProgress, readHref } from "@/lib/library";
 import type { LibraryBook } from "@/lib/types";
 import Link from "next/link";
 
@@ -27,18 +28,36 @@ export function LibraryTable({ books }: { books: LibraryBook[] }) {
           <th className="py-2 pr-4 font-medium">Title</th>
           <th className="py-2 pr-4 font-medium">Author</th>
           <th className="py-2 pr-4 font-medium">Category</th>
-          <th className="py-2 font-medium">Added</th>
+          <th className="py-2 pr-4 font-medium">Added</th>
+          <th className="py-2 font-medium">Progress</th>
         </tr>
       </thead>
       <tbody>
-        {books.map((book) => (
-          <tr key={book.book_id} className="border-gray-100 border-b">
-            <td className="py-2 pr-4">{book.title}</td>
-            <td className="py-2 pr-4 text-gray-600">{book.author ?? "—"}</td>
-            <td className="py-2 pr-4 text-gray-600">{book.category ?? "—"}</td>
-            <td className="py-2 text-gray-600">{formatAdded(book.added_at)}</td>
-          </tr>
-        ))}
+        {books.map((book) => {
+          // A saved position exists iff last_chunk_index is non-null;
+          // progress can still be null alongside it (book with no chunks).
+          const progressLabel = formatProgress(book.progress);
+          return (
+            <tr key={book.book_id} className="border-gray-100 border-b">
+              <td className="py-2 pr-4">{book.title}</td>
+              <td className="py-2 pr-4 text-gray-600">{book.author ?? "—"}</td>
+              <td className="py-2 pr-4 text-gray-600">{book.category ?? "—"}</td>
+              <td className="py-2 pr-4 text-gray-600">{formatAdded(book.added_at)}</td>
+              <td className="py-2 text-gray-600">
+                {book.last_chunk_index === null ? (
+                  "—"
+                ) : (
+                  <span className="flex flex-wrap items-baseline gap-x-2">
+                    {progressLabel ? <span>{progressLabel}</span> : null}
+                    <Link href={readHref(book.book_id)} className="text-blue-600 hover:underline">
+                      Continue reading
+                    </Link>
+                  </span>
+                )}
+              </td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );

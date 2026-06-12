@@ -51,8 +51,11 @@ Two layers keep the answer grounded (Phase 14 verify: "query nothing-in-corpus
 ## Config & failure modes
 
 - ``SERMON_API_LLM_PROVIDER`` picks the OpenAI-compatible endpoint —
-  ``google`` (default; Google's compat endpoint, ``GOOGLE_API_KEY``) or
-  ``ppq`` (ppq.ai gateway, ``PPQ_API_KEY``). ``_PROVIDERS`` below is the
+  ``deepinfra`` (default since 2026-06-12, amending ADR 0005's original
+  ``google`` default; DeepInfra's compat endpoint, ``DEEPINFRA_API_KEY`` —
+  the same key the embeddings/rerank/highlight legs already use),
+  ``google`` (Google's compat endpoint, ``GOOGLE_API_KEY``), or ``ppq``
+  (ppq.ai gateway, ``PPQ_API_KEY``). ``_PROVIDERS`` below is the
   single source of truth for base_url / default model / key env var, and
   ``SERMON_API_LLM_MODEL`` overrides the model id (ADR 0005).
 - The **active** provider's key is required. The handler 503s up front —

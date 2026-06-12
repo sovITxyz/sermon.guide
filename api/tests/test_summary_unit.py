@@ -17,10 +17,11 @@ load.
   the active provider's pinned model through `chat.completions.create`, and
   fails loud (502) on an upstream `openai.APIError`, an empty completion, or
   a choices-less response.
-- Provider resolution (Phase 14b, ADR 0005): default is google; flipping to
-  ppq picks the ppq base_url/model/key; SERMON_API_LLM_MODEL overrides the
-  model id; the 503 guard names the ACTIVE provider's missing env var and
-  never silently cross-pairs one provider with the other's key.
+- Provider resolution (Phase 14b, ADR 0005): default is deepinfra (operator
+  decision 2026-06-12, amending ADR 0005's original google default); flipping
+  to google/ppq picks that arm's base_url/model/key; SERMON_API_LLM_MODEL
+  overrides the model id; the 503 guard names the ACTIVE provider's missing
+  env var and never silently cross-pairs one provider with the other's key.
 - The handler forces the full pipeline (`do_rerank=True`) with the JWT
   user_id, 503s when the active provider's key is unset *before* retrieval,
   and returns the deterministic no-context message (no LLM call) when nothing
@@ -590,12 +591,18 @@ async def test_handler_degraded_empty_keeps_no_llm_guard_and_flags(
 # --- provider resolution (Phase 14b, ADR 0005) -------------------------------
 
 
-def test_provider_defaults_to_google(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A fresh env (no SERMON_API_LLM_* vars) resolves to the google arm."""
+def test_provider_defaults_to_deepinfra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh env (no SERMON_API_LLM_* vars) resolves to the deepinfra arm.
+
+    Operator decision 2026-06-12 (amends ADR 0005's original google default):
+    the summary LLM rides the same vendor + DEEPINFRA_API_KEY as the rest of
+    the inference stack. google/ppq stay selectable — the flip tests below
+    keep both arms pinned.
+    """
     monkeypatch.delenv("SERMON_API_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("SERMON_API_LLM_MODEL", raising=False)
     fresh = ApiSettings()
-    assert fresh.llm_provider == "google"
+    assert fresh.llm_provider == "deepinfra"
     assert fresh.llm_model is None
 
 

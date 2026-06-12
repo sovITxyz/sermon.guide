@@ -78,10 +78,13 @@ embeddings are remote DeepInfra calls keyed by `DEEPINFRA_API_KEY`.
   presence; no workflow edit needed). Boots compose and runs the golden
   + ingest-e2e + embedding weight-parity suites with the key wired —
   cents per run, cold ingest every run (ephemeral infra means Phase 8
-  dedup idempotency never applies in CI). The golden query rows stay
-  skipped until Phase 23 commits a public-domain CI corpus; infra/key
-  skips in this job are treated as failures, only the corpus-gap skip
-  is tolerated. Fork PRs never receive secrets, so the job skips there.
+  dedup idempotency never applies in CI). The golden query rows skip
+  there as corpus-gap skips — Phase 23 ships `seeds/manifest.jsonl` +
+  the docs/SEED_CORPUS.md download runbook instead of committing sample
+  files, and the harness skips per-row (a partially downloaded corpus
+  still runs every row whose files are on disk); infra/key skips in
+  this job are treated as failures, only the corpus-gap skip is
+  tolerated. Fork PRs never receive secrets, so the job skips there.
 
 Env trap to keep in mind for any new CI step: `db/settings.py` and
 `celery_app.py` defaults bake in the dev box's host-port remaps

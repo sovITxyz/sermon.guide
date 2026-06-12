@@ -4,8 +4,14 @@
 # `bootstrap-milvus` sources infra/.env so the script's SERMON_MILVUS_*
 # defaults can be overridden without exporting them in your shell. Pass
 # extra args via `make bootstrap-milvus ARGS=--force`.
+#
+# Test targets, by posture:
+# - `test`       keyless-fast; never sources infra/.env, live-gated suites
+#                skip silently here BY DESIGN.
+# - `test-live`  the keyed live gate (Phase 23): sources infra/.env and
+#                FAILS on any key/infra skip — see the target comment.
 
-.PHONY: lint format format-check typecheck test test-isolation test-retrieval-golden bootstrap-milvus backfill-chunks clean-parent-sections sweep-orphans ingest worker enqueue migrate-up migrate-down migrate-new
+.PHONY: lint format format-check typecheck test test-live test-isolation test-retrieval-golden bootstrap-milvus backfill-chunks clean-parent-sections sweep-orphans ingest worker enqueue migrate-up migrate-down migrate-new
 
 lint:
 	uv run ruff check .
@@ -21,6 +27,25 @@ typecheck:
 
 test:
 	uv run pytest
+
+# Phase 23 live gate — closes the Phase 20 deviation (ii) silent-skip trap.
+# Sources ../infra/.env (live compose ports + the operator DEEPINFRA_API_KEY;
+# the code defaults in db/settings.py and celery_app.py are stale dev-box
+# remaps — Phase 21 finding iii) and runs the live-gated suites: golden
+# retrieval, ingest e2e (incl. kill-9 redelivery), embedding weight-parity.
+# FAILS on ANY key/infra skip; the only tolerated skip is the corpus gap
+# ("corpus sample(s) missing") — the same classification as CI's
+# retrieval-golden-live guard, implemented in scripts/test_live.sh.
+# Prereqs: `make up` at the repo root, then `make migrate-up` +
+# `make bootstrap-milvus` here. Expect tens of minutes of wall-clock
+# (cold ingest is minutes/book; the warm golden path measured ~26 min —
+# Phase 21 finding iv). Plain `test` stays keyless-fast by design.
+test-live:
+	@test -f ../infra/.env || { \
+		echo 'test-live: ../infra/.env not found.' >&2; \
+		echo 'test-live: run `make up` at the repo root to create it, set the operator DEEPINFRA_API_KEY in it, then re-run.' >&2; \
+		exit 2; }
+	set -a && . ../infra/.env && set +a && bash scripts/test_live.sh
 
 # Phase 3 hard gate: multi-tenant isolation smoke test. Requires a live Milvus
 # (`make up` from repo root). See ARCHITECTURE.md §7.1 and CLAUDE.md.

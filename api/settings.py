@@ -112,10 +112,13 @@ class ApiSettings(BaseSettings):
     # ``deepinfra`` provider added Phase 16b / ADR 0006). ``llm_provider`` picks
     # which OpenAI-compatible endpoint /search-summary talks to; the
     # per-provider base_url / default model / key live in ``summary.py:_PROVIDERS``
-    # (single source of truth). ``deepinfra`` reuses DEEPINFRA_API_KEY so the
-    # whole platform — embeddings, rerank, highlight, AND the summary LLM — can
-    # run on one vendor + one key.
-    llm_provider: Literal["google", "ppq", "deepinfra"] = "google"
+    # (single source of truth). ``deepinfra`` is the DEFAULT (operator decision
+    # 2026-06-12, amending ADR 0005's original ``google`` default): it reuses
+    # the DEEPINFRA_API_KEY that already powers embeddings/rerank/highlight, so
+    # the whole platform runs on one vendor + one key out of the box — whereas
+    # GOOGLE_API_KEY is typically unset and a healthy /search-summary would 503.
+    # ``google`` and ``ppq`` remain fully selectable.
+    llm_provider: Literal["google", "ppq", "deepinfra"] = "deepinfra"
 
     # Optional model-id override (SERMON_API_LLM_MODEL); ``None`` → the active
     # provider's default. Spell it the provider's way — bare ``gemini-2.5-flash``

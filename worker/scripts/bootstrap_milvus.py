@@ -30,9 +30,19 @@ VECTOR_DIM = 1024
 # NOT a per-RPC default, so latency-sensitive call sites must still pass
 # ``timeout=`` per call (``api/readyz.py`` probes at 2.0 s;
 # ``retrieval.dense_search`` reuses this constant). 2.5 s comfortably
-# clears a healthy gRPC handshake (ms-class) while keeping a Milvus-down
-# request fast enough to degrade instead of stalling — the Phase 12 audit
-# measured the unbounded path at 12.2 s.
+# clears a healthy gRPC handshake (ms-class) and bounds a FRESH
+# construction attempt while Milvus is down.
+#
+# What neither deadline bounds: a warm connection's FIRST failure after
+# Milvus dies. pymilvus's retry decorator calls its connection-recovery
+# hook BEFORE the deadline check, and that hook runs an in-request
+# reconnect with a hardcoded 10 s channel-ready wait
+# (``grpc_handler.reconnect(timeout=10)``) — live-measured at ~10-11 s
+# before the ``MilvusException`` surfaces. Only the steady-state calls
+# after that fast-fail (closed channel, sub-second). Hard per-request
+# bounds therefore belong to the caller: ``api/search.py`` budgets the
+# dense arm's whole Milvus leg with ``DENSE_ARM_BUDGET_SECONDS`` via
+# ``asyncio.wait_for``.
 MILVUS_TIMEOUT_SECONDS = 2.5
 
 

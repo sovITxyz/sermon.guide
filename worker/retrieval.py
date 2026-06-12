@@ -115,13 +115,19 @@ def dense_search(
     descending. The ``score`` on each hit is the dense COSINE
     similarity in ``[-1, 1]``; RRF fusion overwrites it later.
 
-    The per-call ``timeout`` (Phase 22) is the TOTAL deadline for the
-    search RPC: pymilvus's retry decorator treats it as a retry budget,
-    so a down/unreachable Milvus surfaces as a typed ``MilvusException``
-    in ~2.5 s instead of the default retry long-tail (12.2 s in the
-    Phase 12 audit). Same pattern as ``api/readyz.py``'s probe — the RPC
-    deadline must do the timing out, a ``wait_for`` can't cancel the
-    blocking thread.
+    The per-call ``timeout`` (Phase 22) is pymilvus's retry budget for
+    the search RPC. It bounds the steady-state-down case (a closed/dead
+    channel fast-fails as a typed ``MilvusException`` in roughly
+    0.4-1.2 s) and keeps retries from compounding — but it is NOT a hard
+    wall-clock ceiling: on a warm connection's FIRST failure pymilvus 2.6
+    calls its connection-recovery hook BEFORE the deadline check, and
+    that hook runs an in-request reconnect with a hardcoded 10 s
+    channel-ready wait (live-measured at ~10-11 s before the exception
+    surfaces). Callers that need a hard per-request bound must enforce it
+    outside the RPC: ``api/search.py`` wraps this call (plus client
+    checkout) in ``asyncio.wait_for`` under ``DENSE_ARM_BUDGET_SECONDS``
+    — the ``wait_for`` cannot cancel the blocking thread, it abandons it,
+    so the orphaned thread drains within pymilvus's own 10 s ceiling.
     """
     expr = _build_milvus_filter(book_ids)
     results = client.search(

@@ -38,7 +38,8 @@ Make targets (also run from `worker/`):
 | `format`            | `uv run ruff format .`                                                                                             |
 | `format-check`      | `uv run ruff format --check .`                                                                                     |
 | `typecheck`         | `uv run pyright`                                                                                                   |
-| `test`              | `uv run pytest`                                                                                                    |
+| `test`              | `uv run pytest` — keyless-fast; never sources `infra/.env`, so live-gated suites skip silently here BY DESIGN.     |
+| `test-live`         | Phase 23 keyed live gate: sources `../infra/.env`, runs the golden + ingest-e2e + embedding weight-parity suites, and FAILS on any key/infra skip. Only the corpus-gap skip (`corpus sample(s) missing`) is tolerated (warned) — same classification as CI's retrieval-golden-live guard, implemented in `scripts/test_live.sh`. Needs the compose stack up + migrations + `bootstrap-milvus`; budget tens of minutes. |
 | `bootstrap-milvus`  | sources `../infra/.env` and runs `scripts/bootstrap_milvus.py`. `make bootstrap-milvus ARGS=--force` drops + recreates. |
 | `ingest`            | `make ingest FILE=path/to/book.epub USER=<user_uuid>` — single-book dedup-aware pipeline (Phase 8). The book_id is decided by dedup, not passed in. |
 | `worker`            | `uv run celery -A celery_app worker --loglevel=info` — long-running Phase 9 Celery prefork worker. Sources `../infra/.env` for Redis broker. |

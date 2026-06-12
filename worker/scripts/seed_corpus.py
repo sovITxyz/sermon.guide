@@ -462,6 +462,13 @@ def run_seed(
             sys.stdout.write(f"{prefix}: would enqueue task_id={task_id} sha256={sha[:12]}…\n")
             continue
         ensure_upload_task_row(task_id=task_id, user_id=user_id, filename=item.book.filename)
+        # Deterministic task ids mean a PREVIOUS run's result can still sit
+        # in the result backend under this id. Drop it BEFORE publishing,
+        # or `.get()` below returns the stale cached payload instead of
+        # THIS run's outcome — a re-run would mis-report "new book" where
+        # the worker actually converged as a duplicate, and a cached
+        # SUCCESS would mask a fresh failure. No-op when no result exists.
+        ingest_book.AsyncResult(str(task_id)).forget()
         async_result = ingest_book.apply_async(
             args=[str(item.path), str(user_id)],
             task_id=str(task_id),

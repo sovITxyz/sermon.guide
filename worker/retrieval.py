@@ -58,7 +58,7 @@ from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from scripts.bootstrap_milvus import COLLECTION_NAME
+from scripts.bootstrap_milvus import COLLECTION_NAME, MILVUS_TIMEOUT_SECONDS
 
 # RRF constant from Cormack et al. 2009 + ARCHITECTURE.md §2. 60 is the
 # load-bearing magic number; changing it requires re-running goldens.
@@ -114,6 +114,14 @@ def dense_search(
     Returns at most *limit* hits, ordered by COSINE similarity
     descending. The ``score`` on each hit is the dense COSINE
     similarity in ``[-1, 1]``; RRF fusion overwrites it later.
+
+    The per-call ``timeout`` (Phase 22) is the TOTAL deadline for the
+    search RPC: pymilvus's retry decorator treats it as a retry budget,
+    so a down/unreachable Milvus surfaces as a typed ``MilvusException``
+    in ~2.5 s instead of the default retry long-tail (12.2 s in the
+    Phase 12 audit). Same pattern as ``api/readyz.py``'s probe — the RPC
+    deadline must do the timing out, a ``wait_for`` can't cancel the
+    blocking thread.
     """
     expr = _build_milvus_filter(book_ids)
     results = client.search(
@@ -122,6 +130,7 @@ def dense_search(
         filter=expr,
         limit=limit,
         output_fields=["book_id", "content_chunk", "metadata"],
+        timeout=MILVUS_TIMEOUT_SECONDS,
     )
     hits: list[RetrievalHit] = []
     for hit in results[0]:

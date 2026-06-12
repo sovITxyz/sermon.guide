@@ -24,11 +24,22 @@ from pymilvus import DataType, MilvusClient
 COLLECTION_NAME = "library_vectors"
 VECTOR_DIM = 1024
 
+# Phase 22 (graceful degradation): the deadline for reaching Milvus at all.
+# In pymilvus 2.6 the client-level ``timeout`` bounds CONNECTION
+# establishment (the channel-ready wait — default 10 s when unset); it is
+# NOT a per-RPC default, so latency-sensitive call sites must still pass
+# ``timeout=`` per call (``api/readyz.py`` probes at 2.0 s;
+# ``retrieval.dense_search`` reuses this constant). 2.5 s comfortably
+# clears a healthy gRPC handshake (ms-class) while keeping a Milvus-down
+# request fast enough to degrade instead of stalling — the Phase 12 audit
+# measured the unbounded path at 12.2 s.
+MILVUS_TIMEOUT_SECONDS = 2.5
+
 
 def make_client() -> MilvusClient:
     host = os.environ.get("SERMON_MILVUS_HOST", "localhost")
     port = os.environ.get("SERMON_MILVUS_PORT", "19530")
-    return MilvusClient(uri=f"http://{host}:{port}")
+    return MilvusClient(uri=f"http://{host}:{port}", timeout=MILVUS_TIMEOUT_SECONDS)
 
 
 def main() -> int:

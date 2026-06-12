@@ -19,6 +19,19 @@ I/O seam monkeypatched (``search._dense_arm`` / ``search.bm25_search`` /
   highlight STILL runs on the RRF-ordered fallback.
 - Highlight failure → reranked hits pass through unpruned + flag.
 - Cancellation is flow control, never swallowed into a degraded response.
+
+The dense-arm client-lifecycle tests run the REAL ``_dense_arm`` (only
+``make_client`` / ``_embed_query`` / ``dense_search`` / ``bm25_search``
+monkeypatched) to pin the Phase 22 Milvus-recovery mechanics:
+
+- A dense-arm ``MilvusException`` resets the process-wide client
+  singleton; the next request reconstructs via ``make_client`` (counted)
+  and a healthy client restores ``degraded == []``.
+- ``DENSE_ARM_BUDGET_SECONDS`` expiry → ``TimeoutError`` → degraded
+  ``["dense"]`` with sparse results intact, no premature reset (the
+  orphaned thread's own outcome decides).
+- Outer cancellation during the budget window re-raises
+  ``CancelledError`` through ``wait_for`` — never a degrade.
 """
 
 # Tests exercise module-internals on purpose. ``pytest.approx`` ships
@@ -29,6 +42,7 @@ I/O seam monkeypatched (``search._dense_arm`` / ``search.bm25_search`` /
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from typing import Any
 
@@ -332,6 +346,157 @@ async def test_run_search_cancellation_is_not_swallowed(
 
     with pytest.raises(asyncio.CancelledError):
         await _run()
+
+
+# --- dense-arm client lifecycle: reset + budget (Phase 22) -------------------
+
+
+def _install_dense_leg_seams(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dense_search_fn: Any,
+    sparse_hits: list[RetrievalHit] | None = None,
+) -> list[object]:
+    """Run the REAL ``_dense_arm`` against fakes.
+
+    ``make_client`` counts constructions (returned list), the embed is
+    instant, ``dense_search`` is caller-supplied, and the sparse arm is
+    healthy. The singleton starts unset and monkeypatch restores it after
+    the test.
+    """
+    constructed: list[object] = []
+
+    def _fake_make_client() -> Any:
+        client = object()
+        constructed.append(client)
+        return client
+
+    async def _sparse(**_: Any) -> list[RetrievalHit]:
+        return list(sparse_hits or [])
+
+    monkeypatch.setattr(search_module, "_milvus_client", None)
+    monkeypatch.setattr(search_module, "make_client", _fake_make_client)
+    monkeypatch.setattr(search_module, "_embed_query", lambda _q: [0.0])
+    monkeypatch.setattr(search_module, "dense_search", dense_search_fn)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+    return constructed
+
+
+async def test_dense_milvus_exception_resets_client_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dense-arm ``MilvusException`` drops the process-wide client.
+
+    Without the reset, pymilvus's post-recovery closed channel raises
+    non-gRPC errors its own recovery never retries — the pinned client
+    stays dead past the outage. Dropping it makes the next request
+    reconstruct via ``make_client``.
+    """
+
+    def _boom(**_: Any) -> list[RetrievalHit]:
+        raise MilvusException(message="connection refused: milvus:19530")
+
+    constructed = _install_dense_leg_seams(
+        monkeypatch,
+        dense_search_fn=_boom,
+        sparse_hits=[_hit(uuid.UUID(int=1), 3, score=0.4)],
+    )
+
+    outcome = await _run()
+    assert outcome.degraded == ["dense"]
+    assert [h.metadata["chunk_index"] for h in outcome.hits] == [3]
+    assert len(constructed) == 1
+    # The singleton was dropped — the next request will reconstruct.
+    assert search_module._milvus_client is None
+
+
+async def test_dense_arm_reconstructs_after_reset_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a reset, a healthy client restores ``degraded == []`` — and the
+    reconstruction really happened (one ``make_client`` call per run)."""
+    state = {"up": False}
+
+    def _dense(**_: Any) -> list[RetrievalHit]:
+        if not state["up"]:
+            raise MilvusException(message="connection refused: milvus:19530")
+        return [_hit(uuid.UUID(int=2), 5, score=0.8)]
+
+    constructed = _install_dense_leg_seams(monkeypatch, dense_search_fn=_dense)
+
+    outage = await _run()
+    assert outage.degraded == ["dense"]
+    assert len(constructed) == 1
+    assert search_module._milvus_client is None
+
+    state["up"] = True
+    recovered = await _run()
+    assert recovered.degraded == []
+    assert [h.metadata["chunk_index"] for h in recovered.hits] == [5]
+    # A SECOND client was constructed and republished as the singleton.
+    assert len(constructed) == 2
+    assert search_module._milvus_client is constructed[1]
+
+
+async def test_dense_budget_expiry_degrades_with_sparse_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Budget expiry → ``TimeoutError`` → degraded ``["dense"]``, sparse
+    results untouched. The worker thread is orphaned, not cancelled — the
+    test releases it explicitly; its eventual SUCCESS means the client was
+    healthy-but-slow, so no reset fires (the orphaned thread's own outcome
+    decides)."""
+    release = threading.Event()
+
+    def _stuck(**_: Any) -> list[RetrievalHit]:
+        # Stands in for pymilvus's hardcoded-10 s in-request reconnect.
+        release.wait(timeout=5.0)
+        return []
+
+    constructed = _install_dense_leg_seams(
+        monkeypatch,
+        dense_search_fn=_stuck,
+        sparse_hits=[_hit(uuid.UUID(int=1), 3, score=0.4)],
+    )
+    monkeypatch.setattr(search_module, "DENSE_ARM_BUDGET_SECONDS", 0.05)
+
+    try:
+        outcome = await _run()
+    finally:
+        release.set()
+    assert outcome.degraded == ["dense"]
+    assert [h.metadata["chunk_index"] for h in outcome.hits] == [3]
+    assert len(constructed) == 1
+    # Expiry alone is not evidence the client is bad — it stays published.
+    assert search_module._milvus_client is constructed[0]
+
+
+async def test_dense_budget_does_not_swallow_outer_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine cancellation re-raises ``CancelledError`` through ``wait_for``
+    — flow control, never a ``TimeoutError`` degrade (complements
+    ``test_run_search_cancellation_is_not_swallowed``, which pins the same
+    invariant for an arm that raises ``CancelledError`` itself)."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _stuck(**_: Any) -> list[RetrievalHit]:
+        entered.set()
+        release.wait(timeout=5.0)
+        return []
+
+    _install_dense_leg_seams(monkeypatch, dense_search_fn=_stuck)
+
+    task = asyncio.create_task(_run())
+    try:
+        # Wait (off the loop) until the dense leg is inside the budget window.
+        assert await asyncio.to_thread(entered.wait, 2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
 
 
 def _arms_with_dense_hits(

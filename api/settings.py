@@ -126,12 +126,17 @@ class ApiSettings(BaseSettings):
     llm_model: str | None = None
 
     # Optional reasoning-effort knob (SERMON_API_LLM_REASONING_EFFORT); ``None``
-    # → not sent, provider default applies. Phase 16b latency lever: Gemini 2.5
-    # Flash runs thinking by default through the OpenAI-compat layer (~60s of
-    # the /search-summary round-trip); Google's compat endpoint accepts
-    # ``"none"`` to disable it. Sent verbatim via ``extra_body`` — whether a
-    # gateway (ppq) forwards it is a provider property, probed live per phase
-    # row, not assumed.
+    # → the active provider row's ``default_reasoning_effort`` applies
+    # (``summary.py:_PROVIDERS``): ``"none"`` on deepinfra — whose served
+    # Gemini 2.5 Flash otherwise INLINES a literal <think> block into the
+    # summary text (live finding 2026-06-12) — and omitted-from-the-request on
+    # google/ppq. Phase 16b latency lever: Gemini 2.5 Flash runs thinking by
+    # default through the OpenAI-compat layer (~60s of the /search-summary
+    # round-trip); Google's compat endpoint accepts ``"none"`` to disable it.
+    # Sent verbatim via ``extra_body`` when resolved — whether a gateway (ppq)
+    # forwards it is a provider property, probed live per phase row, not
+    # assumed, which is why the per-provider default lives on the row rather
+    # than here.
     llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
 
     @field_validator("env", mode="before")

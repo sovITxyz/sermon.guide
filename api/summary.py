@@ -143,6 +143,14 @@ class _Provider:
     # Late-bound so the per-request guard (and tests monkeypatching settings)
     # always sees the current value, never an import-time snapshot.
     api_key: Callable[[], str | None]
+    # Per-provider ``reasoning_effort`` applied when SERMON_API_LLM_REASONING_EFFORT
+    # is unset (the env knob always wins when set). ``None`` → the param is
+    # omitted from the request entirely — the safe stance for endpoints whose
+    # tolerance of it is unprobed (ppq's chat.completions, ADR 0006) or whose
+    # default behavior is already acceptable (google separates thinking from
+    # the returned text). Only set a value here that the provider is
+    # live-verified to honor.
+    default_reasoning_effort: str | None = None
 
 
 # Single source of truth for provider → endpoint/model/key, selected via
@@ -170,11 +178,21 @@ _PROVIDERS: Mapping[str, _Provider] = {
     # uses), keyed by the same DEEPINFRA_API_KEY — so the whole inference stack
     # collapses to one vendor + one key. reasoning_effort=none is honored here
     # (probed live 2026-06-09), unlike ppq's chat.completions.
+    #
+    # default_reasoning_effort="none": without it, DeepInfra-served Gemini 2.5
+    # Flash runs thinking by default AND inlines the literal <think>...</think>
+    # block into message.content (defect found in the 2026-06-12 live verify of
+    # the deepinfra-default flip) — the raw reasoning would land in the user's
+    # summary. "none" is live-verified honored on this endpoint, so the default
+    # experience is think-free with no operator env edits; ppq/google rows keep
+    # omitting the param (unprobed on ppq's chat.completions / not needed on
+    # google, whose compat layer keeps thinking out of the returned text).
     "deepinfra": _Provider(
         base_url="https://api.deepinfra.com/v1/openai",
         default_model="google/gemini-2.5-flash",
         key_env_var="DEEPINFRA_API_KEY",
         api_key=lambda: settings.deepinfra_api_key,
+        default_reasoning_effort="none",
     ),
 }
 
@@ -392,7 +410,13 @@ def _generate_summary(*, query: str, sources: Sequence[_Source]) -> str:
     # Phase 16b: optionally disable/cap thinking (SERMON_API_LLM_REASONING_EFFORT).
     # Sent via extra_body so the knob is provider-agnostic and forward-compatible
     # with values the SDK's typed literal hasn't caught up to (e.g. "none").
-    reasoning = settings.llm_reasoning_effort
+    # When the env knob is unset, the active provider row's
+    # default_reasoning_effort applies (deepinfra → "none", else omitted) —
+    # see the _PROVIDERS deepinfra comment for the <think>-inlining defect
+    # this guards against.
+    reasoning: str | None = settings.llm_reasoning_effort
+    if reasoning is None:
+        reasoning = provider.default_reasoning_effort
     extra_body = {"reasoning_effort": reasoning} if reasoning is not None else None
     try:
         response = _client().chat.completions.create(

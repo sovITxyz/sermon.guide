@@ -194,6 +194,29 @@ def _bge_tokenizer() -> Tokenizer:
     return Tokenizer.from_file(str(_TOKENIZER_PATH))
 
 
+def token_count(text: str) -> int:
+    """Count *text*'s BGE content tokens (special tokens excluded), keyless.
+
+    Pure local tokenization through the bundled WordPiece ruleset — no
+    weights, no network, no key. Callers that size text against the
+    embedder's window (e.g. ``chunking`` sub-splitting an oversized chunk so
+    the stored text matches what the embedder actually encodes) reuse this so
+    the count can never drift from ``_truncate_to_tokens``' own tokenizer.
+    """
+    return len(_bge_tokenizer().encode(text, add_special_tokens=False).ids)
+
+
+def truncation_token_limit() -> int:
+    """The BGE content-token window inputs are truncated to before embedding.
+
+    Exposes ``_MAX_CONTENT_TOKENS`` (ADR 0006 §truncation) as a public read so
+    callers can pre-size text to fit the embedder's window — keeping the stored
+    chunk text aligned with the tokens the embedder will actually encode —
+    without importing the private constant.
+    """
+    return _MAX_CONTENT_TOKENS
+
+
 def _truncate_to_tokens(text: str, limit: int) -> str:
     """Trim *text* to at most *limit* BGE content tokens (special tokens excluded).
 

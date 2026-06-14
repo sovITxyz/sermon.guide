@@ -33,7 +33,11 @@ The model is instructed to cite those exact markers inline. The returned
 ``citations`` list is the subset of sources whose markers actually appear in
 the summary text, in order of first appearance — so a client can resolve
 every marker, and a marker the model paraphrases or invents simply doesn't
-resolve (it is never returned as a fake citation). See ``_extract_citations``.
+resolve (it is never returned as a fake citation). The model also tends to
+collapse adjacent citations into one comma-merged bracket like
+``[Faith:7, Hope:9]``; each member that resolves against the source set is
+returned, so a merged group is not silently dropped. See
+``_extract_citations``.
 
 ## Grounding & the hallucination guard
 
@@ -458,23 +462,102 @@ def _to_citation(source: _Source) -> Citation:
     )
 
 
+# Pulls each bracket group out of the summary — the inner text never contains a
+# nested bracket (labels strip ``[``/``]``, see ``_LABEL_BANNED``), so a flat
+# ``[^\[\]]*`` body is exact. Used to walk merged groups like ``[A:7, B:9]``.
+_BRACKET_GROUP = re.compile(r"\[[^\[\]]*\]")
+
+
+def _resolve_group_members(inner: str, by_inner: Mapping[str, _Source]) -> list[_Source]:
+    """Resolve the comma-separated members of one bracket body to known sources.
+
+    *inner* is the text between a ``[`` and ``]`` (no nested brackets). Each
+    member is a ``<label>:<chunk_index>`` marker; the LLM may merge several into
+    one group as ``[A:7, B:9]``. Resolution is greedy longest-prefix against the
+    known inner-marker set rather than a naive ``split(",")`` because a book
+    *label* can itself contain commas (only ``[``/``]``/``:`` are stripped, see
+    ``_label_from_title``), so ``[Faith, Hope:7]`` is a single member, not two.
+
+    At each separator boundary we take the longest known marker the remaining
+    text starts with that is then followed by end-of-group or a comma — longest
+    wins so a label-internal comma is absorbed before we split on it. Text that
+    resolves to no known marker is skipped to the next comma and never returned,
+    so an invented member can't fabricate a citation.
+    """
+    resolved: list[_Source] = []
+    pos = 0
+    n = len(inner)
+    while pos < n:
+        # Skip leading whitespace before a member.
+        while pos < n and inner[pos] == " ":
+            pos += 1
+        if pos == n:
+            break
+        best: _Source | None = None
+        best_end = pos
+        for candidate, source in by_inner.items():
+            end = pos + len(candidate)
+            # The candidate must match here, end past the current best (longest
+            # wins, absorbing a label-internal comma), AND be bounded by
+            # end-of-group or a comma — else ``Faith:1`` matches in ``Faith:12``.
+            if end <= best_end or not inner.startswith(candidate, pos):
+                continue
+            if end == n or inner[end] == ",":
+                best = source
+                best_end = end
+        if best is not None:
+            resolved.append(best)
+            pos = best_end
+            # Step over the separating comma (and any following space handled at
+            # the top of the loop).
+            if pos < n and inner[pos] == ",":
+                pos += 1
+        else:
+            # Unresolvable member: skip to the next comma so a stray token can't
+            # derail the rest of the group, and never emit it as a citation.
+            nxt = inner.find(",", pos)
+            if nxt == -1:
+                break
+            pos = nxt + 1
+    return resolved
+
+
 def _extract_citations(summary_text: str, sources: Sequence[_Source]) -> list[Citation]:
     """Return the sources whose markers appear in *summary_text*, first-appearance order.
 
     Only markers we handed the model resolve — a marker the model paraphrases
     or invents is ignored, so the citation list never carries an unresolvable
-    or hallucinated reference. The trade-off is that an off-format marker
-    drops a real citation; acceptable for v0, where the grounding instruction
-    pins the exact marker strings. Markers are bracket-delimited, so no marker
-    is a substring of another (``[X:1]`` cannot match inside ``[X:12]``).
+    or hallucinated reference. Markers are bracket-delimited, so no marker is a
+    substring of another (``[X:1]`` cannot match inside ``[X:12]``).
+
+    Comma-merged brackets are handled member-by-member: the model often collapses
+    adjacent citations into one group like ``[Faith:7, Hope:9]``, and every
+    member that resolves against the source set is returned (the v0 silent-drop
+    of merged-only members is gone). A single-marker bracket behaves exactly as
+    before. Resolution is greedy longest-prefix against the known marker set,
+    not a naive comma split, because a book label can itself contain a comma
+    (only ``[``/``]``/``:`` are stripped), so ``[Faith, Hope:7]`` is one member.
+
+    First-appearance order is by the bracket group's position in *summary_text*;
+    within a merged group, by member order. The result is de-duped by marker,
+    first occurrence winning.
     """
-    appearances: list[tuple[int, _Source]] = []
+    by_inner: dict[str, _Source] = {}
     for source in sources:
-        idx = summary_text.find(source.marker)
-        if idx != -1:
-            appearances.append((idx, source))
-    appearances.sort(key=lambda item: item[0])
-    return [_to_citation(source) for _, source in appearances]
+        # Strip the surrounding ``[``/``]`` to get the comparable member text.
+        inner = source.marker[1:-1]
+        by_inner.setdefault(inner, source)
+
+    seen: set[str] = set()
+    citations: list[Citation] = []
+    for match in _BRACKET_GROUP.finditer(summary_text):
+        body = match.group()[1:-1]
+        for source in _resolve_group_members(body, by_inner):
+            if source.marker in seen:
+                continue
+            seen.add(source.marker)
+            citations.append(_to_citation(source))
+    return citations
 
 
 async def _resolve_titles(

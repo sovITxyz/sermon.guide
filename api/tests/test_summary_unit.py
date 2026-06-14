@@ -12,7 +12,10 @@ load.
 - `_build_prompt` carries the query + every marker-prefixed passage.
 - `_extract_citations` returns only markers present in the summary, in
   first-appearance order, and never an invented one — markers are
-  bracket-delimited, so `[X:1]` cannot match inside `[X:12]`.
+  bracket-delimited, so `[X:1]` cannot match inside `[X:12]`. Phase 24:
+  comma-merged brackets (`[A:7, B:9]`) resolve every member; a label that
+  itself contains a comma stays one member (greedy longest-prefix, not a
+  naive split); an invented member in a merged group is dropped, not faked.
 - `_generate_summary` wires the system+user messages, the sampling knobs, and
   the active provider's pinned model through `chat.completions.create`, and
   fails loud (502) on an upstream `openai.APIError`, an empty completion, or
@@ -293,6 +296,92 @@ def test_extract_citations_substring_safety() -> None:
     sources = summary_module._build_sources([_hit(1, 1), _hit(1, 12)], {b1: "Faith"})
     cites = summary_module._extract_citations("See [Faith:12] only.", sources)
     assert [c.marker for c in cites] == ["[Faith:12]"]
+
+
+def test_extract_citations_merged_bracket_resolves_every_member() -> None:
+    # Phase 24: the model collapses adjacent citations into one comma-merged
+    # bracket. Every member that resolves against the source set is returned —
+    # the v0 silent-drop of merged-only members is gone.
+    b1, b2 = uuid.UUID(int=1), uuid.UUID(int=2)
+    sources = summary_module._build_sources(
+        [_hit(1, 70), _hit(2, 51)],
+        {b1: "Augustine", b2: "Aquinas"},
+    )
+    cites = summary_module._extract_citations(
+        "Grace and nature converge [Augustine:70, Aquinas:51].",
+        sources,
+    )
+    assert [c.marker for c in cites] == ["[Augustine:70]", "[Aquinas:51]"]
+    assert [c.book_id for c in cites] == [b1, b2]
+
+
+def test_extract_citations_merged_bracket_same_book_both_chunks() -> None:
+    # A merged group whose members share a book label and differ only by chunk
+    # index — both must resolve, and the substring guard must still hold inside
+    # the group (`Faith:1` is bounded by the comma, `Faith:12` by the bracket).
+    b1 = uuid.UUID(int=1)
+    sources = summary_module._build_sources([_hit(1, 1), _hit(1, 12)], {b1: "Faith"})
+    cites = summary_module._extract_citations("Both [Faith:1, Faith:12] cited.", sources)
+    assert [c.marker for c in cites] == ["[Faith:1]", "[Faith:12]"]
+
+
+def test_extract_citations_merged_bracket_ignores_invented_member() -> None:
+    # Phase 24: a merged group mixing a real and an invented member resolves
+    # only the real one — never fabricate the unresolvable token.
+    b1 = uuid.UUID(int=1)
+    sources = summary_module._build_sources([_hit(1, 0)], {b1: "Faith"})
+    cites = summary_module._extract_citations(
+        "Mixed [Faith:0, Nonexistent:7] reference.",
+        sources,
+    )
+    assert [c.marker for c in cites] == ["[Faith:0]"]
+
+
+def test_extract_citations_merged_bracket_all_invented_returns_empty() -> None:
+    # A merged group of only invented members fabricates nothing.
+    b1 = uuid.UUID(int=1)
+    sources = summary_module._build_sources([_hit(1, 0)], {b1: "Faith"})
+    assert summary_module._extract_citations("All fake [Ghost:1, Phantom:2].", sources) == []
+
+
+def test_extract_citations_label_with_comma_is_single_member() -> None:
+    # A book label can contain a comma (only `[`/`]`/`:` are stripped), so
+    # `[Faith, Hope:7]` is ONE member, not two — a naive comma split would
+    # mis-resolve it. Greedy longest-prefix matching keeps it whole.
+    b1 = uuid.UUID(int=1)
+    sources = summary_module._build_sources([_hit(1, 7)], {b1: "Faith, Hope"})
+    assert sources[0].marker == "[Faith, Hope:7]"
+    cites = summary_module._extract_citations("See [Faith, Hope:7] here.", sources)
+    assert [c.marker for c in cites] == ["[Faith, Hope:7]"]
+
+
+def test_extract_citations_merged_member_with_comma_label_and_sibling() -> None:
+    # The comma-bearing label merged with a plain sibling: the longest-prefix
+    # match must absorb the label-internal comma before splitting on the real
+    # member separator.
+    b1, b2 = uuid.UUID(int=1), uuid.UUID(int=2)
+    sources = summary_module._build_sources(
+        [_hit(1, 7), _hit(2, 3)],
+        {b1: "Faith, Hope", b2: "Love"},
+    )
+    assert sources[0].marker == "[Faith, Hope:7]"
+    cites = summary_module._extract_citations("Both [Faith, Hope:7, Love:3] cited.", sources)
+    assert [c.marker for c in cites] == ["[Faith, Hope:7]", "[Love:3]"]
+
+
+def test_extract_citations_mixed_single_and_merged_ordering() -> None:
+    # Ordering is by bracket-group position in the text, then member order
+    # within a merged group; de-duped by marker, first occurrence winning.
+    b1, b2, b3 = uuid.UUID(int=1), uuid.UUID(int=2), uuid.UUID(int=3)
+    sources = summary_module._build_sources(
+        [_hit(1, 0), _hit(2, 0), _hit(3, 0)],
+        {b1: "Faith", b2: "Hope", b3: "Love"},
+    )
+    cites = summary_module._extract_citations(
+        "First [Hope:0], then [Faith:0, Love:0], and again [Hope:0].",
+        sources,
+    )
+    assert [c.marker for c in cites] == ["[Hope:0]", "[Faith:0]", "[Love:0]"]
 
 
 # --- llm call ----------------------------------------------------------------

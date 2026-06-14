@@ -25,7 +25,18 @@ from pathlib import Path
 
 import pytest
 
-from chunking import Chunk, _heading_offsets, _parent_section_for, chunk, clean_heading
+from chunking import (
+    _HARD_MAX_CHUNK_BYTES,
+    _MAX_CHUNK_BYTES,
+    _MAX_CHUNK_TOKENS,
+    Chunk,
+    _cap_oversized_chunks,
+    _heading_offsets,
+    _parent_section_for,
+    chunk,
+    clean_heading,
+)
+from inference import token_count
 
 SAMPLES = Path(__file__).resolve().parent / "samples"
 EPUB_SAMPLE = SAMPLES / "sample.epub"
@@ -194,6 +205,132 @@ def test_anchor_only_heading_before_any_real_heading_yields_none() -> None:
     headings = _heading_offsets(md)
     assert headings == []
     assert _parent_section_for(md.index("body"), headings) is None
+
+
+# ---------------------------------------------------------------------------
+# Oversized-chunk sub-split (the `_cap_oversized_chunks` post-process pass).
+#
+# Pure + keyless: these drive the sub-split helper directly with synthetic
+# Chunks, never the remote embedder. The live bug they regress: the
+# SemanticSplitter sizes on meaning, not bytes, so a large homogeneous section
+# can produce a single chunk over Milvus's 65535-byte `content_chunk` cap and
+# the Milvus insert is rejected (live: a 355687-char chunk from a seeded EPUB).
+
+
+def _assert_subchunks_valid(
+    out: list[Chunk],
+    *,
+    original: str,
+    base_offset: int,
+    parent_section: str | None,
+) -> None:
+    """Every invariant the sub-split pass must hold for an oversized chunk."""
+    assert out, "oversized chunk produced no sub-chunks"
+    for c in out:
+        # HARD: never exceed Milvus's VARCHAR byte cap.
+        assert len(c.text.encode("utf-8")) <= _HARD_MAX_CHUNK_BYTES, (
+            f"sub-chunk {len(c.text.encode('utf-8'))} bytes > {_HARD_MAX_CHUNK_BYTES}"
+        )
+        # SOFT: stay inside the embedder's token window so stored text matches
+        # what the embedder actually encodes.
+        assert token_count(c.text) <= _MAX_CHUNK_TOKENS, (
+            f"sub-chunk {token_count(c.text)} tokens > {_MAX_CHUNK_TOKENS}"
+        )
+        # parent_section carried onto every sub-chunk.
+        assert c.parent_section == parent_section
+        # Codepoint-safe: text round-trips through UTF-8 with no broken
+        # multibyte sequence (a mid-codepoint cut would raise / differ).
+        assert c.text.encode("utf-8").decode("utf-8") == c.text
+    # No text loss: sub-chunks reproduce the original exactly.
+    assert "".join(c.text for c in out) == original
+    # Offsets are valid, contiguous, non-overlapping windows into the source.
+    prev = base_offset
+    for c in out:
+        assert c.start_idx == prev, "sub-chunks not contiguous"
+        assert c.start_idx < c.end_idx, "empty/inverted sub-chunk window"
+        assert c.text == original[c.start_idx - base_offset : c.end_idx - base_offset]
+        prev = c.end_idx
+    assert prev == base_offset + len(original), "sub-chunks do not cover the whole chunk"
+
+
+def test_cap_oversized_subsplits_homogeneous_and_giant_sentence() -> None:
+    """A long homogeneous run AND a single >cap sentence both get capped.
+
+    Mirrors the live failure shape: a big block of similar sentences (the
+    SemanticSplitter would emit it as one chunk) followed by one boundary-less
+    run longer than the byte cap (the last-resort hard split's job)."""
+    sentence = "The reader paused to consider the deep meaning of this passage before moving on. "
+    homogeneous = sentence * 1500  # ~120 KB of many similar sentences
+    giant_sentence = "word " * 20000  # ~100 KB single run with no terminator
+    original = homogeneous + giant_sentence
+    base = 1000  # not zero — exercises the offset arithmetic
+    oversized = Chunk(
+        text=original,
+        start_idx=base,
+        end_idx=base + len(original),
+        parent_section="Concordance",
+    )
+
+    out = _cap_oversized_chunks([oversized])
+
+    assert len(out) > 1, "an oversized chunk must be split into several sub-chunks"
+    _assert_subchunks_valid(out, original=original, base_offset=base, parent_section="Concordance")
+
+
+def test_cap_oversized_leaves_normal_chunks_byte_identical() -> None:
+    """Chunks at/under the trigger pass through unchanged — normal books untouched."""
+    normal = [
+        Chunk(text="Short opening line.", start_idx=0, end_idx=19, parent_section="Intro"),
+        Chunk(text="A second small chunk follows.", start_idx=20, end_idx=49, parent_section=None),
+        # Exactly at the trigger byte size — must NOT be split (the cap is
+        # "exceeds", not "reaches").
+        Chunk(
+            text="a" * _MAX_CHUNK_BYTES,
+            start_idx=50,
+            end_idx=50 + _MAX_CHUNK_BYTES,
+            parent_section="Big",
+        ),
+    ]
+    out = _cap_oversized_chunks(normal)
+
+    assert len(out) == len(normal), "no sub-splitting should be triggered"
+    # Byte-identical AND same objects — the common path returns inputs verbatim.
+    for original, returned in zip(normal, out, strict=True):
+        assert returned is original
+
+
+def test_cap_oversized_just_over_trigger_is_split() -> None:
+    """One byte over the trigger flips sub-splitting on; text is preserved."""
+    text = "a" * (_MAX_CHUNK_BYTES + 1)
+    oversized = Chunk(text=text, start_idx=0, end_idx=len(text), parent_section=None)
+    out = _cap_oversized_chunks([oversized])
+    assert "".join(c.text for c in out) == text
+    _assert_subchunks_valid(out, original=text, base_offset=0, parent_section=None)
+
+
+def test_cap_oversized_multibyte_never_splits_a_codepoint() -> None:
+    """A multibyte (4-byte emoji) oversized run stays codepoint-safe under the cap."""
+    # One boundary-less run of 4-byte codepoints, well over the byte cap, that
+    # exercises the hard-window last resort on multibyte text.
+    original = "😀" * 30000  # 120 000 bytes, no sentence boundary
+    base = 5
+    oversized = Chunk(
+        text=original, start_idx=base, end_idx=base + len(original), parent_section="Emoji"
+    )
+
+    out = _cap_oversized_chunks([oversized])
+
+    assert len(out) > 1
+    _assert_subchunks_valid(out, original=original, base_offset=base, parent_section="Emoji")
+    # Belt-and-suspenders: the raw bytes of each sub-chunk are independently
+    # valid UTF-8 (a mid-codepoint cut would leave a truncated 4-byte sequence).
+    for c in out:
+        c.text.encode("utf-8").decode("utf-8")  # raises on a broken codepoint
+
+
+def test_cap_oversized_empty_input_is_empty() -> None:
+    """No chunks in, no chunks out — the pass is a no-op on an empty list."""
+    assert _cap_oversized_chunks([]) == []
 
 
 def _remote_embeddings_available() -> bool:

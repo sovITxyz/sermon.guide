@@ -45,8 +45,9 @@ from llama_index.core import Document
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.schema import TextNode
+from nltk.tokenize import PunktSentenceTokenizer
 
-from inference import embed_texts
+from inference import embed_texts, token_count, truncation_token_limit
 from inference import settings as inference_settings
 
 # BGE-Large is the locked retrieval embedder (ARCHITECTURE.md §2). Reading
@@ -61,6 +62,199 @@ DEFAULT_EMBED_MODEL = inference_settings.embeddings_model
 # what knobs exist.
 _BUFFER_SENTENCES = 1
 _BREAKPOINT_PERCENTILE = 95
+
+# --- Oversized-chunk cap (sub-split pass) ------------------------------------
+# Milvus stores `content_chunk` as VARCHAR(65535) where the limit is BYTES of
+# UTF-8 (worker/scripts/bootstrap_milvus.py). The SemanticSplitter places
+# boundaries on shifts in MEANING, not on size — a large homogeneous run (a
+# concordance, an index, a long table) can collapse into a single multi-hundred-
+# KB chunk whose `content_chunk` insert Milvus rejects outright (live: a
+# 355687-char chunk from a seeded EPUB failed the corpus-seed ingest).
+#
+# `_HARD_MAX_CHUNK_BYTES` is Milvus's hard VARCHAR cap — every emitted sub-chunk
+# MUST be at or under it (we do NOT raise the schema; we fit it). `_MAX_CHUNK_BYTES`
+# is a safe trigger BELOW that hard cap: only chunks over this size are
+# sub-split, leaving comfortable margin so a normal book is never touched and a
+# borderline chunk is split with room to spare. Chunks at or under the trigger
+# are returned byte-identical — the common path pays one `len(text.encode())`
+# and nothing else.
+_HARD_MAX_CHUNK_BYTES = 65535
+_MAX_CHUNK_BYTES = 60000
+
+# Soft per-sub-chunk token target. The embedder truncates each input to
+# `truncation_token_limit()` (510) content tokens, so a sub-chunk over that
+# would be embedded head-only — its stored tail would never influence its
+# vector. Sizing sub-chunks to <= that window makes the stored text match what
+# the embedder actually encodes for the oversized chunks we touch.
+_MAX_CHUNK_TOKENS = truncation_token_limit()
+
+
+@lru_cache(maxsize=1)
+def _sentence_tokenizer() -> PunktSentenceTokenizer:
+    """Punkt sentence tokenizer for the sub-split pass, built once per process.
+
+    Default (untrained) Punkt parameters — the same English model the
+    SemanticSplitter's own sentence buffering rides — so no NLTK corpus
+    download and no network. ``span_tokenize`` yields offset spans, which is
+    what lets the sub-split reconstruct valid windows into the original text.
+    """
+    return PunktSentenceTokenizer()
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Partition *text* into contiguous ``(start, end)`` sentence windows.
+
+    Built from Punkt's ``span_tokenize`` *starts* (not its end offsets) so the
+    pieces tile the WHOLE string with no gaps and no overlap — inter-sentence
+    whitespace attaches to the preceding sentence, leading whitespace to the
+    first. The invariant the caller relies on:
+    ``"".join(text[s:e] for s, e in _sentence_spans(text)) == text``.
+
+    Empty text yields no spans; text Punkt finds no sentence boundary in (one
+    long run with no terminator) yields a single ``(0, len(text))`` span, which
+    the byte/token caps then hard-split as a last resort.
+    """
+    if not text:
+        return []
+    starts = [s for s, _ in _sentence_tokenizer().span_tokenize(text)]
+    if not starts or starts[0] != 0:
+        # Punkt drops leading whitespace from its first span; anchor at 0 so
+        # nothing is lost. A boundary-less run gives no starts at all.
+        starts = [0, *starts] if starts else [0]
+    bounds = [*starts[1:], len(text)]
+    return [(start, end) for start, end in zip(starts, bounds, strict=True) if start < end]
+
+
+def _window_fits(text: str, start: int, end: int) -> bool:
+    """True when ``text[start:end]`` is within BOTH the byte and token caps.
+
+    The byte cap (``_HARD_MAX_CHUNK_BYTES``) is Milvus's hard limit; the token
+    cap (``_MAX_CHUNK_TOKENS``) keeps the stored text inside the embedder's
+    window. Both are checked so a single window never exceeds either.
+    """
+    piece = text[start:end]
+    return (
+        len(piece.encode("utf-8")) <= _HARD_MAX_CHUNK_BYTES
+        and token_count(piece) <= _MAX_CHUNK_TOKENS
+    )
+
+
+def _hard_windows(text: str, start_offset: int) -> list[tuple[int, int]]:
+    """Hard-split *text* into ``(abs_start, abs_end)`` windows fitting both caps.
+
+    Last resort for a single sentence that alone exceeds a cap (a giant run with
+    no sentence terminator, or one pathological sentence). Each window is the
+    longest CHARACTER prefix of the remaining text that fits both
+    ``_HARD_MAX_CHUNK_BYTES`` (hard — Milvus VARCHAR) and ``_MAX_CHUNK_TOKENS``
+    (soft — embedder window), found by binary search on the character count — so
+    cuts always land on a UTF-8 CODEPOINT boundary (never mid-codepoint, since a
+    Python string index is a codepoint index). Offsets are absolute
+    (``start_offset`` + char index) so they stay valid windows into the original
+    markdown, and the windows tile the text with no gaps or overlap. A single
+    codepoint always fits both caps, so every window advances by >= 1 char.
+    """
+    windows: list[tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        # Largest end in (i, n] with text[i:end] fitting both caps.
+        lo, hi, best = i + 1, n, i + 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if _window_fits(text, i, mid):
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        windows.append((start_offset + i, start_offset + best))
+        i = best
+    return windows
+
+
+def _split_chunk_text(text: str, base_offset: int, parent_section: str | None) -> list[Chunk]:
+    """Sub-split one oversized chunk's *text* into capped, offset-true sub-chunks.
+
+    Greedily packs whole sentences (``_sentence_spans``) into sub-chunks, opening
+    a new sub-chunk before a sentence would push the running piece over either
+    cap: ``_MAX_CHUNK_TOKENS`` content tokens (soft — keeps stored text aligned
+    with what the embedder encodes) or ``_HARD_MAX_CHUNK_BYTES`` UTF-8 bytes
+    (hard — Milvus's VARCHAR limit). A single sentence that alone exceeds a cap
+    is itself windowed (``_hard_windows``, codepoint-safe, fitting both caps) so
+    no sub-chunk can ever exceed either cap.
+
+    Sub-chunks partition *text* contiguously: their offsets are absolute windows
+    into the original markdown (``base_offset`` + char index) and concatenating
+    their text reproduces *text* exactly. ``parent_section`` is carried onto
+    every sub-chunk.
+    """
+    pieces: list[tuple[int, int]] = []  # (abs_start, abs_end) sub-sentence atoms
+    for s_start, s_end in _sentence_spans(text):
+        sentence = text[s_start:s_end]
+        if not _window_fits(text, s_start, s_end):
+            # One sentence over a cap: window it so each atom fits BOTH caps.
+            pieces.extend(_hard_windows(sentence, base_offset + s_start))
+        else:
+            pieces.append((base_offset + s_start, base_offset + s_end))
+
+    sub_chunks: list[Chunk] = []
+    run_start: int | None = None
+    run_end = 0
+    abs_base = base_offset
+    for abs_start, abs_end in pieces:
+        if run_start is None:
+            run_start, run_end = abs_start, abs_end
+            continue
+        candidate = text[run_start - abs_base : abs_end - abs_base]
+        if (
+            len(candidate.encode("utf-8")) > _HARD_MAX_CHUNK_BYTES
+            or token_count(candidate) > _MAX_CHUNK_TOKENS
+        ):
+            sub_chunks.append(
+                Chunk(
+                    text=text[run_start - abs_base : run_end - abs_base],
+                    start_idx=run_start,
+                    end_idx=run_end,
+                    parent_section=parent_section,
+                )
+            )
+            run_start, run_end = abs_start, abs_end
+        else:
+            run_end = abs_end
+    if run_start is not None:
+        sub_chunks.append(
+            Chunk(
+                text=text[run_start - abs_base : run_end - abs_base],
+                start_idx=run_start,
+                end_idx=run_end,
+                parent_section=parent_section,
+            )
+        )
+    return sub_chunks
+
+
+def _cap_oversized_chunks(chunks: list[Chunk]) -> list[Chunk]:
+    """Sub-split any chunk whose UTF-8 byte length exceeds ``_MAX_CHUNK_BYTES``.
+
+    Pure and keyless — counts tokens with the bundled local BGE tokenizer
+    (``inference.token_count``) and bytes with ``str.encode``; no embedder, no
+    network. Chunks at or under the trigger pass through BYTE-IDENTICAL (same
+    object), so a normal book is completely unaffected. The SemanticSplitter
+    sizes on meaning, not bytes, so a large homogeneous section can produce a
+    single chunk over Milvus's 65535-byte ``content_chunk`` cap; this pass
+    fits it without raising the schema (ARCHITECTURE.md §3).
+
+    No text is lost: an oversized chunk's sub-chunks partition its text
+    contiguously (concatenation reproduces the original) and carry its
+    ``parent_section`` and valid offset windows into the original markdown.
+    """
+    capped: list[Chunk] = []
+    for c in chunks:
+        if len(c.text.encode("utf-8")) <= _MAX_CHUNK_BYTES:
+            capped.append(c)
+            continue
+        capped.extend(_split_chunk_text(c.text, c.start_idx, c.parent_section))
+    return capped
+
 
 # ATX-style Markdown header: 1–6 `#` followed by a space and the heading text.
 # Setext headings (`Title\n=====`) are rare in pandoc/pymupdf4llm output and
@@ -201,6 +395,14 @@ def chunk(markdown: str) -> list[Chunk]:
     inter-sentence embedding distance) become separate chunks. Uses
     BGE-Large for boundary detection, loaded once per process.
 
+    A post-process pass (``_cap_oversized_chunks``) then sub-splits any chunk
+    over ``_MAX_CHUNK_BYTES`` UTF-8 bytes so every returned chunk fits Milvus's
+    65535-byte ``content_chunk`` cap (the SemanticSplitter sizes on meaning, not
+    bytes, so a large homogeneous section can otherwise produce one chunk too
+    big to insert). The pass is pure and keyless — local-tokenizer counts only,
+    no extra embedder calls — and leaves normal-sized chunks byte-identical, so
+    typical books are unaffected.
+
     Returns an empty list for empty input — the splitter would otherwise
     raise on a zero-length document.
     """
@@ -236,7 +438,7 @@ def chunk(markdown: str) -> list[Chunk]:
                 parent_section=_parent_section_for(start, headings) if start >= 0 else None,
             )
         )
-    return chunks
+    return _cap_oversized_chunks(chunks)
 
 
 def main(argv: list[str] | None = None) -> int:

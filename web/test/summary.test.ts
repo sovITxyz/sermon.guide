@@ -40,13 +40,57 @@ describe("segmentSummary", () => {
     ]);
   });
 
-  it("leaves comma-merged brackets as plain text (Phase 14b live finding)", () => {
-    // The model sometimes merges adjacent citations into one bracket; the API
-    // only returns standalone-resolvable markers, so the merged bracket must
-    // render as prose, not as a broken link.
+  it("explodes a comma-merged bracket into one chip per resolved member (Phase 24)", () => {
+    // The model sometimes merges adjacent citations into one bracket. The API
+    // resolves the merged members (Phase 24), so each member that maps to a
+    // returned citation must render as its own linked chip. The structural
+    // `[`, `]`, and `, ` are dropped — merged brackets do not round-trip.
     const text = "Faith grows [Faith:70, Faith:51] over time.";
     const segments = segmentSummary(text, [{ marker: "[Faith:70]" }, { marker: "[Faith:51]" }]);
-    expect(segments).toEqual([{ kind: "text", start: 0, text }]);
+    expect(segments).toEqual([
+      { kind: "text", start: 0, text: "Faith grows " },
+      { kind: "marker", start: 13, marker: "[Faith:70]", citationIndex: 0 },
+      { kind: "marker", start: 23, marker: "[Faith:51]", citationIndex: 1 },
+      { kind: "text", start: 32, text: " over time." },
+    ]);
+  });
+
+  it("drops only the invented member of a merged bracket, keeping real ones", () => {
+    // A merged bracket can mix a real member with one the model invented; only
+    // the resolvable members become chips — nothing is fabricated.
+    const text = "Both views [A:1, Ghost:9, B:2] agree.";
+    const segments = segmentSummary(text, [{ marker: "[A:1]" }, { marker: "[B:2]" }]);
+    expect(segments).toEqual([
+      { kind: "text", start: 0, text: "Both views " },
+      { kind: "marker", start: 12, marker: "[A:1]", citationIndex: 0 },
+      { kind: "marker", start: 26, marker: "[B:2]", citationIndex: 1 },
+      { kind: "text", start: 30, text: " agree." },
+    ]);
+  });
+
+  it("leaves a merged bracket as prose when no member resolves", () => {
+    const text = "See [Ghost:1, Phantom:2] later.";
+    expect(segmentSummary(text, [{ marker: "[A:1]" }])).toEqual([{ kind: "text", start: 0, text }]);
+  });
+
+  it("links single and merged brackets in document order", () => {
+    const text = "First [A:1] then merged [B:2, C:3] last [D:4].";
+    const segments = segmentSummary(text, [
+      { marker: "[A:1]" },
+      { marker: "[B:2]" },
+      { marker: "[C:3]" },
+      { marker: "[D:4]" },
+    ]);
+    expect(segments.filter((s) => s.kind === "marker")).toEqual([
+      { kind: "marker", start: 6, marker: "[A:1]", citationIndex: 0 },
+      { kind: "marker", start: 25, marker: "[B:2]", citationIndex: 1 },
+      { kind: "marker", start: 30, marker: "[C:3]", citationIndex: 2 },
+      { kind: "marker", start: 40, marker: "[D:4]", citationIndex: 3 },
+    ]);
+    // Marker `start`s are strictly increasing — unique, stable React keys.
+    const starts = segments.filter((s) => s.kind === "marker").map((s) => s.start);
+    expect(starts).toEqual([...starts].sort((a, b) => a - b));
+    expect(new Set(starts).size).toBe(starts.length);
   });
 
   it("leaves invented markers as plain text", () => {
@@ -86,7 +130,9 @@ describe("segmentSummary", () => {
     });
   });
 
-  it("round-trips: concatenated segments reproduce the input", () => {
+  it("round-trips standalone markers: concatenated segments reproduce the input", () => {
+    // With no exploded merged bracket, concatenating segments is lossless. The
+    // unmatched merged bracket here stays prose because no member resolves.
     const text = "Start [A:1] middle [Faith:70, Faith:51] then [B:2] end.";
     const segments = segmentSummary(text, [{ marker: "[A:1]" }, { marker: "[B:2]" }]);
     expect(joinSegments(segments)).toBe(text);

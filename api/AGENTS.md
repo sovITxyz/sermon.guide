@@ -438,13 +438,28 @@ section):
 
 ## Open trust gaps
 
-- **No library cap on the search filter.** A user with 10K books
-  produces a ~360 KB `book_id IN [...]` filter expression on every
-  `/search`. Phase 12's BM25 arm doubles the per-query work (Milvus
-  filter + Postgres `book_id = ANY(...)`). Both backends still accept
-  it in practice at v0 scale; introducing a chunked-filter or
-  partition-key narrowing strategy is the next phase to do this
-  properly.
+- **Chunked Milvus filter, no silent cap (Phase 24).** A user with 10K
+  books would produce a ~360 KB `book_id IN [...]` Milvus filter
+  expression in a single search. `retrieval.dense_search` now splits the
+  `book_id` set into `MILVUS_FILTER_BOOK_ID_CHUNK`-sized slices (default
+  **1000**, overridable via `SERMON_MILVUS_FILTER_BOOK_ID_CHUNK`),
+  keeping each per-search expr ~36 KB. Libraries `<=` the chunk size take
+  the unchanged single-search fast path; larger libraries run one scoped
+  search per slice (each pulling its own top-`limit`) and merge the
+  per-slice hits into the global top-`limit` by COSINE distance. This
+  **preserves full recall** — no book is silently dropped, which would be
+  both a correctness AND a tenant-trust regression. The union of the
+  per-slice filters equals exactly the input `book_id` set (contiguous,
+  non-overlapping slices), so the tenant boundary holds chunk-by-chunk;
+  the empty-library `ValueError` guard is unchanged. Chunked slices run
+  sequentially under the same single `DENSE_ARM_BUDGET_SECONDS`
+  `wait_for`, so a very large library costs proportionally more wall time
+  bounded by that budget (a budget trip degrades the whole arm — never a
+  partial-library result that would look like a silent cap). Phase 12's
+  BM25 arm needs no chunking: `book_id = ANY(:book_ids)` binds a single
+  array parameter, so a 10K-element list ships as one bound value with no
+  query-text length blowup (live-gated by
+  `worker/tests/test_retrieval_filter_cap.py`).
 - **The retrieval arms degrade on ANY `Exception`, including our own
   bugs.** The arm fan-out's full-`Exception` breadth is deliberate (the
   dense arm's failure surface spans four libraries; enumerating them

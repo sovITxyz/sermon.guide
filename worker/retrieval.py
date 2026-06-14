@@ -46,6 +46,7 @@ debugging; for absolute relevance, inspect ``dense_score`` /
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -70,6 +71,38 @@ RRF_K = 60
 # Postgres per query.
 DENSE_FANOUT = 30
 SPARSE_FANOUT = 30
+
+
+def _default_book_id_chunk() -> int:
+    """Resolve the per-search ``book_id`` filter chunk size (Phase 24).
+
+    Overridable via ``SERMON_MILVUS_FILTER_BOOK_ID_CHUNK`` so an operator
+    can tune the trade-off without a code change (mirrors the ``SERMON_*``
+    env convention in ``db/settings.py`` / ``bootstrap_milvus.py``). A
+    non-positive or non-integer value falls back to the default rather
+    than silently disabling chunking — disabling it reintroduces the
+    unbounded-``expr`` problem this constant exists to bound.
+    """
+    raw = os.environ.get("SERMON_MILVUS_FILTER_BOOK_ID_CHUNK")
+    if raw is None:
+        return _MILVUS_FILTER_BOOK_ID_CHUNK_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _MILVUS_FILTER_BOOK_ID_CHUNK_DEFAULT
+    return value if value > 0 else _MILVUS_FILTER_BOOK_ID_CHUNK_DEFAULT
+
+
+# Cap on how many ``book_id``s go into a single Milvus ``book_id in [...]``
+# filter expression (Phase 24). A 10K-book library at ~36 bytes/UUID-in-
+# expr is a ~360 KB string per search; splitting it into ≤1000-book chunks
+# keeps every expr ~36 KB while preserving FULL recall — each chunk runs
+# its own scoped search and the per-chunk hits merge back into the global
+# top-K. A silent cap (dropping books past the first N) would exclude part
+# of a user's library — both a correctness regression AND a tenant-trust
+# regression — so chunking, not truncation, is the only acceptable fix.
+_MILVUS_FILTER_BOOK_ID_CHUNK_DEFAULT = 1000
+MILVUS_FILTER_BOOK_ID_CHUNK = _default_book_id_chunk()
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,32 +135,19 @@ def _build_milvus_filter(book_ids: Sequence[uuid.UUID]) -> str:
     return f"book_id in [{quoted}]"
 
 
-def dense_search(
+def _dense_search_one_chunk(
     *,
     client: MilvusClient,
     query_vec: list[float],
     book_ids: Sequence[uuid.UUID],
-    limit: int = DENSE_FANOUT,
+    limit: int,
 ) -> list[RetrievalHit]:
-    """Run a single filtered Milvus COSINE search. Sync; blocking.
+    """Run ONE filtered Milvus COSINE search over a single ``book_id`` chunk.
 
-    Returns at most *limit* hits, ordered by COSINE similarity
-    descending. The ``score`` on each hit is the dense COSINE
-    similarity in ``[-1, 1]``; RRF fusion overwrites it later.
-
-    The per-call ``timeout`` (Phase 22) is pymilvus's retry budget for
-    the search RPC. It bounds the steady-state-down case (a closed/dead
-    channel fast-fails as a typed ``MilvusException`` in roughly
-    0.4-1.2 s) and keeps retries from compounding — but it is NOT a hard
-    wall-clock ceiling: on a warm connection's FIRST failure pymilvus 2.6
-    calls its connection-recovery hook BEFORE the deadline check, and
-    that hook runs an in-request reconnect with a hardcoded 10 s
-    channel-ready wait (live-measured at ~10-11 s before the exception
-    surfaces). Callers that need a hard per-request bound must enforce it
-    outside the RPC: ``api/search.py`` wraps this call (plus client
-    checkout) in ``asyncio.wait_for`` under ``DENSE_ARM_BUDGET_SECONDS``
-    — the ``wait_for`` cannot cancel the blocking thread, it abandons it,
-    so the orphaned thread drains within pymilvus's own 10 s ceiling.
+    Always scoped — the ``filter=`` expression is mandatory and built
+    from *book_ids*; this never issues an unfiltered search. This is the
+    tenant-isolation boundary: the caller guarantees *book_ids* is a
+    subset of the JWT-derived library, so each chunk's expr is too.
     """
     expr = _build_milvus_filter(book_ids)
     results = client.search(
@@ -158,6 +178,103 @@ def dense_search(
             ),
         )
     return hits
+
+
+def dense_search(
+    *,
+    client: MilvusClient,
+    query_vec: list[float],
+    book_ids: Sequence[uuid.UUID],
+    limit: int = DENSE_FANOUT,
+    chunk_size: int = MILVUS_FILTER_BOOK_ID_CHUNK,
+) -> list[RetrievalHit]:
+    """Run a filtered Milvus COSINE search, chunking the filter (Phase 24).
+
+    Returns at most *limit* hits, ordered by COSINE similarity
+    descending. The ``score`` on each hit is the dense COSINE
+    similarity in ``[-1, 1]``; RRF fusion overwrites it later.
+
+    ## Filter chunking (Phase 24)
+
+    When ``len(book_ids) <= chunk_size`` this is behaviorally IDENTICAL
+    to the pre-Phase-24 single search: one ``client.search`` with one
+    ``book_id in [...]`` expr. When the library is larger, the
+    ``book_id`` set is split into ``chunk_size``-book slices and one
+    scoped search runs per slice (each with ``limit=limit`` so the global
+    top-*limit* can be recovered no matter how the best hits are
+    distributed across slices). The per-slice hits are merged by COSINE
+    distance descending and truncated to *limit*, so FULL recall over the
+    whole library is preserved — no book is silently dropped, which would
+    be both a correctness AND a tenant-trust regression. The union of the
+    per-slice filters equals exactly *book_ids*: ``itertools``-free,
+    contiguous, non-overlapping slices of the input list.
+
+    ## Timeout
+
+    The per-call ``timeout`` (Phase 22) is pymilvus's retry budget for
+    the search RPC. It bounds the steady-state-down case (a closed/dead
+    channel fast-fails as a typed ``MilvusException`` in roughly
+    0.4-1.2 s) and keeps retries from compounding — but it is NOT a hard
+    wall-clock ceiling: on a warm connection's FIRST failure pymilvus 2.6
+    calls its connection-recovery hook BEFORE the deadline check, and
+    that hook runs an in-request reconnect with a hardcoded 10 s
+    channel-ready wait (live-measured at ~10-11 s before the exception
+    surfaces). Callers that need a hard per-request bound must enforce it
+    outside the RPC: ``api/search.py`` wraps this call (plus client
+    checkout) in ``asyncio.wait_for`` under ``DENSE_ARM_BUDGET_SECONDS``
+    — the ``wait_for`` cannot cancel the blocking thread, it abandons it,
+    so the orphaned thread drains within pymilvus's own 10 s ceiling. The
+    chunked path issues each slice's search sequentially under that same
+    single outer budget; a large library therefore costs proportionally
+    more wall time, bounded by the caller's budget (a slice that trips the
+    budget raises ``MilvusException``/``TimeoutError`` and degrades the
+    whole arm, never returns a partial-library result that would look like
+    a silent cap).
+    """
+    # ``_build_milvus_filter`` (per chunk) keeps the empty-library
+    # ValueError guard: an empty input yields zero chunks, so guard here
+    # too rather than silently returning [] (a no-hit result is
+    # indistinguishable from a missed short-circuit).
+    if not book_ids:
+        msg = (
+            "dense_search requires at least one book_id; "
+            "caller must short-circuit on empty libraries."
+        )
+        raise ValueError(msg)
+
+    # Fast path: small library → one search, byte-for-byte the same expr
+    # and call shape as before Phase 24.
+    if len(book_ids) <= chunk_size:
+        return _dense_search_one_chunk(
+            client=client,
+            query_vec=query_vec,
+            book_ids=book_ids,
+            limit=limit,
+        )
+
+    # Chunked path: contiguous, non-overlapping slices whose union is
+    # exactly ``book_ids`` (no book added, none dropped → the tenant
+    # boundary is preserved). Each slice pulls its own top-``limit`` so
+    # the global top-``limit`` survives any distribution of best hits
+    # across slices.
+    merged: list[RetrievalHit] = []
+    for start in range(0, len(book_ids), chunk_size):
+        slice_ids = book_ids[start : start + chunk_size]
+        merged.extend(
+            _dense_search_one_chunk(
+                client=client,
+                query_vec=query_vec,
+                book_ids=slice_ids,
+                limit=limit,
+            ),
+        )
+    # Merge per-slice hits into the global top-``limit`` by COSINE
+    # distance descending. ``dense_score`` is the raw COSINE distance
+    # (set in ``_dense_search_one_chunk``); a chunk boundary never splits
+    # a single (book_id, chunk_index) across slices, so no dedup is
+    # needed — book_ids are disjoint across slices.
+    merged.sort(key=lambda h: h.score, reverse=True)
+    return merged[:limit]
 
 
 # Single SQL spelling — async and sync variants share it. ``websearch_to_tsquery``

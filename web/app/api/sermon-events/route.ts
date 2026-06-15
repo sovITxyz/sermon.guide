@@ -1,6 +1,7 @@
 import { getSessionToken } from "@/lib/api-server";
+import { whitelistCreateEvent } from "@/lib/calendar";
 import { apiBaseUrl } from "@/lib/config";
-import { errorDetail } from "@/lib/http";
+import { errorDetail, passthroughResponse } from "@/lib/http";
 import type { CalendarEventListResponse } from "@/lib/types";
 import { NextResponse } from "next/server";
 
@@ -47,4 +48,53 @@ export async function GET(req: Request): Promise<Response> {
 
   const data = (await res.json()) as CalendarEventListResponse;
   return NextResponse.json(data);
+}
+
+/**
+ * Create one or more sermon events (Phase 40). The body goes through a
+ * STRUCTURAL whitelist (lib/calendar.ts) — only `event_date`, `title`,
+ * `series`, and `repeat_weekly_until` are re-serialized upstream; `document_id`
+ * is DROPPED (deferred to Phase 41) before the body reaches the API's
+ * `extra="forbid"` gate. Wrong primitive types are a 400 here.
+ *
+ * The 201 response is a LIST (`{ events }`) even for a single create — a
+ * `repeat_weekly_until` materializes many independent rows on the API side, so
+ * the client must merge ALL returned events. All length/range/cap validation
+ * (title length, `repeat_weekly_until >= event_date`, the 53-row materializer
+ * cap) is the API's 422 to own: this proxy does NOT pre-check it and passes the
+ * 422 through byte-for-byte. Per-user write → `cache: "no-store"`.
+ */
+export async function POST(req: Request): Promise<Response> {
+  const token = await getSessionToken();
+  if (!token) {
+    return NextResponse.json({ error: "Not authenticated." }, { status: 401 });
+  }
+
+  const parsed = (await req.json().catch(() => null)) as unknown;
+  const result = whitelistCreateEvent(parsed);
+  if (!result.ok) {
+    return NextResponse.json({ error: result.error }, { status: 400 });
+  }
+
+  const res = await fetch(`${apiBaseUrl()}/calendar/events`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(result.body),
+    cache: "no-store",
+  });
+
+  // 422 (range / cap / length) carries the API's canonical detail; pass it
+  // through byte-for-byte so the materializer-cap contract has one owner.
+  if (res.status === 422) {
+    return passthroughResponse(res);
+  }
+  if (!res.ok) {
+    return NextResponse.json(
+      { error: await errorDetail(res, "Could not create the event.") },
+      { status: res.status },
+    );
+  }
+
+  const data = (await res.json()) as CalendarEventListResponse;
+  return NextResponse.json(data, { status: 201 });
 }

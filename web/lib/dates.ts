@@ -229,3 +229,90 @@ export function monthGrid(year: number, month: number): DayCell[][] {
 export function monthsOfYear(): number[] {
   return Array.from({ length: 12 }, (_, i) => i + 1);
 }
+
+/**
+ * The JS weekday index (0 = Sunday … 6 = Saturday) of a 1-based
+ * `(year, month, day)`. Like {@link weekdayOfFirst}, the ONLY Date use is
+ * `Date.UTC(...)` with explicit numeric args, reading the UTC weekday straight
+ * back — timezone-immune. Never parses a `YYYY-MM-DD` STRING through a Date.
+ */
+export function weekdayOf(year: number, month: number, day: number): number {
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+}
+
+/**
+ * Advance a `YYYY-MM-DD` string by `delta` calendar days (negative steps back),
+ * returning a fresh canonical `YYYY-MM-DD`. Pure integer arithmetic on the
+ * (year, month, day) parts: it normalizes day overflow/underflow by walking
+ * month/year boundaries with {@link daysInMonth}, so it never constructs a Date
+ * from the string and is therefore timezone-immune. Used by the week grid and
+ * the prev/next-week nav (delta = ±7).
+ */
+export function addDays(value: string, delta: number): string {
+  let { year, month, day } = parseDate(value);
+  day += delta;
+  // Walk forward over month ends.
+  while (day > daysInMonth(year, month)) {
+    day -= daysInMonth(year, month);
+    if (month === 12) {
+      month = 1;
+      year += 1;
+    } else {
+      month += 1;
+    }
+  }
+  // Walk backward over month starts (borrow from the previous month).
+  while (day < 1) {
+    if (month === 1) {
+      month = 12;
+      year -= 1;
+    } else {
+      month -= 1;
+    }
+    day += daysInMonth(year, month);
+  }
+  return formatDate(year, month, day);
+}
+
+/**
+ * The `YYYY-MM-DD` of the first day (Sunday, per {@link WEEK_STARTS_ON}) of the
+ * week CONTAINING `value`. Steps back by the day's offset from the week start
+ * using the same `(weekday - WEEK_STARTS_ON + 7) % 7` idiom `monthGrid` uses
+ * for its leading pad. Pure string/number arithmetic.
+ */
+export function weekStart(value: string): string {
+  const { year, month, day } = parseDate(value);
+  const offset = (weekdayOf(year, month, day) - WEEK_STARTS_ON + 7) % 7;
+  return addDays(value, -offset);
+}
+
+/**
+ * Build the 7-day grid for the week CONTAINING `value`: exactly seven
+ * consecutive `DayCell`s starting on Sunday (per {@link WEEK_STARTS_ON}). Unlike
+ * the month grid, a week has no "borrowed adjacent month" notion — every day in
+ * the week is a real day the user can act on — so every cell is `inMonth: true`.
+ * Pure string/number arithmetic via {@link addDays}; never parses a Date string.
+ */
+export function weekGrid(value: string): DayCell[] {
+  const start = weekStart(value);
+  const cells: DayCell[] = [];
+  for (let i = 0; i < 7; i += 1) {
+    const date = addDays(start, i);
+    cells.push({ date, day: parseDate(date).day, inMonth: true });
+  }
+  return cells;
+}
+
+/**
+ * The half-open `[start, end)` range covering the week CONTAINING `value`:
+ * Sunday of that week through (exclusive) the following Sunday — exactly seven
+ * days, well under the API's 400-day cap, so a week view is one
+ * `/calendar/events` call. The exclusive end (start + 7 days) is the
+ * load-bearing half-open boundary the API expects: Saturday is INCLUDED, the
+ * next Sunday is not. Rolls cleanly across month/year boundaries via
+ * {@link addDays}.
+ */
+export function weekRange(value: string): DateRange {
+  const start = weekStart(value);
+  return { start, end: addDays(start, 7) };
+}

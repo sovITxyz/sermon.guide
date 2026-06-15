@@ -281,6 +281,14 @@ for (const [eventId, eventDate, title, series] of CALENDAR_SEEDS) {
 /** The materializer cap (api/calendar_routes.py MATERIALIZER_CAP_ROWS). */
 const MATERIALIZER_CAP_ROWS = 53;
 
+/**
+ * A poison destination date (Phase 42 drag-rollback test): a PATCH that would
+ * move an event ONTO this date returns a 500 instead of saving, so the E2E spec
+ * can exercise CalendarView's optimistic-move ROLLBACK + visible-error path. It
+ * sits in the Phase-42 test year (2031) on a date no spec legitimately drops to.
+ */
+const FORCE_500_DATE = "2031-12-25";
+
 /** Public CalendarEvent wire shape — strips the internal `userId`. */
 function calendarWire(eventId, record) {
   return {
@@ -492,6 +500,16 @@ const server = createServer(async (req, res) => {
         return detail(res, 404, "Event not found.");
       }
       const body = await readJson(req);
+      // Forced-500 sentinel (Phase 42 drag rollback test): a PATCH that would
+      // move an event ONTO this poison date fails with a server error so the
+      // optimistic move is rolled back. Read the body ONCE (above) so this early
+      // return and the normal path never both consume the request stream. The
+      // body is an OPAQUE 500 (no `{detail}` string) — like a genuinely
+      // unhandled API error — so the proxy's errorDetail() falls back and
+      // CalendarView surfaces the generic "Could not save the event." banner.
+      if (body?.event_date === FORCE_500_DATE) {
+        return send(res, 500, { error: "Internal Server Error" });
+      }
       const hasDate = typeof body?.event_date === "string";
       const hasTitle = typeof body?.title === "string";
       // series + document_id are three-state: present-and-null detaches,

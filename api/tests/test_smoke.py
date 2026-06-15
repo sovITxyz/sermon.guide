@@ -33,5 +33,7 @@ def test_healthz_route_is_registered() -> None:
     assert "/documents" in paths
     assert "/documents/{document_id}" in paths
     assert "/documents/{document_id}/restore" in paths
+    assert "/calendar/events" in paths
+    assert "/calendar/events/{event_id}" in paths
     assert "/search" in paths
     assert "/search-summary" in paths

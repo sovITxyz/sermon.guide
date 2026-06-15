@@ -1,0 +1,7 @@
+# Playwright E2E artifacts (Phase 25). The root .gitignore covers Node/Next
+# build output; these are web-local Playwright outputs with no root entry.
+/test-results/
+/playwright-report/
+/blob-report/
+/.playwright/
+/playwright/.cache/

@@ -3,7 +3,16 @@
   "vcs": { "enabled": false, "clientKind": "git", "useIgnoreFile": false },
   "files": {
     "ignoreUnknown": true,
-    "ignore": ["next-env.d.ts", ".next", "node_modules"]
+    "ignore": [
+      "next-env.d.ts",
+      ".next",
+      "node_modules",
+      "test-results",
+      "playwright-report",
+      "blob-report",
+      ".playwright",
+      "playwright/.cache"
+    ]
   },
   "organizeImports": { "enabled": true },
   "formatter": {

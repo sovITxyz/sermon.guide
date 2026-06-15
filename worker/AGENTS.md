@@ -16,19 +16,57 @@ uv run <tool>                # run anything in the venv (ruff, pyright, pytest, 
 
 ### System binaries
 
-Two non-Python dependencies must be present on the host (CI image and dev
+Three non-Python dependencies must be present on the host (CI image and dev
 machines alike):
 
-- **`pandoc`** — EPUB extraction shells out to it via `pypandoc`. Install
-  with `sudo apt install pandoc` (Debian/Ubuntu) or `brew install pandoc`
-  (macOS). Pinned in `pyproject.toml` as a Python wrapper but the binary
-  itself is system-installed.
+- **`pandoc`** — EPUB extraction shells out to it via `pypandoc`, and the
+  Phase 43 DOCX round-trip (`convert.py`) drives it directly for both
+  `html->docx` and `docx->html`. Install with `sudo apt install pandoc`
+  (Debian/Ubuntu) or `brew install pandoc` (macOS). Pinned in `pyproject.toml`
+  as a Python wrapper but the binary itself is system-installed.
 - **`libmagic`** — `python-magic` is a thin ctypes wrapper around libmagic;
   Ubuntu/Debian ship it via `libmagic1` (usually pre-installed via
   `file`/`util-linux`). On macOS: `brew install libmagic`.
+- **Node 22** — the DOCX round-trip's Node leg (`convert_node/`, Phase 43)
+  needs `@tiptap/html` to (de)serialize ProseMirror JSON <-> HTML with the same
+  extension set as the editor. `convert.py` shells out to `node`; install Node
+  22 (e.g. nvm / `apt install nodejs` from NodeSource).
 
-A missing binary surfaces as `OSError`/`RuntimeError` at import or first
-call — fail loudly, do not silently fall back.
+A missing binary surfaces as `OSError`/`RuntimeError`/`ConversionError` at
+import or first call — fail loudly, do not silently fall back.
+
+### `convert_node/` bundle (Phase 43)
+
+`convert.py` (the DOCX round-trip; the one worker module `api/` may import) does
+the format conversion through a standalone, **React-free** Node CLI under
+`convert_node/`. It is invoked as a subprocess (`node convert_node/cli.mjs
+export|import`), reading JSON or HTML on stdin and writing the other on stdout.
+
+- Own **pinned** `package.json` + `package-lock.json` (both committed): `@tiptap/html`,
+  `@tiptap/core`, `@tiptap/pm`, `@tiptap/starter-kit` (all `3.26.1`, matching
+  `web/`) + `happy-dom` (a mandatory peer of `@tiptap/html`). `convert_node/node_modules`
+  is gitignored (root `.gitignore` `node_modules/`); run `npm install` in
+  `convert_node/` to populate it. Imports come from `@tiptap/html/server` (the
+  Node-safe path — it builds its own local happy-dom `Window` per call, no
+  browser, no global DOM).
+- **Extension parity is load-bearing**: `cli.mjs` uses the SAME set as
+  `web/components/SermonEditor.tsx` `buildExtensions` — `StarterKit.configure({
+  link: false })` + the citation node (the editor-only Placeholder is omitted; it
+  adds no schema nodes). Diverging extension sets make `generateHTML` silently
+  DROP unknown nodes.
+- **`convert_node/citation-extension.mjs` is a MIRROR of `web`'s `CitationNode`**
+  (mirror-not-import, like `api`'s `_ALLOWED_UPLOAD_MIMES`). `data-*` attrs do
+  not survive `.docx`; only hyperlinks do, so the citation serializes to
+  `<a href="/read/{bookId}?chunk={chunkIndex}">` (the `readHref` shape from
+  `web/lib/library.ts`) and import recovers `bookId` + `chunkIndex` from that
+  URL. `bookTitle` is degraded-from-anchor-text; `snippet`/`parentSection` are
+  lost. **Keep it in lockstep with `web/components/editor/CitationNode.tsx`** —
+  change both in the same PR.
+- `assets/reference.docx` is pandoc's default reference doc (regenerate with
+  `pandoc --print-default-data-file reference.docx > assets/reference.docx`),
+  passed to `pypandoc` as `--reference-doc` on export.
+- pandoc + Node + the `convert_node` bundle become api+worker image deps for
+  **Phase 29** to bake into the Dockerfiles (not done in Phase 43).
 
 Make targets (also run from `worker/`):
 

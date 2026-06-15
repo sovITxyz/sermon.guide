@@ -1,0 +1,20 @@
+{
+  "name": "sermon-convert-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "React-free Node leg for the Phase 43 DOCX round-trip: ProseMirror JSON <-> HTML via @tiptap/html/server. Invoked as a subprocess by worker/convert.py — NOT a published package.",
+  "type": "module",
+  "bin": {
+    "sermon-convert": "./cli.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@tiptap/core": "3.26.1",
+    "@tiptap/html": "3.26.1",
+    "@tiptap/pm": "3.26.1",
+    "@tiptap/starter-kit": "3.26.1",
+    "happy-dom": "20.10.3"
+  }
+}

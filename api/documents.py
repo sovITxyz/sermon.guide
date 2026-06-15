@@ -229,14 +229,15 @@ def derive_content_text(content: object) -> str:
     blank line), evaluated in document order; a text node yields its text;
     every other leaf yields ``""``.
 
-    Mechanics: a two-phase post-order traversal. Each work item is a
-    ``(node, children, child_results)`` frame. We push a node, expand its
-    children left-to-right onto the stack (so they pop in document order),
-    and once all of a node's children have been resolved we fold them into
-    the parent's ``child_results`` — joining the non-empty ones with ``\\n``.
-    The single ``results`` map keyed by frame identity carries each
-    resolved subtree's string back up to its parent. No call recursion, so
-    depth is bounded only by available memory, not the interpreter stack.
+    Mechanics: post-order DFS over an explicit ``stack`` of ``_Frame``
+    items, each ``(children, parts, cursor)`` for one container node.
+    ``cursor`` walks the frame's children left-to-right: a leaf child folds
+    its own text straight into the frame's ``parts``; a container child
+    pushes a new frame and suspends the parent. When a frame's children are
+    exhausted, its non-empty ``parts`` are newline-joined and that string is
+    appended to the parent frame's ``parts`` (the top frame's join is the
+    return value). No call recursion, so depth is bounded only by available
+    memory, not the interpreter stack.
 
     The output backs list previews (first ``PREVIEW_CHARS`` chars) and
     future FTS. It is re-derived on EVERY write; the client never supplies

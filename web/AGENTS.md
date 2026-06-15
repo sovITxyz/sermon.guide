@@ -117,6 +117,37 @@ contenteditable. Locked decisions:
     bucketed), so sustained ~1 PATCH/2s autosave is already unthrottled — see
     `api/AGENTS.md`. No bucket was added.
 
+## Sermons list — delete + restore (Phase 36, B2 slice C)
+
+`components/SermonList.tsx` is a **client island** (it was a pure server
+component through Phase 35) — server components cannot mutate, so the row
+actions live in the island and call `router.refresh()` after each mutation to
+re-run the `/sermons` server component against the new state. `app/sermons/page.tsx`
+stays a server component that fetches the list (`getDocuments`) and passes it
+down. Locked decisions:
+
+- **Soft delete is confirm-gated.** A manuscript is irreplaceable, so the row's
+  Delete button fires `window.confirm` first; a dismissed confirm fires **no**
+  request. On accept it `DELETE`s the same-origin `/api/documents/[id]` proxy.
+  A **204** (success) and the uniform **404** (already gone) are both treated as
+  "no longer listed" → refresh; any other status surfaces a non-destructive
+  inline error and does **not** refresh.
+- **Restore reachability = an in-session UNDO TOAST**, NOT a "recently deleted"
+  view. The api list is non-deleted-only and there is **no "list deleted"
+  endpoint** (adding one is an api change, out of scope for this phase). So a
+  successful delete raises an undo affordance (`<output>` = implicit
+  `role="status"`, a polite live region — never `role="alert"`, which the App
+  Router route announcer already owns) that `POST`s `/api/documents/[id]/restore`
+  (body-less; the full doc comes back with content intact). The toast holds the
+  **last** delete only; a new delete replaces it, and a reload/navigation clears
+  it. That is by design: the toast is the in-session undo window, and the
+  confirm prompt is the guard against accidental loss. A failed restore **keeps**
+  the toast so the user can retry — it never double-clobbers.
+- **Single mutation at a time** (`busyRef`): the in-flight id gates its row's
+  Delete and the toast's Undo so a second click never races the first.
+- All ids are `encodeURIComponent`'d into the proxy URLs; previews stay PLAIN
+  TEXT (`preview` field) — **zero `dangerouslySetInnerHTML`** (repo invariant).
+
 ## Tests
 
 Vitest runs **two projects in one `pnpm test`** (`vitest.workspace.ts`,
@@ -193,10 +224,11 @@ web server's server-only `API_BASE_URL` at the fake api so the same-origin
   `[book:chunk]` markers exactly match the returned citations (so the Phase 24
   chip renderer resolves them), `/upload`, and `/tasks/{id}` with the Phase-20
   ownership-404 (own task → 200, another user's or unknown id → identical 404),
-  and the Phase-35 `/documents` endpoints (POST create → 201 full doc, GET list →
+  and the `/documents` endpoints (POST create → 201 full doc, GET list →
   preview-only items with no `content` key, GET/`{id}` full, PATCH/`{id}` → 200 /
-  **409 on a stale `base_updated_at`**, DELETE soft) — all bearer-scoped with the
-  same uniform 404 for non-owned/unknown ids. A strictly-monotonic `updated_at`
+  **409 on a stale `base_updated_at`**, DELETE soft, and the Phase-36
+  POST/`{id}/restore` → 200 full doc with content intact) — all bearer-scoped
+  with the same uniform 404 for non-owned/unknown ids. A strictly-monotonic `updated_at`
   (a counter, not wall-clock) makes the optimistic-concurrency 409 deterministic.
   This is the documented CI boundary: the web CI job has no services, so the
   grounded-summary determinism the live path gets from the stub LLM is baked

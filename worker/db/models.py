@@ -12,11 +12,12 @@ against ``user_library``, ``highlights``, or ``collections`` must filter by
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger,
     Computed,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -433,4 +434,87 @@ class Document(Base):
             "user_id",
             text("updated_at DESC"),
         ),
+    )
+
+
+class SermonEvent(Base):
+    """A dated entry on a user's preaching calendar (Phase 38 — B3 slice).
+
+    The server half of the B3 calendar: ``api/calendar.py`` does range-GET /
+    POST (with an optional weekly materializer) / partial-PATCH / DELETE, all
+    DOUBLE-scoped (``event_id`` AND ``user_id``). User-owned like
+    ``highlights`` / ``documents``: every query MUST filter by ``user_id``
+    (JWT-derived); a non-owned ``event_id`` is a uniform 404 with no existence
+    oracle (the Phase 20 ``/tasks`` posture).
+
+    ``event_date`` is a Postgres DATE, NOT a timestamptz — preaching is
+    day-anchored, and a UTC-midnight timestamptz silently shifts a day for
+    UTC-minus users. Dates stay ``YYYY-MM-DD`` end-to-end. This is the
+    schema's first DATE column.
+
+    ``document_id`` is a NULLABLE FK to ``documents`` with ``ON DELETE SET
+    NULL`` (the schema's first SET NULL) — deleting the linked document
+    detaches the event instead of cascading it away. The documents API
+    soft-deletes (the row and link survive); the SET NULL is the defensive
+    behaviour for a real row delete. Because ``document_id`` arrives as
+    attacker-controlled body input, ``api/calendar.py`` ownership-checks it
+    against the JWT user's documents before write — the FK alone does not
+    scope tenancy.
+
+    ``series`` is an optional free-text recurrence label (e.g. "Advent"); the
+    weekly materializer writes INDEPENDENT rows (no parent linkage), so each
+    materialized occurrence PATCHes / DELETEs on its own.
+
+    There is DELIBERATELY no unique on ``(user_id, event_date)`` — two
+    services on one Sunday is normal. The ``(user_id, event_date)`` index
+    serves the range scan; ``event_date`` is bidirectional so a plain
+    ascending column list suffices (no DESC trick).
+
+    ``updated_at`` carries ``server_default=func.now()`` for the insert but
+    has NO ``onupdate`` (the schema-wide convention): the API bumps it
+    EXPLICITLY via ``func.now()`` on PATCH.
+    """
+
+    __tablename__ = "sermon_events"
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Day-anchored DATE (not timestamptz) — see class docstring.
+    event_date: Mapped[date] = mapped_column(Date(), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    # Optional free-text recurrence/series label (B3 — NOT an RRULE).
+    series: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # NULLABLE FK to documents with ON DELETE SET NULL — the schema's first
+    # SET NULL. Tenancy on this column is enforced by the API ownership check,
+    # not the FK (the FK only fires on a real documents row delete).
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.document_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Range hot path: a user's events within [start, end). The user_id
+        # prefix scopes per tenant; event_date carries the half-open range
+        # scan. DELIBERATELY no unique on (user_id, event_date) — two
+        # services one Sunday is normal.
+        Index("ix_sermon_events_user_date", "user_id", "event_date"),
     )

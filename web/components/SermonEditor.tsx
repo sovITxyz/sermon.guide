@@ -17,12 +17,15 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CitationNode } from "./editor/CitationNode";
+import { LibraryMembershipProvider } from "./editor/library-membership";
 
 /**
- * Manuscript editor (Phase 36, B2 slice C). A headless TipTap contenteditable
- * with a fixed toolbar, an editable title, and AUTOSAVE — the editor stops
- * losing work. No citations (Phase 37).
+ * Manuscript editor (Phase 36, B2 slice C; citations Phase 37, B2 slice D). A
+ * headless TipTap contenteditable with a fixed toolbar, an editable title, and
+ * AUTOSAVE — the editor stops losing work. Cited library passages are
+ * first-class blocks (the `citation` node, components/editor/CitationNode.tsx).
  *
  * Bundling: dynamic-imported with `ssr: false` from the route shell
  * (SermonEditorShell), so TipTap loads only on the editor route. `useEditor`
@@ -61,19 +64,37 @@ const CONFLICT_MESSAGE =
   "Autosave is paused so neither side is clobbered. Your edits here are safe — " +
   "copy anything you need, then reload to get the latest version.";
 
-/** Build the StarterKit + Placeholder extension set. Link is disabled this
- * phase (no link UI in the toolbar; interactive links arrive with citations in
- * Phase 37). */
+/** Build the StarterKit + Placeholder + Citation extension set. StarterKit's
+ * own Link is disabled (no link UI in the toolbar); the only interactive links
+ * are inside the citation node view. The `citation` node (Phase 37) MUST be in
+ * this list so a stored doc containing it parses on load and round-trips through
+ * getJSON()/setContent. */
 function buildExtensions() {
   return [
     StarterKit.configure({ link: false }),
     Placeholder.configure({ placeholder: "Start writing your sermon…" }),
+    CitationNode,
   ];
 }
 
-export function SermonEditor({ document: initialDocument }: { document: DocumentFull }) {
+export function SermonEditor({
+  document: initialDocument,
+  ownedBookIds,
+}: {
+  document: DocumentFull;
+  // The user's owned-`book_id` set, resolved ONCE by the shell's single
+  // /library fetch on doc open and shared with every citation node view via
+  // context — so the degraded badge costs ZERO per-citation fetches. Defaults to
+  // an empty set (everything degraded) when the shell does not supply one.
+  ownedBookIds?: ReadonlySet<string>;
+}) {
   const [title, setTitle] = useState(initialDocument.title);
   const [status, setStatus] = useState<SaveStatus>("saved");
+
+  // Stabilize the membership set so a re-render does not hand the provider a new
+  // reference (and re-render every node view). The empty-set fallback keeps the
+  // degraded path safe when no set is supplied.
+  const membership = useMemo(() => ownedBookIds ?? new Set<string>(), [ownedBookIds]);
 
   // --- autosave machinery (refs so the loop reads fresh values, never stale
   //     closures) -----------------------------------------------------------
@@ -417,7 +438,9 @@ export function SermonEditor({ document: initialDocument }: { document: Document
         </div>
       </div>
 
-      <EditorContent editor={editor} />
+      <LibraryMembershipProvider ownedBookIds={membership}>
+        <EditorContent editor={editor} />
+      </LibraryMembershipProvider>
 
       {status === "conflict" ? (
         <div role="alert" className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3">

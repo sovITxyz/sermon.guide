@@ -15,6 +15,13 @@ import dynamic from "next/dynamic";
  * The server shell (page.tsx) fetches the full document server-side and passes
  * it down, so the editor opens with content already in hand — the dynamic
  * import only defers the editor CODE, not the data.
+ *
+ * Phase 37: the page also fetches the user's library ONCE (one /library call on
+ * doc open) and passes the owned-`book_id` set down as `ownedBookIds`. The
+ * editor shares it with every citation node view via context, so the
+ * degraded-badge decision ("no longer in your library") costs ZERO per-citation
+ * fetches. The set arrives as a string[] from the server component (Sets do not
+ * cross the RSC boundary) and is rebuilt into a Set here on the client.
  */
 const SermonEditor = dynamic(
   () => import("@/components/SermonEditor").then((mod) => mod.SermonEditor),
@@ -24,6 +31,12 @@ const SermonEditor = dynamic(
   },
 );
 
-export function SermonEditorShell({ document }: { document: DocumentFull }) {
-  return <SermonEditor document={document} />;
+export function SermonEditorShell({
+  document,
+  ownedBookIds,
+}: {
+  document: DocumentFull;
+  ownedBookIds: readonly string[];
+}) {
+  return <SermonEditor document={document} ownedBookIds={new Set(ownedBookIds)} />;
 }

@@ -47,6 +47,9 @@ test("an empty query surfaces a client-side validation error and never searches"
   // Submit with an empty input: SearchPanel's searchQueryProblem fires before
   // any fetch, so the alert appears and no Summary card is rendered.
   await page.getByRole("button", { name: "Search" }).click();
-  await expect(page.getByRole("alert")).toBeVisible();
+  // Scope to SearchPanel's validation copy: a bare getByRole("alert") also
+  // matches Next.js's always-present #__next-route-announcer__ (strict-mode
+  // violation), so assert on the validation message text directly.
+  await expect(page.getByText("Enter a question to search for.")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Summary" })).toHaveCount(0);
 });

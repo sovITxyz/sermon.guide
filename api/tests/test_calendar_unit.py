@@ -590,6 +590,148 @@ def test_repeat_weekly_until_before_event_date_is_422(
     assert session.events == {}
 
 
+def test_repeat_weekly_until_far_future_is_capped_422_no_large_alloc(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    """A far-future repeat_weekly_until (DoS vector) is the cap 422, FAST.
+
+    Pre-fix, the count was checked AFTER _weekly_dates built the FULL date
+    list, so event_date 2026 + repeat_weekly_until 9999 materialized a
+    ~400k-element list (memory/CPU DoS) before the 422. The bound is now O(1)
+    date arithmetic BEFORE generation: this must be the cap 422 (not a 500 /
+    timeout) and NOTHING is written. _weekly_dates is monkeypatched to a bomb
+    so the test FAILS if generation is ever reached on the far-future path.
+    """
+    session = _FakeSession()
+    _wire_session(monkeypatch, session)
+
+    def _no_generate(_start: date, _until: date) -> list[date]:
+        msg = "generation reached on the far-future path — the O(1) cap did not fire first"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("calendar_routes._weekly_dates", _no_generate)
+
+    with client:
+        resp = client.post(
+            "/calendar/events",
+            json={
+                "event_date": "2026-06-07",
+                "title": "Forever",
+                "repeat_weekly_until": "9999-12-31",
+            },
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert str(MATERIALIZER_CAP_ROWS) in resp.json()["detail"]  # the cap 422, not a generic error
+    # Nothing materialized — the cap fired before any list/row was built.
+    assert session.events == {}
+    assert "add" not in session.executed
+
+
+def test_repeat_weekly_until_date_max_is_422_not_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    """repeat_weekly_until at date.max is the cap 422, never an OverflowError 500.
+
+    Pre-fix, _weekly_dates looped ``current += timedelta(weeks=1)``; near
+    date.max the increment stepped past date.max → OverflowError → uncaught
+    500. The O(1) count-check now rejects this far-out range as the cap 422
+    before generation, so the overflow is unreachable.
+    """
+    session = _FakeSession()
+    _wire_session(monkeypatch, session)
+
+    with client:
+        resp = client.post(
+            "/calendar/events",
+            json={
+                "event_date": "2026-06-07",
+                "title": "To the end of time",
+                "repeat_weekly_until": date.max.isoformat(),
+            },
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert str(MATERIALIZER_CAP_ROWS) in resp.json()["detail"]
+    assert session.events == {}
+
+
+def test_repeat_weekly_cap_boundary_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    """The 53-row boundary is EXACT: exactly 53 → 201 with 53 rows, 54 → 422.
+
+    Mirrors test_repeat_weekly_at_cap_ok_over_cap_is_422 but pins the boundary
+    against the O(1) count formula (``(until - anchor).days // 7 + 1``): the
+    last accepted ``until`` is anchor + (cap-1) full weeks; one more week is
+    one occurrence too many.
+    """
+    session = _FakeSession()
+    _wire_session(monkeypatch, session)
+
+    anchor = date(2026, 1, 4)
+    at_cap = (anchor + timedelta(weeks=MATERIALIZER_CAP_ROWS - 1)).isoformat()  # exactly 53
+    over_cap = (anchor + timedelta(weeks=MATERIALIZER_CAP_ROWS)).isoformat()  # 54
+
+    with client:
+        ok = client.post(
+            "/calendar/events",
+            json={
+                "event_date": anchor.isoformat(),
+                "title": "Exactly 53",
+                "repeat_weekly_until": at_cap,
+            },
+        )
+        over = client.post(
+            "/calendar/events",
+            json={
+                "event_date": anchor.isoformat(),
+                "title": "54th",
+                "repeat_weekly_until": over_cap,
+            },
+        )
+
+    assert ok.status_code == 201, ok.text
+    assert len(ok.json()["events"]) == MATERIALIZER_CAP_ROWS
+    assert over.status_code == 422
+    assert str(MATERIALIZER_CAP_ROWS) in over.json()["detail"]
+    # Exactly 53 persisted; the over-cap POST wrote nothing.
+    assert len(session.events) == MATERIALIZER_CAP_ROWS
+
+
+def test_repeat_weekly_until_before_event_date_is_422_invalid_range(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    """repeat_weekly_until earlier than event_date is a 422 (invalid range).
+
+    The negative-span guard fires before the O(1) count arithmetic, so a
+    backwards range never reaches generation and writes nothing. (Distinct
+    from test_repeat_weekly_until_before_event_date_is_422: this one pins the
+    invalid-range 422 message and the write-free posture explicitly.)
+    """
+    session = _FakeSession()
+    _wire_session(monkeypatch, session)
+
+    with client:
+        resp = client.post(
+            "/calendar/events",
+            json={
+                "event_date": "2026-06-14",
+                "title": "Backwards",
+                "repeat_weekly_until": "2026-06-07",
+            },
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert "on or after event_date" in resp.json()["detail"]
+    assert session.events == {}
+    assert "add" not in session.executed
+
+
 def test_each_materialized_row_is_independently_patch_and_delete_able(
     monkeypatch: pytest.MonkeyPatch,
     client: TestClient,

@@ -125,6 +125,18 @@ class ApiSettings(BaseSettings):
     # on google, prefixed ``google/gemini-2.5-flash`` on ppq/deepinfra.
     llm_model: str | None = None
 
+    # Optional base-URL override (SERMON_API_LLM_BASE_URL); ``None`` → the active
+    # provider row's hardcoded ``base_url`` (``summary.py:_PROVIDERS``). The
+    # ONLY intended use is pointing the summary LLM at a local, deterministic
+    # OpenAI-compatible stub for end-to-end / CI runs (web Phase 25) so a real
+    # DeepInfra round-trip never fires in tests — the active provider's key is
+    # still required up front (a dummy value satisfies the 503 guard; the stub
+    # ignores it). It is NOT a production knob: a misconfigured value silently
+    # ships every user's query + retrieved passages to an arbitrary endpoint,
+    # so leave it unset outside test harnesses. The model spelling and the key
+    # env var still follow the active provider row.
+    llm_base_url: str | None = None
+
     # Optional reasoning-effort knob (SERMON_API_LLM_REASONING_EFFORT); ``None``
     # → the active provider row's ``default_reasoning_effort`` applies
     # (``summary.py:_PROVIDERS``): ``"none"`` on deepinfra — whose served

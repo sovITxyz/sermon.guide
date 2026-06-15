@@ -815,6 +815,43 @@ def test_ppq_flip_constructs_client_with_ppq_base_url_and_key(
         summary_module._client.cache_clear()
 
 
+def test_base_url_override_points_client_at_the_stub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SERMON_API_LLM_BASE_URL overrides the active provider's hardcoded base_url.
+
+    The web Phase 25 E2E points the live api at a local OpenAI-compatible stub
+    via this knob so no real provider round-trip fires. The key still follows
+    the active provider row (a dummy value satisfies the up-front 503 guard).
+    """
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "deepinfra")
+    monkeypatch.setattr(summary_module.settings, "deepinfra_api_key", "di-test")
+    monkeypatch.setattr(summary_module.settings, "llm_base_url", "http://127.0.0.1:8099/v1")
+    summary_module._client.cache_clear()
+    try:
+        client = summary_module._client()
+        assert str(client.base_url).rstrip("/") == "http://127.0.0.1:8099/v1"
+        # The active provider's key still rides — the override touches base_url only.
+        assert client.api_key == "di-test"
+    finally:
+        summary_module._client.cache_clear()
+
+
+def test_base_url_override_unset_keeps_provider_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``None`` override (the default) leaves the active provider's base_url intact."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "deepinfra")
+    monkeypatch.setattr(summary_module.settings, "deepinfra_api_key", "di-test")
+    monkeypatch.setattr(summary_module.settings, "llm_base_url", None)
+    summary_module._client.cache_clear()
+    try:
+        client = summary_module._client()
+        assert str(client.base_url).rstrip("/") == "https://api.deepinfra.com/v1/openai"
+    finally:
+        summary_module._client.cache_clear()
+
+
 def test_ppq_flip_uses_ppq_default_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """provider=ppq → the "google/"-prefixed catalog spelling, not the bare id."""
     monkeypatch.setattr(summary_module.settings, "llm_provider", "ppq")

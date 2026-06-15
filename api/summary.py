@@ -310,13 +310,21 @@ def _client() -> openai.OpenAI:
     so this never runs unconfigured in practice; the guard keeps that
     invariant explicit (``lru_cache`` does not cache the raised exception, so
     setting the key later still works).
+
+    ``SERMON_API_LLM_BASE_URL`` (``settings.llm_base_url``) overrides the active
+    provider row's hardcoded ``base_url`` — the sole intended use is pointing at
+    a local, deterministic OpenAI-compatible stub for the web Phase 25 E2E/CI so
+    no real provider round-trip fires (settings.py documents the non-prod
+    posture). The active provider's key is still required (a dummy value
+    satisfies the up-front 503 guard; the stub ignores it).
     """
     provider = _active_provider()
     api_key = provider.api_key()
     if not api_key:
         msg = f"{provider.key_env_var} is not configured"
         raise RuntimeError(msg)
-    return openai.OpenAI(base_url=provider.base_url, api_key=api_key)
+    base_url = settings.llm_base_url or provider.base_url
+    return openai.OpenAI(base_url=base_url, api_key=api_key)
 
 
 def _label_from_title(title: str, filename: str | None, book_id: uuid.UUID) -> str:

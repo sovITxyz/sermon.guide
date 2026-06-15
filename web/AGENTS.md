@@ -49,6 +49,42 @@ This is load-bearing; do not weaken it.
   `library.ts` are pure (no `server-only`) so middleware and Vitest can
   import them.
 
+## Editor — TipTap, code-split off non-editor routes (Phase 35)
+
+The sermon manuscript editor (`/sermons/[documentId]`) is a headless TipTap
+contenteditable. Locked decisions:
+
+- **MIT core ONLY — never a Pro extension (B2).** Deps:
+  `@tiptap/react`, `@tiptap/pm`, `@tiptap/starter-kit`,
+  `@tiptap/extension-placeholder` (all `^3`, MIT, React-19/Next-15 compatible —
+  TipTap 3 is the current `latest`). `StarterKit` is `.configure({ link: false })`
+  this phase: no link UI in the toolbar, and interactive links/citations arrive
+  in Phase 37. Do **not** add a Pro/cloud extension or any paid `@tiptap-pro/*`.
+- **Code-split.** `components/SermonEditor.tsx` is dynamic-imported via
+  `next/dynamic` with `ssr: false` from the route's client shell
+  (`app/sermons/[documentId]/SermonEditorShell.tsx`) — **the first and only
+  `next/dynamic` use in web/.** This keeps the TipTap + ProseMirror bundle in its
+  own chunk so it loads ONLY on the editor route, never on /library, /search,
+  /read, or /upload. `ssr: false` is doubly required: TipTap's `useEditor` runs
+  `immediatelyRender: false` per the App Router SSR rule, and ProseMirror touches
+  the DOM. The server shell (`page.tsx`) fetches the full doc server-side
+  (`lib/api-server.ts:getDocument`, bearer stays on the server) and passes it
+  down, so the dynamic import defers the editor CODE, not the DATA.
+- **ZERO `dangerouslySetInnerHTML`** (repo invariant). TipTap is headless
+  contenteditable — it renders its own DOM from the ProseMirror document and the
+  content round-trips as JSON, never as injected markup. List previews render the
+  server-derived `content_text` (`preview` field) as PLAIN TEXT.
+- **Explicit Save only this phase (autosave is Phase 36).** The Save button
+  PATCHes `{title, content: editor.getJSON(), base_updated_at}` through the
+  same-origin `/api/documents/[id]` proxy (which whitelists exactly those three
+  fields — `lib/documents.ts`). On **200** the component adopts the returned
+  `updated_at` as its new in-memory `base_updated_at` (a `useRef`) so a second
+  save from the same tab is never a false self-conflict. On **409** (a write
+  landed elsewhere since this tab loaded) it shows a **non-destructive** inline
+  error and KEEPS the user's buffer — the reload/merge conflict UX is Phase 36.
+  413/404 get their own sensible messages. No autosave, no debounce, no
+  citations.
+
 ## Tests
 
 Vitest runs **two projects in one `pnpm test`** (`vitest.workspace.ts`,
@@ -124,7 +160,12 @@ web server's server-only `API_BASE_URL` at the fake api so the same-origin
   WIRE shapes: `/auth/{signup,login}`, a grounded `/search-summary` whose
   `[book:chunk]` markers exactly match the returned citations (so the Phase 24
   chip renderer resolves them), `/upload`, and `/tasks/{id}` with the Phase-20
-  ownership-404 (own task → 200, another user's or unknown id → identical 404).
+  ownership-404 (own task → 200, another user's or unknown id → identical 404),
+  and the Phase-35 `/documents` endpoints (POST create → 201 full doc, GET list →
+  preview-only items with no `content` key, GET/`{id}` full, PATCH/`{id}` → 200 /
+  **409 on a stale `base_updated_at`**, DELETE soft) — all bearer-scoped with the
+  same uniform 404 for non-owned/unknown ids. A strictly-monotonic `updated_at`
+  (a counter, not wall-clock) makes the optimistic-concurrency 409 deterministic.
   This is the documented CI boundary: the web CI job has no services, so the
   grounded-summary determinism the live path gets from the stub LLM is baked
   straight into the fake api. It exercises the real browser → same-origin proxy

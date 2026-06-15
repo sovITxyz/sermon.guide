@@ -5,7 +5,7 @@ import {
   getDocument,
   getLibrary,
 } from "@/lib/api-server";
-import type { DocumentFull } from "@/lib/types";
+import type { DocumentFull, LibraryBookRef } from "@/lib/types";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
@@ -26,10 +26,13 @@ interface SermonEditorPageProps {
  * not-found state in place rather than redirecting.
  *
  * Phase 37: alongside the document, fetch the user's library ONCE (one /library
- * call) and pass the owned-`book_id` set to the shell. The citation node views
- * read it via context to decide the degraded badge — ZERO per-citation fetches.
- * A failed library fetch is non-fatal: an empty set degrades every citation
- * (cached snippet still renders) rather than blocking the editor from opening.
+ * call) and pass it to the shell. The owned-`book_id` set drives the degraded
+ * badge (ZERO per-citation fetches); the same fetch also yields the
+ * `book_id` -> title map the in-editor LibraryDrawer uses to cache `bookTitle`
+ * into a citation at insert (a raw /search hit carries no title). A failed
+ * library fetch is non-fatal: an empty list degrades every citation (cached
+ * snippet still renders) and just leaves the drawer unable to label a hit's book
+ * until the user reopens — it never blocks the editor from opening.
  */
 export default async function SermonEditorPage({ params }: SermonEditorPageProps) {
   const { documentId } = await params;
@@ -60,14 +63,16 @@ export default async function SermonEditorPage({ params }: SermonEditorPageProps
   }
 
   // One library fetch per doc open -> the owned-book_id set for the degraded
-  // badge. Non-fatal: an empty set just degrades every citation card.
-  let ownedBookIds: string[] = [];
+  // badge AND the {book_id, title} list the drawer uses to label inserted
+  // citations. Non-fatal: an empty list just degrades every citation card and
+  // leaves the drawer unable to title a hit until the user reopens.
+  let libraryBooks: LibraryBookRef[] = [];
   try {
     const books = await getLibrary();
-    ownedBookIds = books.map((book) => book.book_id);
+    libraryBooks = books.map((book) => ({ book_id: book.book_id, title: book.title }));
   } catch {
-    ownedBookIds = [];
+    libraryBooks = [];
   }
 
-  return <SermonEditorShell document={document} ownedBookIds={ownedBookIds} />;
+  return <SermonEditorShell document={document} libraryBooks={libraryBooks} />;
 }

@@ -23,6 +23,19 @@ export interface LibraryResponse {
   books: LibraryBook[];
 }
 
+/**
+ * The minimal library projection the editor shell hands the client (Phase 37):
+ * just `book_id` + `title`. A raw POST /search hit carries NO title, so the
+ * in-editor LibraryDrawer sources `bookTitle` from this map when caching a
+ * citation at insert; the owned-`book_id` set for the degraded badge is derived
+ * from the same list. `LibraryBook` itself does not cross the RSC boundary — the
+ * page projects it to this small shape (plain JSON) before passing it down.
+ */
+export interface LibraryBookRef {
+  book_id: string;
+  title: string;
+}
+
 export interface SummaryCitation {
   marker: string;
   book_id: string;

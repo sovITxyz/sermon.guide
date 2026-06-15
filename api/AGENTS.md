@@ -363,6 +363,69 @@ table (`worker/db/models.py`, migration 0004):
   the 404 contract correct forever; persisting the *outcome* to the row
   is deliberately deferred until a product surface needs it.
 
+## Documents — sermon storage (`documents.py`, Phase 34)
+
+`documents.py` is the storage + API half of the B2 sermon editor (slice
+A); Phases 35-37 build the web side on this surface (no web in Phase 34).
+Canonical sermon storage is TipTap/ProseMirror JSON in `documents.content`
+JSONB (Cross-item contract; markdown-canonical was rejected). The table is
+user-owned like `highlights` — every query filters by the JWT
+`user_id`, a non-owned `document_id` is a uniform 404 with no existence
+oracle (the cross-tenant-404 rule above). Migration 0006 (`worker/db`).
+
+- **`content_text` is ALWAYS server-derived, NEVER client-supplied.**
+  `documents.derive_content_text` is a pure helper that walks the
+  ProseMirror JSON node tree, concatenating every `text`-node's text and
+  joining block-level nodes with a newline; non-text leaves (image, hard
+  break, a citation node with no text) contribute nothing; malformed input
+  degrades to `""`. It is re-derived on EVERY create + content-PATCH. The
+  field is forbidden on the request models (`extra="forbid"`) so a smuggled
+  value — which could disagree with `content` — is a hard 422, not a
+  silently-dropped key. The list preview = the first `PREVIEW_CHARS`
+  (**280**) chars of `content_text`; the list NEVER ships the full
+  `content` JSON (that is the GET-full endpoint's job).
+- **The ~2 MB cap is measured on the SERIALIZED `content` JSON byte size**
+  (`MAX_CONTENT_BYTES = 2 * 1024 * 1024`), enforced in-handler on both
+  create and content-PATCH → 413 (the `uploads.py` 413 shape;
+  `HTTP_413_REQUEST_ENTITY_TOO_LARGE` to match that module). Measured with
+  `json.dumps(..., ensure_ascii=False)` so multibyte text counts its real
+  UTF-8 length.
+- **`schema_version` is server-managed** — the `SCHEMA_VERSION = 1` module
+  constant is the authoritative source; the DB column DEFAULT is only a
+  backstop. Never accepted from the body.
+- **PATCH is partial + optimistically concurrent.** Body carries
+  `base_updated_at` (REQUIRED), and `title` and/or `content` (at least one
+  — an empty patch is a 422). A `base_updated_at` that doesn't equal the
+  stored `updated_at` is a **409** (single-author concurrency, no versions
+  table — B2). The gate SELECT (`_owned_active_stmt`) runs first (ownership
+  + active + 404-no-oracle + carries the prior `updated_at` for the 409),
+  then a Core `UPDATE … RETURNING` (`_update_stmt`) applies the change and
+  **bumps `updated_at` EXPLICITLY via `func.now()`** in the value set — the
+  column has `server_default` but NO `onupdate` (schema-wide convention),
+  so without the explicit bump the next PATCH's gate value would never
+  move. (Same explicit-bump rationale as `reader._position_upsert_stmt`.)
+- **Soft delete + restore.** `DELETE` sets `deleted_at` via a scoped
+  `UPDATE … RETURNING` on an ACTIVE row (`_delete_stmt`); a soft-deleted
+  doc reads as 404 on GET/PATCH/DELETE (the active gate excludes
+  `deleted_at IS NOT NULL`), so a **double-DELETE is a 404**, symmetric
+  with GET-on-deleted. `POST /documents/{document_id}/restore` clears
+  `deleted_at` — it is the ONLY endpoint that resolves through
+  `_owned_any_stmt` (no `deleted_at IS NULL` predicate) so it can SEE
+  soft-deleted rows, but it KEEPS the `user_id` gate (a cross-tenant
+  restore is the same 404). Restoring an already-active doc is an
+  idempotent no-op 200.
+- **Statement builders are the tenant seam.** Every query is factored into
+  a module-level `_xxx_stmt` (`_list_stmt`, `_owned_active_stmt`,
+  `_owned_any_stmt`, `_update_stmt`, `_delete_stmt`) so its `user_id`
+  predicate is compile-pinned in `tests/test_documents_unit.py` (the
+  `library._library_stmt` pattern) — drop the predicate and every user sees
+  every user's sermons. The `(user_id, updated_at DESC)` index
+  (`ix_documents_user_updated`) backs the list's `ORDER BY updated_at DESC`.
+- **No rate-limit bucket in Phase 34.** The documents-autosave bucket
+  (~60/60) is web/autosave-driven and deferred to Phase 36 (see "Rate
+  limiting" → "Adding or widening a bucket"); new routes get no limiter
+  automatically.
+
 ## Content-type posture (Phase 20 — early sniff, decided)
 
 `POST /upload` libmagic-sniffs the FIRST BYTES of the body and 415s

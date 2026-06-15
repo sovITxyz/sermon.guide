@@ -37,6 +37,11 @@ const webServer = {
   command: `next dev --port ${WEB_PORT}`,
   port: WEB_PORT,
   reuseExistingServer: !process.env.CI,
+  // `next dev`'s first boot (npm/uv-free, but Next has to spin up its compiler)
+  // is slow on a cold CI runner — give it generous headroom before Playwright
+  // gives up waiting for the port. Separate from per-route on-demand compiles,
+  // which the navigationTimeout below absorbs.
+  timeout: 120_000,
   stdout: "pipe" as const,
   stderr: "pipe" as const,
   // API_BASE_URL is server-only (lib/config.ts) — the browser never sees it.
@@ -53,10 +58,25 @@ export default defineConfig({
   // Single worker in CI (one fake-api + one dev server) — omit the key locally
   // so Playwright picks its default. exactOptionalPropertyTypes forbids an
   // explicit `undefined`, so spread it in conditionally.
+  //
+  // workers:1 in CI is the COLD-START fix, not just a resource limit: with
+  // parallel workers each test hits a never-compiled `next dev` route at the
+  // same instant, stacking N simultaneous on-demand compiles past the 30s
+  // default and flaking the first cold run. Serializing makes each route
+  // compile once, sequentially; the first hit pays the compile, the rest are
+  // warm. Retries stay as a backstop, not the primary fix.
   ...(process.env.CI ? { workers: 1 } : {}),
+  // A single cold on-demand route compile on a slow runner can exceed the 30s
+  // default navigation timeout, so raise the page-navigation and action waits
+  // enough to absorb one compile. Also lift the per-test cap (default 30s) so a
+  // navigate-then-act test that pays a cold compile doesn't trip the test
+  // timeout either.
+  timeout: 90_000,
   reporter: process.env.CI ? [["github"], ["list"]] : "list",
   use: {
     baseURL: `http://127.0.0.1:${WEB_PORT}`,
+    navigationTimeout: 60_000,
+    actionTimeout: 15_000,
     trace: "on-first-retry",
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],

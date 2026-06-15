@@ -100,6 +100,17 @@ globs `e2e/**/*.spec.ts`, so the two never collect each other.
 - `pnpm e2e` — Playwright's `webServer` boots everything itself. No manual
   server juggling.
 
+**Cold-start under CI.** The suite drives `next dev`, which compiles routes
+on-demand on first hit. Under `CI=1` it runs `workers: 1` so each route
+compiles once, sequentially — parallel workers would otherwise stack N
+simultaneous cold compiles past the 30s default and flake the first cold run.
+To absorb a single cold compile the config also raises `navigationTimeout`
+(60s), `actionTimeout` (15s), the per-test `timeout` (90s), and the
+`webServer.timeout` for `next dev`'s first boot (120s); `retries: 2` stays as a
+backstop, not the primary fix. We deliberately keep the dev-server path (not
+`next build`/`start`) — a genuinely-cold `rm -rf .next` first run is 4/4 green
+with these limits. `reuseExistingServer` stays off in CI, on locally.
+
 **Ports — never 3000.** The dev server binds **3100** (`E2E_WEB_PORT`, the
 :3000 conflict on the dev box is real); the in-memory fake api binds **8081**
 (`FAKE_API_PORT`). Both are env-overridable. `playwright.config.ts` points the

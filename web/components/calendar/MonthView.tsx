@@ -17,17 +17,31 @@ interface MonthViewProps {
   colorFor: typeof SeriesColorFn;
   /** Today's `YYYY-MM-DD`, to ring the current day. */
   todayStr: string;
+  /** Open the quick-create popover for an in-month day (`YYYY-MM-DD`). */
+  onCreate: (date: string) => void;
+  /** Open the edit/delete popover for an event chip. */
+  onEdit: (event: CalendarEvent) => void;
 }
 
 /**
  * The single-month view: a `grid-cols-7` of tall day cells. Each in-month day
  * shows up to {@link MAX_CHIPS} series-colored event CHIPS (title as a plain
  * text node — never `dangerouslySetInnerHTML`) and a "+N more" line when there
- * are more. Leading/trailing adjacent-month days are dimmed. Built from the
- * pure `monthGrid` so the alignment (Sunday start, leap February) is exactly
- * what the vitest suite pins.
+ * are more. Clicking a chip opens the edit/delete popover (Phase 40); clicking
+ * an in-month day's empty space opens the quick-create popover for that day.
+ * Leading/trailing adjacent-month days are dimmed and inert. Built from the pure
+ * `monthGrid` so the alignment (Sunday start, leap February) is exactly what the
+ * vitest suite pins.
  */
-export function MonthView({ year, month, eventsByDate, colorFor, todayStr }: MonthViewProps) {
+export function MonthView({
+  year,
+  month,
+  eventsByDate,
+  colorFor,
+  todayStr,
+  onCreate,
+  onEdit,
+}: MonthViewProps) {
   const weeks = monthGrid(year, month);
 
   return (
@@ -47,11 +61,14 @@ export function MonthView({ year, month, eventsByDate, colorFor, todayStr }: Mon
             return (
               <MonthDay
                 key={cell.date}
+                date={cell.date}
                 day={cell.day}
                 inMonth={cell.inMonth}
                 isToday={isToday}
                 events={events}
                 colorFor={colorFor}
+                onCreate={onCreate}
+                onEdit={onEdit}
               />
             );
           }),
@@ -62,17 +79,23 @@ export function MonthView({ year, month, eventsByDate, colorFor, todayStr }: Mon
 }
 
 function MonthDay({
+  date,
   day,
   inMonth,
   isToday,
   events,
   colorFor,
+  onCreate,
+  onEdit,
 }: {
+  date: string;
   day: number;
   inMonth: boolean;
   isToday: boolean;
   events: CalendarEvent[];
   colorFor: typeof SeriesColorFn;
+  onCreate: (date: string) => void;
+  onEdit: (event: CalendarEvent) => void;
 }) {
   const chips = events.slice(0, MAX_CHIPS);
   const overflow = events.length - chips.length;
@@ -84,23 +107,36 @@ function MonthDay({
         inMonth ? "bg-white" : "bg-gray-50"
       }`}
     >
-      <div
-        className={`mb-1 inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${
-          inMonth ? "text-gray-700" : "text-gray-300"
-        } ${isToday ? "bg-blue-600 font-semibold text-white" : ""}`}
-      >
-        {day}
-      </div>
+      {inMonth ? (
+        <button
+          type="button"
+          onClick={() => onCreate(date)}
+          aria-label={`Add an event on ${date}`}
+          className={`mb-1 inline-flex h-5 w-5 items-center justify-center rounded-full text-xs hover:bg-gray-100 ${
+            isToday ? "bg-blue-600 font-semibold text-white hover:bg-blue-700" : "text-gray-700"
+          }`}
+        >
+          {day}
+        </button>
+      ) : (
+        <div className="mb-1 inline-flex h-5 w-5 items-center justify-center rounded-full text-gray-300 text-xs">
+          {day}
+        </div>
+      )}
       <ul className="space-y-0.5">
         {chips.map((event) => {
           const color = colorFor(event.series);
           return (
-            <li
-              key={event.event_id}
-              title={event.series ? `${event.title} · ${event.series}` : event.title}
-              className={`truncate rounded px-1 py-0.5 text-[11px] leading-tight ${color.bg} ${color.text}`}
-            >
-              {event.title}
+            <li key={event.event_id}>
+              <button
+                type="button"
+                onClick={() => onEdit(event)}
+                aria-label={`Edit ${event.title}`}
+                title={event.series ? `${event.title} · ${event.series}` : event.title}
+                className={`block w-full truncate rounded px-1 py-0.5 text-left text-[11px] leading-tight hover:opacity-80 ${color.bg} ${color.text}`}
+              >
+                {event.title}
+              </button>
             </li>
           );
         })}

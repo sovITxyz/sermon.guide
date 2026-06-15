@@ -17,12 +17,20 @@ import {
   monthRange,
   parseDate,
   today,
+  weekRange,
   yearRange,
 } from "@/lib/dates";
 import type { CalendarEvent } from "@/lib/types";
 
-/** The two read-only views Phase 39 ships (week + CRUD arrive in Phase 40). */
-export type CalendarViewKind = "year" | "month";
+// The deterministic series→color mapper (Phase 40) lives in its own module so
+// the proxy/test layer can import it without pulling in the date helpers, but
+// the calendar views have always imported it from here. Re-export it (and its
+// type) so year / month / week all reach the SAME `seriesColor`, guaranteeing a
+// given series renders the identical color in every view.
+export { type SeriesColor, seriesColor } from "@/lib/series-color";
+
+/** The calendar views: the year wall-planner, a month grid, and a week (Phase 40). */
+export type CalendarViewKind = "year" | "month" | "week";
 
 /** The normalized, validated calendar state derived from the URL. */
 export interface CalendarState {
@@ -54,7 +62,8 @@ export function parseCalendarState(
   rawDate: string | null | undefined,
   now: Date = new Date(),
 ): CalendarState {
-  const view: CalendarViewKind = rawView === "month" ? "month" : "year";
+  const view: CalendarViewKind =
+    rawView === "month" ? "month" : rawView === "week" ? "week" : "year";
 
   let anchor = today(now);
   if (typeof rawDate === "string") {
@@ -78,11 +87,19 @@ export function parseCalendarState(
 /**
  * The single half-open `[start, end)` range the one `/sermon-events` fetch
  * needs for a given state: the whole anchor year for the year view, the whole
- * anchor month for the month view. Both fit well under the API's 400-day cap,
- * so each view is exactly one call (the year is 365/366 days).
+ * anchor month for the month view, or the seven days of the anchor's week
+ * (Sunday-aligned) for the week view. All three fit well under the API's
+ * 400-day cap, so each view is exactly one call (the year is 365/366 days).
  */
 export function rangeForState(state: CalendarState): DateRange {
-  return state.view === "year" ? yearRange(state.year) : monthRange(state.year, state.month);
+  switch (state.view) {
+    case "year":
+      return yearRange(state.year);
+    case "month":
+      return monthRange(state.year, state.month);
+    case "week":
+      return weekRange(state.anchor);
+  }
 }
 
 /**
@@ -105,72 +122,10 @@ export function groupByDate(events: readonly CalendarEvent[]): Map<string, Calen
 }
 
 /**
- * A small, fixed palette of Tailwind utility-class triples for series dots and
- * chips. Deliberately a closed set of static class strings (not interpolated)
- * so Tailwind's content scanner emits every one — a dynamically-built class
- * name like `bg-${x}` would be purged from the production CSS.
- */
-export interface SeriesColor {
-  /** Background for a chip / a filled dot. */
-  bg: string;
-  /** Foreground text color for a chip. */
-  text: string;
-  /** A standalone dot color (used in the dense year view). */
-  dot: string;
-}
-
-const SERIES_PALETTE: readonly SeriesColor[] = [
-  { bg: "bg-blue-100", text: "text-blue-800", dot: "bg-blue-500" },
-  { bg: "bg-emerald-100", text: "text-emerald-800", dot: "bg-emerald-500" },
-  { bg: "bg-amber-100", text: "text-amber-800", dot: "bg-amber-500" },
-  { bg: "bg-rose-100", text: "text-rose-800", dot: "bg-rose-500" },
-  { bg: "bg-violet-100", text: "text-violet-800", dot: "bg-violet-500" },
-  { bg: "bg-cyan-100", text: "text-cyan-800", dot: "bg-cyan-500" },
-  { bg: "bg-orange-100", text: "text-orange-800", dot: "bg-orange-500" },
-  { bg: "bg-teal-100", text: "text-teal-800", dot: "bg-teal-500" },
-];
-
-/** The neutral color for events with no series label (`series === null`). */
-const NO_SERIES_COLOR: SeriesColor = {
-  bg: "bg-gray-100",
-  text: "text-gray-700",
-  dot: "bg-gray-400",
-};
-
-/**
- * A stable, non-negative 32-bit hash of a string (FNV-1a-ish via the classic
- * `h = h*31 + c` fold, kept in 32 bits with `| 0` then unsigned-shifted). Pure
- * and deterministic so a given series always maps to the same palette slot
- * across renders and reloads — the "deterministic series→color hash" the B3
- * backlog calls for.
- */
-function hashString(value: string): number {
-  let hash = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash * 31 + value.charCodeAt(i)) | 0;
-  }
-  return hash >>> 0;
-}
-
-/**
- * Map a `series` label to a deterministic {@link SeriesColor}. `null` (no
- * series) gets the neutral gray; any non-empty label hashes into the fixed
- * palette. Same label → same color, every time, with no shared mutable state.
- */
-export function seriesColor(series: string | null): SeriesColor {
-  if (series === null || series.length === 0) {
-    return NO_SERIES_COLOR;
-  }
-  // SERIES_PALETTE is a non-empty const; the modulo keeps the index in range,
-  // and the `?? NO_SERIES_COLOR` satisfies noUncheckedIndexedAccess.
-  const index = hashString(series) % SERIES_PALETTE.length;
-  return SERIES_PALETTE[index] ?? NO_SERIES_COLOR;
-}
-
-/**
  * Build the `?view=&date=` href for a calendar link, normalizing the date to
- * the canonical `YYYY-MM-DD`. Used by the prev/next month controls and the
- * year→month drill-down (clicking a MiniMonth opens that month).
+ * the canonical `YYYY-MM-DD`. Used by the prev/next period controls and the
+ * year→month / month→week drill-downs. Works unchanged for `"week"` now that
+ * {@link CalendarViewKind} widened.
  */
 export function calendarHref(view: CalendarViewKind, date: string): string {
   const { year, month, day } = parseDate(date);

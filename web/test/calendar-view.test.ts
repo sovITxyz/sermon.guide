@@ -40,8 +40,15 @@ describe("parseCalendarState", () => {
     expect(state.month).toBe(3);
   });
 
-  it("falls back to year for an unknown view", () => {
-    expect(parseCalendarState("week", "2026-03-15", NOW).view).toBe("year");
+  it("honors view=week and keeps the clicked day as the anchor", () => {
+    const state = parseCalendarState("week", "2026-03-18", NOW);
+    expect(state.view).toBe("week");
+    // The anchor stays the exact clicked day; rangeForState Sunday-aligns it.
+    expect(state.anchor).toBe("2026-03-18");
+  });
+
+  it("falls back to year for an unknown/empty view", () => {
+    expect(parseCalendarState("decade", "2026-03-15", NOW).view).toBe("year");
     expect(parseCalendarState("", "2026-03-15", NOW).view).toBe("year");
   });
 
@@ -79,6 +86,19 @@ describe("rangeForState", () => {
   it("rolls a December month range into the next January", () => {
     const range = rangeForState(parseCalendarState("month", "2026-12-25", NOW));
     expect(range).toEqual({ start: "2026-12-01", end: "2027-01-01" });
+  });
+
+  it("spans the Sunday-aligned seven days of the anchor's week (half-open)", () => {
+    // 2026-03-18 is a Wednesday → the week is Sun 2026-03-15 .. Sat 2026-03-21,
+    // half-open end is the following Sunday 2026-03-22.
+    const range = rangeForState(parseCalendarState("week", "2026-03-18", NOW));
+    expect(range).toEqual({ start: "2026-03-15", end: "2026-03-22" });
+  });
+
+  it("rolls a week range across a month boundary", () => {
+    // 2026-04-01 is a Wednesday → week Sun 2026-03-29 .. Sat 2026-04-04.
+    const range = rangeForState(parseCalendarState("week", "2026-04-01", NOW));
+    expect(range).toEqual({ start: "2026-03-29", end: "2026-04-05" });
   });
 });
 

@@ -128,3 +128,197 @@ test("year→month drill-down: clicking a month name opens that month", async ({
   await expect(page.getByRole("heading", { level: 1, name: `February ${YEAR}` })).toBeVisible();
   await expect(page.getByTestId("calendar-month").getByText("Sermon on the Mount")).toBeVisible();
 });
+
+/**
+ * Phase 40 — the week view + create/edit/delete round-trips.
+ *
+ * These exercise the same-origin mutation proxies (POST /api/sermon-events and
+ * PATCH/DELETE /api/sermon-events/[eventId]) against the in-memory fake api,
+ * which keeps a per-user store and materializes weekly repeats server-side. The
+ * seeded 2028 rows are shared/visible to everyone, so each spec works in a fresh
+ * future year (2029) and signs up a fresh user to assert only its OWN rows. The
+ * UI refetches the current range after every successful mutation, so the new
+ * state must appear without a manual reload.
+ *
+ * 2029-03-14 is a Wednesday → its week (Sunday-aligned) is 2029-03-11 .. 2029-03-17.
+ */
+
+const Y2 = "2029";
+const CREATE_DATE = "2029-03-14";
+const WEEK_ANCHOR = "2029-03-14"; // any day in the Sun 03-11 .. Sat 03-17 week
+
+test("?view=week deep-links to a 7-column week grid (Sunday-aligned)", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  await page.goto(`/calendar?view=week&date=${WEEK_ANCHOR}`);
+
+  // The week toggle is active and the week grid renders.
+  await expect(page.getByRole("link", { name: "Week", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  const weekGrid = page.getByTestId("calendar-week");
+  await expect(weekGrid).toBeVisible();
+
+  // Seven day columns, each with an "Add an event on YYYY-MM-DD" affordance for
+  // its day — Sunday 03-11 first through Saturday 03-17 last.
+  for (const day of [
+    "2029-03-11",
+    "2029-03-12",
+    "2029-03-13",
+    "2029-03-14",
+    "2029-03-15",
+    "2029-03-16",
+    "2029-03-17",
+  ]) {
+    await expect(page.getByRole("button", { name: `Add an event on ${day}` })).toBeVisible();
+  }
+});
+
+test("create on an empty day appears in the week, month, and year views", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  await page.goto(`/calendar?view=week&date=${WEEK_ANCHOR}`);
+  await expect(page.getByTestId("calendar-week")).toBeVisible();
+
+  // Open the quick-create popover for 2029-03-14 and fill it.
+  await page.getByRole("button", { name: `Add an event on ${CREATE_DATE}` }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Title").fill("Midweek Vespers");
+  await dialog.getByLabel("Series", { exact: false }).fill("Lent");
+  await dialog.getByRole("button", { name: "Create" }).click();
+
+  // After the POST the island refetches the week range — the new card shows up
+  // in the week view without a reload.
+  await expect(dialog).toBeHidden();
+  await expect(page.getByTestId("calendar-week").getByText("Midweek Vespers")).toBeVisible();
+
+  // The same row appears in the month view (March 2029)...
+  await page.goto(`/calendar?view=month&date=${Y2}-03-01`);
+  await expect(page.getByTestId("calendar-month").getByText("Midweek Vespers")).toBeVisible();
+
+  // ...and in the year view (its March MiniMonth marks the day as having events).
+  await page.goto(`/calendar?view=year&date=${Y2}-01-01`);
+  const march = page.getByRole("region", { name: `March ${Y2}` });
+  await expect(march.getByRole("group", { name: /2029-03-14, 1 event/ })).toBeVisible();
+});
+
+test("a weekly-repeat create materializes the whole capped run", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // Create starting 2029-03-04 (a Sunday) repeating weekly until 2029-03-18 →
+  // three rows: 03-04, 03-11, 03-18 (anchor + every +7 days through the until).
+  await page.goto(`/calendar?view=month&date=${Y2}-03-01`);
+  await expect(page.getByTestId("calendar-month")).toBeVisible();
+
+  await page.getByRole("button", { name: "Add an event on 2029-03-04" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Lenten Series");
+  await dialog.getByLabel("Repeat weekly", { exact: true }).check();
+  await dialog.getByLabel("Repeat weekly until").fill("2029-03-18");
+  await dialog.getByRole("button", { name: "Create" }).click();
+
+  await expect(dialog).toBeHidden();
+  // All three materialized rows land in the same month grid.
+  await expect(page.getByTestId("calendar-month").getByText("Lenten Series")).toHaveCount(3);
+});
+
+test("a weekly-repeat over the cap surfaces the API's 422", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  await page.goto(`/calendar?view=month&date=${Y2}-01-01`);
+  await expect(page.getByTestId("calendar-month")).toBeVisible();
+
+  // 2029-01-07 .. 2031-01-12 is far more than 53 weekly occurrences → the API's
+  // materializer cap 422 must surface inline (the proxy passes it through; the
+  // UI never pre-validates the cap).
+  await page.getByRole("button", { name: "Add an event on 2029-01-07" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Too Many");
+  await dialog.getByLabel("Repeat weekly", { exact: true }).check();
+  await dialog.getByLabel("Repeat weekly until").fill("2031-01-12");
+  await dialog.getByRole("button", { name: "Create" }).click();
+
+  // The dialog stays open and shows the cap error; nothing was created.
+  await expect(dialog.getByRole("alert")).toContainText(/limit/i);
+  await expect(dialog).toBeVisible();
+});
+
+test("edit a title then delete: round-trip reflected across views", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // Seed one of our own rows via the week view.
+  await page.goto(`/calendar?view=week&date=${WEEK_ANCHOR}`);
+  await page.getByRole("button", { name: `Add an event on ${CREATE_DATE}` }).click();
+  let dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Draft Sermon");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByTestId("calendar-week").getByText("Draft Sermon")).toBeVisible();
+
+  // Edit the title via the card's edit popover.
+  await page.getByRole("button", { name: "Edit Draft Sermon" }).click();
+  dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Title").fill("Final Sermon");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(dialog).toBeHidden();
+
+  // The rename is reflected in the week view (refetch) and the month view.
+  await expect(page.getByTestId("calendar-week").getByText("Final Sermon")).toBeVisible();
+  await expect(page.getByTestId("calendar-week").getByText("Draft Sermon")).toHaveCount(0);
+  await page.goto(`/calendar?view=month&date=${Y2}-03-01`);
+  await expect(page.getByTestId("calendar-month").getByText("Final Sermon")).toBeVisible();
+
+  // Delete it from the month view's chip.
+  await page.getByRole("button", { name: "Edit Final Sermon" }).click();
+  dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "Delete" }).click();
+  await expect(dialog).toBeHidden();
+  // Gone from the month view and from the week view after the refetch.
+  await expect(page.getByTestId("calendar-month").getByText("Final Sermon")).toHaveCount(0);
+  await page.goto(`/calendar?view=week&date=${WEEK_ANCHOR}`);
+  await expect(page.getByTestId("calendar-week").getByText("Final Sermon")).toHaveCount(0);
+});
+
+test("the same series renders the same color across week and month views", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // Two events sharing one series on two days of the same week.
+  await page.goto(`/calendar?view=week&date=${WEEK_ANCHOR}`);
+  for (const [day, title] of [
+    ["2029-03-12", "Service A"],
+    ["2029-03-15", "Service B"],
+  ] as const) {
+    await page.getByRole("button", { name: `Add an event on ${day}` }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByLabel("Title").fill(title);
+    await dialog.getByLabel("Series", { exact: false }).fill("Eastertide");
+    await dialog.getByRole("button", { name: "Create" }).click();
+    await expect(dialog).toBeHidden();
+  }
+
+  // In the week view both cards share the deterministic series background class.
+  const cardA = page.getByRole("button", { name: "Edit Service A" });
+  const cardB = page.getByRole("button", { name: "Edit Service B" });
+  const classA = (await cardA.getAttribute("class")) ?? "";
+  const classB = (await cardB.getAttribute("class")) ?? "";
+  const bgA = (classA.match(/bg-[a-z]+-100/) ?? [])[0];
+  const bgB = (classB.match(/bg-[a-z]+-100/) ?? [])[0];
+  expect(bgA).toBeTruthy();
+  expect(bgA).toBe(bgB);
+
+  // The month view uses the SAME mapper, so the chip background matches too.
+  await page.goto(`/calendar?view=month&date=${Y2}-03-01`);
+  const chip = page.getByRole("button", { name: "Edit Service A" });
+  const chipClass = (await chip.getAttribute("class")) ?? "";
+  const bgChip = (chipClass.match(/bg-[a-z]+-100/) ?? [])[0];
+  expect(bgChip).toBe(bgA);
+});

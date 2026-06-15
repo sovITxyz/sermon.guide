@@ -390,6 +390,82 @@ def test_derive_text_bare_list_of_nodes() -> None:
     )
 
 
+def test_derive_text_document_order_is_preserved() -> None:
+    # The walk is depth-first in DOCUMENT ORDER: every child (sibling blocks
+    # AND the sibling text nodes within a block) emits in the order it
+    # appears, each child joined to the next by a newline (the container
+    # join is per-child, so two text nodes in one paragraph land on two
+    # lines — the same byte-identical contract as DOC_TEXT above).
+    doc: dict[str, Any] = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "one"}]},
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "two"},
+                    {"type": "text", "text": "three"},
+                ],
+            },
+            {"type": "paragraph", "content": [{"type": "text", "text": "four"}]},
+        ],
+    }
+    assert derive_content_text(doc) == "one\ntwo\nthree\nfour"
+
+
+def test_derive_text_empty_child_contributes_no_blank_line() -> None:
+    # An empty block between two non-empty blocks must NOT inject a blank
+    # line — the per-container join drops empty parts before joining (the
+    # byte-identical contract the iterative rewrite must preserve).
+    doc: dict[str, Any] = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "head"}]},
+            {"type": "paragraph", "content": []},
+            {"type": "horizontalRule"},
+            {"type": "paragraph", "content": [{"type": "text", "text": "tail"}]},
+        ],
+    }
+    assert derive_content_text(doc) == "head\ntail"
+
+
+def test_derive_text_pathologically_deep_does_not_recurse_overflow() -> None:
+    # A small-but-deep ProseMirror doc (20000 nested single-child blocks,
+    # well under MAX_CONTENT_BYTES) blows Python's ~1000-frame recursion
+    # limit in a naive recursive walk -> RecursionError -> 500 DoS by any
+    # authed user. The ITERATIVE walk must traverse any depth without
+    # raising and still project the buried text correctly.
+    depth = 20_000
+    node: dict[str, Any] = {"type": "text", "text": "deep"}
+    for _ in range(depth):
+        node = {"type": "blockquote", "content": [node]}
+    doc: dict[str, Any] = {"type": "doc", "content": [node]}
+
+    # No RecursionError; the single buried text node is the whole projection
+    # (each nesting level is a single-child container, so no newline joins).
+    assert derive_content_text(doc) == "deep"
+
+
+def test_derive_text_deep_with_sibling_blocks_keeps_newline_joins() -> None:
+    # Depth AND breadth: a deeply nested chain whose innermost block holds
+    # two sibling paragraphs — the iterative walk still folds siblings with
+    # a newline at the correct level, at depth, without recursing.
+    depth = 5_000
+    inner: dict[str, Any] = {
+        "type": "blockquote",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "alpha"}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "omega"}]},
+        ],
+    }
+    node: dict[str, Any] = inner
+    for _ in range(depth):
+        node = {"type": "blockquote", "content": [node]}
+    doc: dict[str, Any] = {"type": "doc", "content": [node]}
+
+    assert derive_content_text(doc) == "alpha\nomega"
+
+
 # --- create → list → GET-full round trip -------------------------------------
 
 

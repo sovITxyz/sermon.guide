@@ -389,7 +389,12 @@ oracle (the cross-tenant-404 rule above). Migration 0006 (`worker/db`).
   create and content-PATCH → 413 (the `uploads.py` 413 shape;
   `HTTP_413_REQUEST_ENTITY_TOO_LARGE` to match that module). Measured with
   `json.dumps(..., ensure_ascii=False)` so multibyte text counts its real
-  UTF-8 length.
+  UTF-8 length. Forward note: this ~2 MB cap is enforced IN-HANDLER, after
+  Starlette has already buffered the whole request body into memory; a
+  pre-deserialize / global ASGI body-size limit is a future cross-cutting
+  hardening (not Phase 34 scope). The node-tree walk itself is iterative
+  (`derive_content_text`), so a small-but-deeply-nested payload under the
+  cap cannot `RecursionError`-500.
 - **`schema_version` is server-managed** — the `SCHEMA_VERSION = 1` module
   constant is the authoritative source; the DB column DEFAULT is only a
   backstop. Never accepted from the body.

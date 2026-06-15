@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
@@ -150,6 +151,61 @@ class DocumentResponse(BaseModel):
     updated_at: datetime
 
 
+@dataclass(slots=True)
+class _Frame:
+    """One container node mid-walk in :func:`derive_content_text`.
+
+    ``children`` is the node's child list, ``parts`` accumulates the
+    NON-EMPTY projections of children already resolved (in document order),
+    and ``cursor`` is the index of the next child to process. A plain
+    mutable struct so the iterative walk can suspend/resume a parent across
+    a child descent without recursion.
+    """
+
+    children: list[object]
+    parts: list[str]
+    cursor: int
+
+
+def _node_children(content: object) -> list[object] | None:
+    """Return the child-node list for a container, or ``None`` for a leaf/scalar.
+
+    A non-text ``dict`` whose ``content`` is a list is a block-level
+    container; a bare ``list`` is treated as a container of its elements
+    (the top-level ``doc.content`` handed in raw). Everything else — a text
+    node, a leaf node with no ``content`` list, or a scalar — has no
+    children. Text nodes are deliberately excluded here: their projection is
+    their ``text`` string (handled by ``_node_text``), never a join of
+    children, even if a malformed text node also carried a ``content`` list.
+    """
+    if isinstance(content, dict):
+        node = cast("dict[str, object]", content)
+        if node.get("type") == "text":
+            return None
+        children = node.get("content")
+        if isinstance(children, list):
+            return cast("list[object]", children)
+        return None
+    if isinstance(content, list):
+        return cast("list[object]", content)
+    return None
+
+
+def _node_text(content: object) -> str:
+    """Return a single node's own text contribution (no recursion into children).
+
+    A ``text`` node yields its ``text`` string (``""`` if absent/non-str);
+    every other node — a container (whose text comes from its children), a
+    non-text leaf, or a scalar — contributes nothing on its own.
+    """
+    if isinstance(content, dict):
+        node = cast("dict[str, object]", content)
+        if node.get("type") == "text":
+            text = node.get("text")
+            return text if isinstance(text, str) else ""
+    return ""
+
+
 def derive_content_text(content: object) -> str:
     """Walk a ProseMirror/TipTap JSON node tree → plain text.
 
@@ -163,30 +219,64 @@ def derive_content_text(content: object) -> str:
     raising — the byte-size cap and JSON-shape are the client's contract,
     this projection is best-effort.
 
+    The walk is ITERATIVE (an explicit work stack, depth-first,
+    document-order) — NOT recursive — so a pathologically deep document
+    cannot raise ``RecursionError`` and 500 the request (a small but deeply
+    nested payload sits well under ``MAX_CONTENT_BYTES`` yet would blow
+    Python's ~1000-frame default limit). Output is byte-identical to the
+    earlier recursive form: a container's projection is the newline-join of
+    its children's NON-EMPTY projections (so an empty child contributes no
+    blank line), evaluated in document order; a text node yields its text;
+    every other leaf yields ``""``.
+
+    Mechanics: a two-phase post-order traversal. Each work item is a
+    ``(node, children, child_results)`` frame. We push a node, expand its
+    children left-to-right onto the stack (so they pop in document order),
+    and once all of a node's children have been resolved we fold them into
+    the parent's ``child_results`` — joining the non-empty ones with ``\\n``.
+    The single ``results`` map keyed by frame identity carries each
+    resolved subtree's string back up to its parent. No call recursion, so
+    depth is bounded only by available memory, not the interpreter stack.
+
     The output backs list previews (first ``PREVIEW_CHARS`` chars) and
     future FTS. It is re-derived on EVERY write; the client never supplies
     it.
     """
-    # A ProseMirror text node: {"type": "text", "text": "..."}.
-    if isinstance(content, dict):
-        node = cast("dict[str, object]", content)
-        if node.get("type") == "text":
-            text = node.get("text")
-            return text if isinstance(text, str) else ""
-        # Recurse into the node's children. Block-level container nodes
-        # (doc, paragraph, heading, list_item, blockquote, …) hold their
-        # children under "content"; joining those children's projections
-        # with a newline keeps blocks on separate lines.
-        children = node.get("content")
-        if isinstance(children, list):
-            kids = cast("list[object]", children)
-            return "\n".join(part for part in (derive_content_text(c) for c in kids) if part)
-        return ""
-    # A bare list of nodes (e.g. the top-level doc.content handed in raw).
-    if isinstance(content, list):
-        nodes = cast("list[object]", content)
-        return "\n".join(part for part in (derive_content_text(c) for c in nodes) if part)
-    return ""
+    children = _node_children(content)
+    if children is None:
+        # A leaf (text node or otherwise) or scalar: its own text, no walk.
+        return _node_text(content)
+
+    # Post-order DFS with an explicit stack. Each frame is one container
+    # node; ``parts`` accumulates its children's resolved (already
+    # newline-folded) projections in document order. ``cursor`` is the
+    # index of the next child to process. We process a frame's children
+    # one at a time: a leaf child folds in immediately; a container child
+    # pushes a new frame and suspends the parent (we re-find it on return).
+    stack: list[_Frame] = [_Frame(children=children, parts=[], cursor=0)]
+    while True:
+        frame = stack[-1]
+        if frame.cursor < len(frame.children):
+            child = frame.children[frame.cursor]
+            frame.cursor += 1
+            grandkids = _node_children(child)
+            if grandkids is None:
+                # Leaf child: its own text folds straight into the parent.
+                part = _node_text(child)
+                if part:
+                    frame.parts.append(part)
+            else:
+                # Container child: descend; its folded result is appended
+                # to THIS frame's parts when the child frame completes.
+                stack.append(_Frame(children=grandkids, parts=[], cursor=0))
+            continue
+        # All children of this frame are resolved: fold them.
+        folded = "\n".join(frame.parts)
+        stack.pop()
+        if not stack:
+            return folded
+        if folded:
+            stack[-1].parts.append(folded)
 
 
 def _content_byte_size(content: dict[str, object]) -> int:

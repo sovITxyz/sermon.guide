@@ -96,6 +96,11 @@ function makeFakeEditor(): FakeEditor {
   return editor;
 }
 
+// The editor now imports CitationNode (components/editor/CitationNode.tsx),
+// which pulls Node/mergeAttributes/ReactNodeViewRenderer/NodeViewWrapper from
+// @tiptap/react. These tests don't exercise the citation node view (that lives
+// in CitationNode.test.tsx with a separate, lighter mock), so the mock just
+// returns inert stand-ins so the module resolves under the SermonEditor mock.
 vi.mock("@tiptap/react", () => ({
   useEditor: () => fakeEditor,
   useEditorState: ({
@@ -104,6 +109,10 @@ vi.mock("@tiptap/react", () => ({
     selector: (ctx: { editor: FakeEditor | null }) => unknown;
   }) => selector({ editor: fakeEditor }),
   EditorContent: () => null,
+  Node: { create: (config: unknown) => config },
+  mergeAttributes: (...args: Record<string, unknown>[]) => Object.assign({}, ...args),
+  ReactNodeViewRenderer: (component: unknown) => component,
+  NodeViewWrapper: () => null,
 }));
 vi.mock("@tiptap/starter-kit", () => ({
   default: { configure: () => ({ name: "starterKit" }) },

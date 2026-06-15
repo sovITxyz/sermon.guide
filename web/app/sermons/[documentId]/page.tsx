@@ -1,5 +1,10 @@
 import { SermonEditorShell } from "@/app/sermons/[documentId]/SermonEditorShell";
-import { DocumentNotFoundError, UnauthenticatedError, getDocument } from "@/lib/api-server";
+import {
+  DocumentNotFoundError,
+  UnauthenticatedError,
+  getDocument,
+  getLibrary,
+} from "@/lib/api-server";
 import type { DocumentFull } from "@/lib/types";
 import Link from "next/link";
 import { redirect } from "next/navigation";
@@ -19,6 +24,12 @@ interface SermonEditorPageProps {
  * but a server fetch that 401s is the authoritative check). The API's uniform
  * 404 (non-owned / nonexistent / soft-deleted — no existence oracle) renders a
  * not-found state in place rather than redirecting.
+ *
+ * Phase 37: alongside the document, fetch the user's library ONCE (one /library
+ * call) and pass the owned-`book_id` set to the shell. The citation node views
+ * read it via context to decide the degraded badge — ZERO per-citation fetches.
+ * A failed library fetch is non-fatal: an empty set degrades every citation
+ * (cached snippet still renders) rather than blocking the editor from opening.
  */
 export default async function SermonEditorPage({ params }: SermonEditorPageProps) {
   const { documentId } = await params;
@@ -48,5 +59,15 @@ export default async function SermonEditorPage({ params }: SermonEditorPageProps
     throw err;
   }
 
-  return <SermonEditorShell document={document} />;
+  // One library fetch per doc open -> the owned-book_id set for the degraded
+  // badge. Non-fatal: an empty set just degrades every citation card.
+  let ownedBookIds: string[] = [];
+  try {
+    const books = await getLibrary();
+    ownedBookIds = books.map((book) => book.book_id);
+  } catch {
+    ownedBookIds = [];
+  }
+
+  return <SermonEditorShell document={document} ownedBookIds={ownedBookIds} />;
 }

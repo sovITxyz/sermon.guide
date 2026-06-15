@@ -197,6 +197,14 @@ web server's server-only `API_BASE_URL` at the fake api so the same-origin
 **Test users** are throwaway (`e2e/support/users.ts`, random-UUID email +
 password per run) — never commit real creds.
 
+**Never assert on a bare `page.getByRole("alert")`.** This is an App Router app
+and Next always renders an `<div role="alert" id="__next-route-announcer__">`,
+so a bare `getByRole("alert")` matches TWO elements and trips Playwright's
+strict-mode violation on every run. Scope alert assertions to the component's
+error container — assert on the specific error copy
+(`page.getByText("…exact message…")`) or filter the role by `hasText`/a
+container locator. (Bit both `search.spec.ts` and `editor.spec.ts`.)
+
 **Artifacts** (`test-results/`, `playwright-report/`, `blob-report/`,
 `.playwright/`) are gitignored (`web/.gitignore`) and biome-ignored
 (`biome.json`). CI uploads `playwright-report/` on failure.

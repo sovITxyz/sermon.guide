@@ -431,6 +431,78 @@ oracle (the cross-tenant-404 rule above). Migration 0006 (`worker/db`).
   limiting" → "Adding or widening a bucket"); new routes get no limiter
   automatically.
 
+## Calendar — sermon events (`calendar_routes.py`, Phase 38)
+
+`calendar_routes.py` is the server half of the B3 preaching calendar
+(Phases 39-42 are pure web on top of this API). `sermon_events` is
+user-owned like `documents` — every query filters by the JWT `user_id`, a
+non-owned `event_id` is a uniform 404 with no existence oracle (the
+cross-tenant-404 rule above). Migration 0007 (`worker/db`).
+
+- **The module is `calendar_routes.py`, NOT `calendar.py`.** A file literally
+  named `calendar.py` is shadowed by the stdlib `calendar` under pytest's
+  `pythonpath=["."]` — `from calendar import …` resolves to
+  `/usr/lib/python3.12/calendar.py` (ImportError at collection AND a pyright
+  `reportAttributeAccessIssue`). The router file is `calendar_routes.py`;
+  `main.py` does `import calendar_routes` (plain, no alias) and the route
+  prefix is still `/calendar`. If you add another stdlib-named module, do the
+  same.
+- **`event_date` is a DATE, not a timestamptz** (the schema's first DATE
+  column). Preaching is day-anchored; a UTC-midnight timestamptz shifts a day
+  for UTC-minus users. The GET `start`/`end` query params are DATE too, and
+  dates stay `YYYY-MM-DD` end-to-end into web/.
+- **GET range is half-open `[start, end)`, capped at `RANGE_CAP_DAYS`
+  (400).** An event dated exactly `end` is EXCLUDED (the `_range_stmt`
+  `event_date < end`, NOT `<=`, is load-bearing and compile-pinned). `start`
+  must be `<= end` (else 422) and the span `end - start` must be `<= 400`
+  days (else 422 — a full year-view is one call; the resolution of the B3
+  "GET range cap value" open question). Results are `event_date`-ordered.
+- **POST materializes DISCRETE weekly rows, capped at
+  `MATERIALIZER_CAP_ROWS` (53).** Body `{event_date, title, series?,
+  document_id?, repeat_weekly_until?}` (`extra="forbid"`). A non-null
+  `repeat_weekly_until` writes one row per 7-day step from `event_date`
+  through it inclusive — `repeat_weekly_until >= event_date` (else 422) and
+  the row count `<= 53` (else 422; 52 weeks + 1). Each materialized row is an
+  INDEPENDENT `sermon_events` row (no parent linkage), so each PATCHes /
+  DELETEs on its own. The default (no `repeat_weekly_until`) is one row. POST
+  returns every created event.
+- **`document_id` is ATTACKER-CONTROLLED body input — ownership-check it.**
+  The nullable FK alone does NOT scope tenancy. On POST/PATCH, a non-null
+  `document_id` MUST resolve to a document the JWT user owns
+  (`_document_owned_stmt` — `Document.document_id == id AND Document.user_id
+  == JWT`); a miss raises the SAME 404 used for a nonexistent event, byte-
+  identical whether the doc is another tenant's or nonexistent (no existence/
+  title oracle — without this, user B could link user A's document and the
+  calendar would leak its existence). **The ownership check has NO
+  `deleted_at IS NULL` predicate** — a soft-deleted but owned doc is
+  acceptable (ownership is what matters), unlike the documents GET gate. The
+  gate runs BEFORE any write.
+- **PATCH is partial; `document_id` is three-state.** Body
+  (`extra="forbid"`) carries any subset of `event_date`/`title`/`series`/
+  `document_id`; at least one field must be present (an empty patch is a 422,
+  checked via `model_fields_set`). `document_id` distinguishes ABSENT (leave
+  the link alone), present-and-`null` (DETACH), and present-and-non-null
+  (re-link under the SAME ownership check) — also via `model_fields_set`, so
+  a `null` is not mistaken for "unset". There is NO optimistic-concurrency
+  `base_updated_at` gate here (that is documents-specific — single-author
+  manuscript edits; calendar events have no such requirement); PATCH is a
+  plain doubly-scoped partial update that bumps `updated_at` EXPLICITLY via
+  `func.now()` (no `onupdate` on the column — schema-wide convention).
+- **DELETE is a HARD delete** (`_delete_stmt` — a real `DELETE … RETURNING`,
+  doubly-scoped), NOT a soft delete like documents: calendar events are cheap
+  and regenerable, so there is no `deleted_at`/restore surface. A non-owned /
+  nonexistent / non-UUID id is the same 404.
+- **Statement builders are the tenant seam.** Every query is a module-level
+  `_xxx_stmt` (`_range_stmt`, `_owned_event_stmt`, `_update_stmt`,
+  `_delete_stmt`, `_document_owned_stmt`) so its `user_id` predicate (and the
+  half-open range bounds) are compile-pinned in `tests/test_calendar_unit.py`
+  (the `library._library_stmt` pattern). Every per-id builder is DOUBLE-scoped
+  (`event_id` AND `user_id`). `ix_sermon_events_user_date (user_id,
+  event_date)` backs the range scan.
+- **No rate-limit bucket in Phase 38.** Like documents, calendar CRUD gets no
+  limiter automatically; add one (per "Rate limiting") only if a web surface
+  drives abusive volume.
+
 ## Content-type posture (Phase 20 — early sniff, decided)
 
 `POST /upload` libmagic-sniffs the FIRST BYTES of the body and 415s

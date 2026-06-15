@@ -133,6 +133,67 @@ test("drawer search inserts a citation block that persists across reload", async
   await expect(reloaded).toContainText("Grace is the unearned favor of God");
 });
 
+test("export downloads a .docx and import replaces the editor content", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/sermons");
+
+  await page.getByRole("button", { name: "New sermon" }).click();
+  await page.waitForURL(/\/sermons\/[^/]+$/);
+
+  // Seed some content so the doc is non-empty before the round-trip.
+  await typeAndAwaitSaved(page, "Original manuscript text.");
+
+  // Download .docx: the button fetches the export proxy as a blob and triggers a
+  // browser download. Capture the Playwright download event and assert the
+  // suggested filename came from the API's sanitized Content-Disposition.
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Download as Word document" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toMatch(/\.docx$/);
+
+  // Import .docx: drive the hidden file input directly (the Uploader pattern).
+  // The fake api overwrites content with a deterministic imported doc and
+  // returns the full document; the editor reloads it as TipTap JSON.
+  await page.locator('input[aria-label="Word document to import"]').setInputFiles({
+    name: "import.docx",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    buffer: Buffer.from("PK fake docx bytes"),
+  });
+
+  // The editor now shows the imported content, and the prior text is gone.
+  await expect(editorBody(page)).toContainText("Imported from a Word document.");
+  await expect(editorBody(page)).not.toContainText("Original manuscript text.");
+});
+
+test("a rejected import surfaces a visible error and leaves the editor intact", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/sermons");
+
+  await page.getByRole("button", { name: "New sermon" }).click();
+  await page.waitForURL(/\/sermons\/[^/]+$/);
+
+  await typeAndAwaitSaved(page, "Keep this manuscript.");
+
+  // The fake api 415s a file named reject.docx (mirrors the API's libmagic
+  // sniff refusing a non-docx) — the proxy passes the 4xx through and the editor
+  // shows the visible error banner WITHOUT clobbering the buffer.
+  await page.locator('input[aria-label="Word document to import"]').setInputFiles({
+    name: "reject.docx",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    buffer: Buffer.from("not really a docx"),
+  });
+
+  await expect(page.getByTestId("docx-error")).toBeVisible();
+  // The buffer is untouched by the rejected import.
+  await expect(editorBody(page)).toContainText("Keep this manuscript.");
+
+  // Dismiss clears the error.
+  await page.getByRole("button", { name: "Dismiss error" }).click();
+  await expect(page.getByTestId("docx-error")).toHaveCount(0);
+});
+
 test("a stale-tab autosave surfaces the 409 conflict and reloads to latest", async ({ page }) => {
   const user = await signUp(page, makeUser());
   await loginViaUi(page, user, "/sermons");

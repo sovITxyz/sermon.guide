@@ -377,6 +377,116 @@ describe("SermonEditor — conflict (409)", () => {
   });
 });
 
+describe("SermonEditor — DOCX round-trip (Phase 43)", () => {
+  it("Import overwrites the editor content + title from the API response", async () => {
+    const imported = makeDoc({
+      title: "Imported title",
+      content: { type: "doc", content: [{ type: "paragraph" }] },
+      updated_at: "2026-06-15T14:00:00Z",
+    });
+    const stub = installFetch(() => Promise.resolve(jsonResponse(imported)));
+    render(<SermonEditor document={makeDoc()} />);
+
+    const file = new File(["PK docx"], "import.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    const input = screen.getByLabelText("Word document to import") as HTMLInputElement;
+    await act(async () => {
+      fireEvent.change(input, { target: { files: [file] } });
+      await Promise.resolve();
+    });
+
+    // POSTed to the import proxy with a multipart body (FormData).
+    const call = stub.mock.calls.at(-1);
+    expect(call?.[0]).toBe("/api/documents/doc-1/import");
+    expect((call?.[1] as RequestInit).method).toBe("POST");
+    expect((call?.[1] as RequestInit).body).toBeInstanceOf(FormData);
+
+    // The editor adopted the imported doc (setContent + title).
+    expect(fakeEditor.setContentCalls.length).toBe(1);
+    expect(screen.getByLabelText("Sermon title")).toHaveValue("Imported title");
+    // No DOCX error banner on success.
+    expect(screen.queryByTestId("docx-error")).not.toBeInTheDocument();
+  });
+
+  it("Import surfaces the API's 4xx detail in a visible, dismissable banner", async () => {
+    installFetch(() =>
+      Promise.resolve(
+        jsonResponse(
+          { detail: "Unsupported file type. Upload a .docx document." },
+          { ok: false, status: 415 },
+        ),
+      ),
+    );
+    render(<SermonEditor document={makeDoc()} />);
+
+    const file = new File(["nope"], "reject.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    const input = screen.getByLabelText("Word document to import") as HTMLInputElement;
+    await act(async () => {
+      fireEvent.change(input, { target: { files: [file] } });
+      await Promise.resolve();
+    });
+
+    const banner = screen.getByTestId("docx-error");
+    expect(banner).toHaveTextContent("Unsupported file type");
+    // The buffer was NOT clobbered (no setContent on a failed import).
+    expect(fakeEditor.setContentCalls.length).toBe(0);
+
+    // Dismiss clears it.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId("docx-error")).not.toBeInTheDocument();
+  });
+
+  it("Download triggers a blob download and surfaces an export failure", async () => {
+    // First click: a 502 export failure -> visible error, no download triggered.
+    const stub = installFetch(() =>
+      Promise.resolve(jsonResponse({ detail: "Export failed." }, { ok: false, status: 502 })),
+    );
+    render(<SermonEditor document={makeDoc()} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Download as Word document" }));
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("docx-error")).toHaveTextContent("Export failed.");
+
+    // Second click: a successful export. blob() + object-URL plumbing is stubbed
+    // (jsdom implements neither); assert the anchor download fires.
+    const blob = new Blob(["docx"], {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    const okResponse = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-disposition": 'attachment; filename="My Sermon.docx"' }),
+      blob: () => Promise.resolve(blob),
+    } as unknown as Response;
+    stub.mockImplementation(() => Promise.resolve(okResponse));
+
+    const createObjectURL = vi.fn(() => "blob:fake");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL } as unknown as typeof URL);
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Download as Word document" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(createObjectURL).toHaveBeenCalledWith(blob);
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:fake");
+    // The successful export cleared the prior error banner.
+    expect(screen.queryByTestId("docx-error")).not.toBeInTheDocument();
+  });
+});
+
 describe("SermonEditor — pagehide keepalive flush", () => {
   it("flushes a dirty in-budget buffer with keepalive on pagehide", () => {
     const stub = installFetch(() => Promise.resolve(jsonResponse(makeDoc())));

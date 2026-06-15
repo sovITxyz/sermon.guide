@@ -179,6 +179,43 @@ node lives in `components/editor/`. Locked decisions:
   (`/search` resolves `book_id`s from the JWT user's library); the proxy adds NO
   unscoped query. Mirrors `search-summary/route.ts` but with a 60s timeout
   (`/search` is fast/LLM-free, not the 300s summary path).
+- **In-editor LibraryDrawer** (`components/editor/LibraryDrawer.tsx`): the UI that
+  turns a library search into an inserted citation. **Opened from a toolbar
+  affordance** — a `+ Citation` button in `SermonEditor` (`aria-label="Cite from
+  your library"`, `aria-expanded`) that toggles the drawer; it is **closed by
+  default** so the editor opens uncluttered, and the drawer has its own `Close`.
+  It reuses the SearchPanel plumbing (same-origin POST, `searchQueryProblem`
+  client validation, the `mounted` guard) but hits `/api/search` — RAW hits, NO
+  LLM — so it is FAST: a plain `Searching your library…` label, **no** minutes-long
+  elapsed ticker (that is the `/search-summary` path only). Hits render as
+  **selectable rows** (`data-testid="library-drawer-hit"`) showing the book title
+  + a `section · chunk N` meta line + a 2-line snippet preview, all PLAIN TEXT.
+  - **Hit -> citation attrs mapping (the design gap).** A raw `/search` hit
+    (`lib/types.ts:SearchHit`) has NO title and no field named `snippet`, so the
+    drawer maps: `bookId <- book_id`, `chunkIndex <- metadata.chunk_index`,
+    `parentSection <- metadata.parent_section`, `snippet <- content_chunk`
+    (**cached at insert** — the doc stays self-contained), and `bookTitle <- the
+    one-shot {book_id -> title} map`. A hit whose book is not in the map falls
+    back to `Untitled book` so the card still renders.
+  - **`bookTitle` source — the same one-shot `/library` fetch.**
+    `page.tsx` projects the library to `{book_id, title}[]` (`LibraryBookRef`,
+    plain JSON crosses the RSC boundary) and passes it to the shell, which derives
+    BOTH the owned-`book_id` `Set` (degraded badge) AND a `book_id -> title` `Map`
+    (drawer titles) and hands them to `SermonEditor` as `ownedBookIds` +
+    `bookTitles`. **No extra fetch** — one `/library` call backs both.
+  - **Insert** = `editor.chain().focus().insertContent({ type: "citation", attrs
+    }).run()` on a row click. This fires the editor `update` event the **Phase 36
+    autosave already handles** (debounce + single-flight) — **no autosave change**,
+    and the node is in `editor.getJSON()` so it survives save -> reload. The
+    drawer stays open after an insert (cite several passages in one search).
+  - Tested in `test/components/LibraryDrawer.test.tsx` (search -> renders raw
+    hits; row click -> `insertContent` with the mapped attrs incl. the
+    untitled-fallback + null `parent_section`; plain-text snippet; proxy `{error}`
+    surfaced; empty-query no-fetch) and end-to-end in `e2e/editor.spec.ts` (open
+    drawer -> search -> insert -> card shows title + snippet + Read-in-context
+    link -> autosave -> reload persists). The fake api gained `/search` (raw hits)
+    and `/library` (owned set + titles), bearer-scoped, with `book_id`s that match
+    so an inserted citation resolves as OWNED.
 
 ## Sermons list — delete + restore (Phase 36, B2 slice C)
 

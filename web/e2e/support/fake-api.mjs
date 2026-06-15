@@ -20,9 +20,10 @@
 //                    no-existence-oracle contract the upload E2E asserts)
 //   * /documents     POST create (201 full doc), GET list (preview-only items,
 //                    no `content`), GET/{id} full, PATCH/{id} (200 full / 409 on
-//                    stale base_updated_at), DELETE/{id} (204 soft) — all bearer-
-//                    scoped with the SAME uniform 404 for non-owned/unknown ids
-//                    (the Phase 35 editor smoke create->PATCH->reload + 409 path)
+//                    stale base_updated_at), DELETE/{id} (204 soft), POST
+//                    /{id}/restore (200 full, content intact) — all bearer-scoped
+//                    with the SAME uniform 404 for non-owned/unknown ids (the
+//                    Phase 35 editor smoke + the Phase 36 list delete/restore)
 //
 // The LIVE/nightly path uses the real api + e2e/support/stub-llm.mjs instead
 // (see web/AGENTS.md). Tokens are opaque random strings — no JWT, no secrets.
@@ -365,6 +366,30 @@ const server = createServer(async (req, res) => {
       res.writeHead(204);
       return res.end();
     }
+  }
+
+  // Restore a soft-deleted document: POST /documents/{id}/restore. Clears
+  // deleted_at and returns the full doc (content intact — restore never touches
+  // it). The uniform 404 covers non-owned / unknown / non-UUID; an already-
+  // active doc restores idempotently. Mirrors api/documents.py restore.
+  const restoreMatch = path.match(/^\/documents\/([^/]+)\/restore$/);
+  if (req.method === "POST" && restoreMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(restoreMatch[1]);
+    const record = documents.get(id);
+    // Restore is reachable on a non-deleted row too (idempotent), so ownership
+    // is the only gate — but a non-owned / unknown id is still the uniform 404.
+    if (!record || record.userId !== userId) {
+      return detail(res, 404, "Document not found.");
+    }
+    if (record.deleted_at !== null) {
+      record.deleted_at = null;
+      record.updated_at = nextTimestamp();
+    }
+    return send(res, 200, fullDoc(id, record));
   }
 
   // Health / fallthrough.

@@ -51,10 +51,40 @@ This is load-bearing; do not weaken it.
 
 ## Tests
 
-- Vitest, **pure helpers only** (`test/*.test.ts`, node environment, relative
-  imports). Components/integration are covered by the live browser verify, not
-  jsdom, to keep the dependency surface small. Add a unit test when you add a
-  pure function (cookie policy, validation, status mapping).
+Vitest runs **two projects in one `pnpm test`** (`vitest.workspace.ts`,
+shared `resolve.alias` in `vitest.config.ts`):
+
+- **`lib`** (node env, `test/**/*.test.ts`): pure-helper unit tests — cookie
+  policy, validation, summary segmentation, task-status mapping. Relative
+  imports, no DOM. Add one when you add a pure function.
+- **`components`** (jsdom env, `test/components/**/*.test.tsx`): component tests
+  via `@testing-library/react`. Setup in `test/components/setup.ts` (jest-dom
+  matchers, RTL `cleanup`, a `next/link` → `<a>` stub). Uses
+  `@vitejs/plugin-react` for the JSX transform.
+
+**Phase 25 reversed the prior "pure helpers only / no jsdom" posture.** Rationale:
+SearchPanel, the citation-chip renderer, and the upload flow had zero automated
+coverage, so a regression in the chip href/label or the search submit shipped
+silently. Component tests via `@testing-library/react` + the existing Vitest
+runner reuse `pnpm test` with a minimal new dep surface (jsdom +
+plugin-react + testing-library) — far less than Playwright component mode. The
+two envs coexist via the workspace split, so pure-lib tests stay node-env and
+green. (Browser E2E remains a separate concern — Playwright, Phase 25 E2E.)
+
+**Adding a component test:** drop a `*.test.tsx` under `test/components/`.
+It is auto-picked-up by the `components` project (jsdom + setup). Render with
+RTL, stub `global.fetch` per-test (`vi.stubGlobal` / `installFetch` in
+`test/components/helpers.ts`), assert real DOM and behavior (roles, attributes,
+text) — not snapshots. For the 2 s upload poll / 1 s search ticker use
+`vi.useFakeTimers()` + `await act(() => vi.advanceTimersByTimeAsync(ms))`; do
+**not** mix `waitFor` with fake timers (it deadlocks — `waitFor` polls on a real
+clock the fake timers freeze). Keep stubs typed (no `any`) so Biome's
+`noExplicitAny` stays clean.
+
+Dep versions (aligned to React 19.2 / Next 15.5 / Vitest 2.1 / Node 22):
+`@testing-library/react@^16` (the React-19-compatible major — v15 and below
+peer-depend on React 18), `@testing-library/jest-dom@^6`,
+`@testing-library/user-event@^14`, `jsdom@^25`, `@vitejs/plugin-react@^4`.
 
 ## Tailwind / Biome
 
@@ -72,9 +102,13 @@ minutes, not milliseconds (~134s warm E2E on the dev box: CPU rerank + LLM
 round-trip). It carries an explicit `AbortSignal.timeout` (300s → 504) so a
 wedged upstream can't hold the handler forever — copy that pattern for any
 future long-running proxy. The UI side (`SearchPanel`) shows an elapsed-time
-affordance instead of a bare spinner; citation markers the model merges into
-one bracket (`[A:70, A:51]`, Phase 14b finding) render as plain text via
-`lib/summary.ts:segmentSummary` — only standalone markers resolve to cards.
+affordance instead of a bare spinner; a citation marker the model merges into
+one bracket (`[A:70, A:51]`, Phase 14b finding) is **exploded into one chip per
+resolvable member** by `lib/summary.ts:segmentSummary` (Phase 24 carries the
+API's merged-member contract to the renderer). Each resolvable member becomes
+its own linked chip; an invented member is dropped, and a bracket with no
+resolvable member stays prose. (Pre-Phase-24 this section claimed merged
+brackets "render as plain text" — that is no longer true.)
 
 ## Cross-package note
 

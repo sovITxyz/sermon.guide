@@ -38,6 +38,49 @@ export interface SummaryResponse {
   citations: SummaryCitation[];
 }
 
+/**
+ * POST /search body (api/search.py SearchRequest, extra="forbid"). The search
+ * proxy forwards ONLY `query` — `limit`/`rerank` stay at the API defaults so a
+ * client cannot widen the retrieval fan-out or flip off the rerank/highlight
+ * pipeline through this proxy. A smuggled `user_id`/`book_ids` never reaches
+ * the API's 422 because the proxy drops it before serializing the body.
+ */
+export interface SearchRequest {
+  query: string;
+}
+
+/**
+ * One raw hybrid-retrieval hit (api/search.py SearchHit). Field names/casing
+ * match the FastAPI JSON verbatim. `book_id` is a UUID serialized as a string.
+ * `metadata` is the chunk metadata written by the worker (worker/ingest.py):
+ * `chunk_index` is always present; `filename`/`parent_section` are often null.
+ * There is NO top-level title and no `snippet`/`content` field — the citation
+ * node maps `content_chunk` -> snippet and `metadata.chunk_index` -> chunkIndex,
+ * and sources `bookTitle` from the one-shot /library fetch (raw hits carry no
+ * title). Extra `metadata` keys (`rrf_score`, `sentences_kept`, …) are ignored.
+ */
+export interface SearchHit {
+  book_id: string;
+  content_chunk: string;
+  metadata: {
+    filename: string | null;
+    chunk_index: number;
+    parent_section: string | null;
+  };
+  score: number;
+}
+
+/**
+ * POST /search response (api/search.py SearchResponse). `hits` is the final
+ * ranked list (raw — no LLM summary). `degraded` (Phase 22) names any pipeline
+ * stage that failed and was bypassed ("dense"/"sparse"/"rerank"/"highlight");
+ * always present, `[]` on a fully-healthy search.
+ */
+export interface SearchResponse {
+  hits: SearchHit[];
+  degraded: string[];
+}
+
 export interface UploadAccepted {
   task_id: string;
   upload_id: string;

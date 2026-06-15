@@ -52,24 +52,61 @@ Request models set ``extra="forbid"`` (Phase 18): a smuggled ``user_id`` or
 key.
 """
 
+# python-magic is a thin untyped ctypes wrapper around libmagic (Phase 43
+# docx-import sniff) — the same pyright relaxation as ``uploads.py`` /
+# ``worker/extractors/extract.py``.
+# pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
+
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import cast
+from typing import Annotated, cast
 
-from db import Document
-from fastapi import APIRouter, HTTPException, status
+import magic
+from convert import ConversionError, convert_from_docx, convert_to_docx
+from db import Document, SermonDocRevision
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql.dml import ReturningUpdate
+from sqlalchemy.sql.dml import ReturningInsert, ReturningUpdate
 
 from auth import CurrentUserDep, SessionDep
+from settings import settings
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+# The DOCX wire MIME — the value libmagic sniffs for a real Word .docx (an
+# OOXML zip container) and the Content-Type we stream the export with. A
+# single constant so the import sniff and the export header can never drift.
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# libmagic needs only the head of the stream to recognize the OOXML zip
+# container/signature. 8 KiB is comfortably past the `[Content_Types].xml`
+# entry pandoc writes first (the `uploads.py` _SNIFF_BYTES rationale).
+_DOCX_SNIFF_BYTES = 8192
+
+# Streaming-read chunk for the multipart import body (the `uploads.py`
+# _CHUNK_BYTES value). Each chunk counts against MAX_CONTENT_BYTES so an
+# oversize upload is a 413 before pandoc ever sees it.
+_IMPORT_CHUNK_BYTES = 1 << 20  # 1 MiB
+
+# Anything outside [A-Za-z0-9._-] becomes `_` when shaping the export
+# download filename from the (user-controlled) document title — the same
+# sanitize class as `uploads._FILENAME_SANITIZE`. A clean basename keeps the
+# Content-Disposition header free of header-injection / path characters.
+_FILENAME_SANITIZE = re.compile(r"[^A-Za-z0-9._-]")
+
+# What the snapshot row records as having triggered it. The migration's
+# column DEFAULT is ``'import'``; the route sets it explicitly so the value
+# is authoritative regardless of the DB default.
+_REVISION_SOURCE_IMPORT = "import"
 
 # Server-managed ProseMirror schema version stamped on every write. A
 # module constant (the authoritative source per the Phase 34 pre-made
@@ -650,3 +687,252 @@ async def restore_document(
         await session.commit()
         await session.refresh(document)
     return _to_response(document)
+
+
+# === DOCX round-trip (Phase 43) ==============================================
+#
+# ``GET /documents/{document_id}/export.docx`` and ``POST
+# /documents/{document_id}/import`` add a Word round-trip on top of the
+# canonical TipTap/ProseMirror JSON. Both mount under the existing
+# ``documents`` resource (the api has no ``/sermons`` prefix; the product term
+# "sermons" == this resource — the web ``/sermons`` editor proxies to
+# ``/api/documents/...``). Both gate through ``_require_owned_document`` FIRST,
+# so a non-owned / nonexistent / non-UUID / soft-deleted id is the same
+# byte-identical 404 with no existence oracle.
+#
+# Import is an ATTACKER-CONTROLLED .docx upload, so it reuses the ``uploads.py``
+# edge defenses: libmagic-sniff the bytes (415 on non-docx) and size-cap the
+# body (413) BEFORE pandoc runs, stage the bytes in ``settings.upload_dir`` with
+# a ``finally`` that ALWAYS deletes the staged file, and pandoc runs with no
+# network. The converted JSON is re-capped and ``content_text`` is RE-DERIVED
+# (never trusted from the conversion / the client). The overwrite is
+# snapshot-first: in ONE transaction the CURRENT (pre-overwrite) content is
+# inserted into ``sermon_doc_revisions`` BEFORE the UPDATE, so an import is
+# never destructive. The snapshot row's ``user_id`` is the JWT user — never a
+# body/path value (the denormalized tenant gate, ``worker/db`` migration 0008).
+
+
+def _export_filename(title: str) -> str:
+    """Shape a safe ``.docx`` download filename from the document *title*.
+
+    The title is user-controlled, so it can't go verbatim into the
+    ``Content-Disposition`` header (header-injection / path characters). The
+    same sanitize class as ``uploads._sanitize_filename`` collapses anything
+    outside ``[A-Za-z0-9._-]`` to ``_``; an empty/all-stripped title falls
+    back to ``sermon`` so the download is never named ``.docx`` alone.
+    """
+    cleaned = _FILENAME_SANITIZE.sub("_", title).strip("_")
+    base = cleaned or "sermon"
+    return f"{base}.docx"
+
+
+def _revision_insert_stmt(
+    *,
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+    content: dict[str, object],
+    content_text: str,
+    schema_version: int,
+) -> ReturningInsert[tuple[uuid.UUID]]:
+    """Build the snapshot INSERT — the prior content row, scoped to the JWT user.
+
+    Factored out so the tenant column (``user_id`` is ALWAYS the JWT-derived
+    value, NEVER a body/path value) and the snapshot's content/content_text
+    can be compile-pinned in ``tests/test_documents_unit.py`` (the
+    ``_xxx_stmt`` seam). ``source`` is set explicitly to the import sentinel.
+    ``RETURNING revision_id`` lets the route assert exactly one snapshot
+    landed.
+    """
+    return (
+        insert(SermonDocRevision)
+        .values(
+            document_id=document_id,
+            user_id=user_id,
+            content=content,
+            content_text=content_text,
+            schema_version=schema_version,
+            source=_REVISION_SOURCE_IMPORT,
+        )
+        .returning(SermonDocRevision.revision_id)
+    )
+
+
+def _sniff_docx(head: bytes) -> None:
+    """415 unless *head* sniffs as a Word ``.docx`` (OOXML zip container).
+
+    The sniff is over CONTENT bytes, never the client's ``Content-Type``
+    header (the ``uploads.py`` edge-sniff posture) — there is no header for an
+    attacker to vary. Runs BEFORE any disk write or pandoc invocation: a
+    renamed file dies here instead of being staged or handed to pandoc.
+    """
+    mime = magic.from_buffer(head[:_DOCX_SNIFF_BYTES], mime=True)
+    if mime != _DOCX_MIME:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported upload content (sniffed {mime!r}); expected a .docx.",
+        )
+
+
+def _read_capped_upload(file: UploadFile, *, max_bytes: int) -> bytes:
+    """Read the whole multipart body into memory, 413 past *max_bytes*.
+
+    The body streams in 1 MiB chunks (Starlette spools to a
+    ``SpooledTemporaryFile``), and the running total is checked per chunk so
+    an oversize upload is a 413 the moment it crosses the cap — never fully
+    buffered, never staged, never handed to pandoc. ``max_bytes`` is the same
+    ``MAX_CONTENT_BYTES`` ceiling the converted JSON is re-checked against.
+    """
+    buf = bytearray()
+    while True:
+        chunk = file.file.read(_IMPORT_CHUNK_BYTES)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Upload exceeds {max_bytes} bytes.",
+            )
+    return bytes(buf)
+
+
+@router.get("/{document_id}/export.docx")
+async def export_document_docx(
+    document_id: str,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> Response:
+    """Export the owned document as a Word ``.docx``. 404 (no oracle) otherwise.
+
+    Gates through ``_require_owned_document`` FIRST (ownership + active +
+    404-no-oracle), then converts the canonical ``content`` JSON to ``.docx``
+    bytes via ``worker.convert.convert_to_docx`` (pandoc + the Node leg) and
+    streams them with the docx ``Content-Type`` and a sanitized
+    ``Content-Disposition`` filename derived from the title. A conversion
+    failure is a 502 (a dependency — pandoc/Node — failed; not a request bug)
+    with a fixed detail, never the raw conversion stack trace.
+    """
+    document = await _require_owned_document(document_id, current_user.user_id, session)
+    try:
+        docx_bytes = convert_to_docx(document.content)
+    except ConversionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Document export failed.",
+        ) from exc
+    filename = _export_filename(document.title)
+    return Response(
+        content=docx_bytes,
+        media_type=_DOCX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/{document_id}/import", response_model=DocumentResponse)
+async def import_document_docx(
+    document_id: str,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+    file: Annotated[UploadFile, File(...)],
+) -> DocumentResponse:
+    """Replace the owned document's content from an uploaded ``.docx`` (snapshot-first).
+
+    The full attacker-controlled-upload pipeline:
+
+    1. **415** if the bytes don't sniff as a ``.docx`` (content sniff, not the
+       header), **413** if the body exceeds ``MAX_CONTENT_BYTES`` — both BEFORE
+       any disk write or pandoc run.
+    2. Stage the bytes under ``settings.upload_dir`` (per-import UUID subdir);
+       a ``finally`` ALWAYS deletes them, success or failure.
+    3. ``_require_owned_document`` (ownership + active + 404-no-oracle) — only
+       AFTER the cheap edge checks, so a non-owner's oversize/non-docx upload
+       still gets the cheap 4xx without a DB hit, and an owned-doc miss is the
+       same 404.
+    4. ``convert_from_docx`` (pandoc docx->html, then the Node leg
+       html->ProseMirror JSON) — a conversion failure is a fixed-detail 502.
+    5. Re-cap the converted JSON to ``MAX_CONTENT_BYTES`` (413) and RE-DERIVE
+       ``content_text`` (never trust the conversion output as the projection).
+    6. **Snapshot-first** in ONE transaction: INSERT the CURRENT
+       (pre-overwrite) content/content_text/user_id into
+       ``sermon_doc_revisions``, THEN UPDATE ``documents.content`` /
+       ``content_text`` + bump ``updated_at``, THEN commit. The snapshot
+       predates the overwrite, so an import is never destructive.
+
+    The snapshot row's ``user_id`` is the JWT user (the denormalized tenant
+    gate); nothing here reads a ``user_id``/``document_id`` from the body.
+    """
+    # 1. Edge checks over the body bytes, BEFORE disk or pandoc.
+    raw = _read_capped_upload(file, max_bytes=MAX_CONTENT_BYTES)
+    _sniff_docx(raw)
+
+    # 2. Stage under the upload dir so pandoc reads a real file path; the
+    #    finally ALWAYS removes it. (worker.convert also stages in /tmp, but
+    #    we keep the api-side staged copy under settings.upload_dir per the
+    #    uploads.py per-upload-subdir convention so a partial write is bounded
+    #    and self-cleaning.)
+    settings.upload_dir.mkdir(parents=True, exist_ok=True)
+    import_subdir = settings.upload_dir / str(uuid.uuid4())
+    import_subdir.mkdir(parents=True, exist_ok=False)
+    staged = import_subdir / "import.docx"
+    try:
+        staged.write_bytes(raw)
+
+        # 3. Ownership gate (after the cheap edge checks). The loaded row
+        #    carries the CURRENT content/content_text for the snapshot.
+        document = await _require_owned_document(document_id, current_user.user_id, session)
+
+        # 4. Convert. A pandoc/Node failure is a fixed-detail 502, never a
+        #    raw stack-trace oracle.
+        try:
+            content_json = convert_from_docx(staged.read_bytes())
+        except ConversionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Document import failed.",
+            ) from exc
+
+        # 5. Re-cap + RE-DERIVE content_text (never trust the conversion).
+        _require_content_within_cap(content_json)
+        new_content_text = derive_content_text(content_json)
+
+        # 6. Snapshot-FIRST, then overwrite — one transaction. The snapshot
+        #    holds the PRIOR content/content_text and the JWT user_id.
+        prior_content = document.content
+        prior_content_text = document.content_text
+        prior_schema_version = document.schema_version
+        await session.execute(
+            _revision_insert_stmt(
+                document_id=document.document_id,
+                user_id=current_user.user_id,
+                content=prior_content,
+                content_text=prior_content_text,
+                schema_version=prior_schema_version,
+            ),
+        )
+        row = (
+            await session.execute(
+                _update_stmt(
+                    document.document_id,
+                    current_user.user_id,
+                    values={"content": content_json, "content_text": new_content_text},
+                ),
+            )
+        ).one()
+        await session.commit()
+    finally:
+        # ALWAYS clean the staged upload — success, 502, 413, or any other
+        # error. rmtree(ignore_errors=True) removes the whole per-import
+        # subdir unconditionally and never raises, so cleanup can't mask the
+        # real exception nor leave attacker bytes on disk.
+        shutil.rmtree(import_subdir, ignore_errors=True)
+
+    document_id_val, title, content, content_text, schema_version, created_at, updated_at = row
+    return DocumentResponse(
+        document_id=document_id_val,
+        title=title,
+        content=content,
+        content_text=content_text,
+        schema_version=schema_version,
+        created_at=created_at,
+        updated_at=updated_at,
+    )

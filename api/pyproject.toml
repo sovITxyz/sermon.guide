@@ -60,6 +60,14 @@ dependencies = [
   # concern applies (but the openai pin itself must satisfy both packages,
   # since api/ imports worker/inference.py).
   "openai>=2,<3",
+  # Phase 43: api/ imports `worker.convert` (the 6th sanctioned cross-package
+  # import) for the DOCX round-trip — `GET /documents/{id}/export.docx` and
+  # `POST /documents/{id}/import`. `worker.convert` imports `pypandoc` at module
+  # scope, so the api venv must carry it; pinned in lockstep with
+  # `worker/pyproject.toml`. The `pandoc` binary + Node 22 + the
+  # `worker/convert_node/` bundle become api+worker image deps for Phase 29 to
+  # bake (Dockerfiles untouched this phase; the dev box already has them).
+  "pypandoc>=1.17,<2",
 ]
 
 [dependency-groups]

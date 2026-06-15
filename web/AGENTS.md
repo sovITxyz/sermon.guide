@@ -117,6 +117,69 @@ contenteditable. Locked decisions:
     bucketed), so sustained ~1 PATCH/2s autosave is already unthrottled — see
     `api/AGENTS.md`. No bucket was added.
 
+## Citations — the in-editor citation node (Phase 37, B2 slice D)
+
+The signature B2 integration: a cited library passage from search becomes a
+first-class manuscript block that deep-links into the reader. The custom TipTap
+node lives in `components/editor/`. Locked decisions:
+
+- **Block-level atom TipTap node `citation`** (`components/editor/CitationNode.tsx`,
+  `Node.create`). Schema: `group: "block"`, `atom: true` (no editable children —
+  the card is placed, not typed into), `selectable: true`, `draggable: false`.
+  Registered in `SermonEditor.buildExtensions()` so a stored doc containing a
+  citation parses on load. `Node`, `mergeAttributes`, `ReactNodeViewRenderer`,
+  `NodeViewWrapper`, and the `NodeViewProps`/`ReactNodeViewProps` types come from
+  **`@tiptap/react` (v3 re-exports)** — **do NOT add `@tiptap/core`** as a direct
+  dep, and never a Pro extension (the MIT-only rule still holds).
+- **Attrs (`addAttributes`):** `bookId` (string), `chunkIndex` (number),
+  `bookTitle` (string), `snippet` (string), `parentSection` (string \| null,
+  nullable). Each has `parseHTML`/`renderHTML` mapping to a `data-*` attribute
+  (`data-book-id`, `data-chunk-index`, `data-book-title`, `data-snippet`,
+  `data-parent-section`) on a `div[data-type="citation"]` wrapper. **The
+  load-bearing contract is the JSON round-trip:** `editor.getJSON()` -> persist
+  to `documents.content` -> `setContent()` -> re-render must preserve every attr.
+  TipTap rebuilds attrs from JSON via `addAttributes` automatically; the `data-*`
+  mapping additionally survives an HTML clipboard round-trip and lets an existing
+  doc parse on load. Tested with a **real headless `Editor`** (no @tiptap mock)
+  in `test/components/CitationNode.test.tsx`.
+- **`bookTitle` + `snippet` are CACHED at insert** from the search hit. The node
+  view (`CitationView`, a `ReactNodeViewRenderer`) renders PURELY from
+  `node.attrs` and **NEVER fetches on render** — so the doc stays self-contained
+  even if the book leaves the library or its text changes. A raw `/search` hit
+  has **no title** (see `lib/types.ts:SearchHit`); the drawer must source
+  `bookTitle` from the one-shot `/library` set (next builder's job). The drawer
+  inserts via `editor.chain().insertContent({ type: "citation", attrs })`, which
+  fires the existing autosave `update` (no autosave change needed).
+- **Card styling mirrors the /search citation card** (`SearchPanel.tsx` Sources
+  `<li>`): a bordered card with title, a `section · chunk N` meta line (section
+  via `lib/summary.ts:displaySection`, which drops `<`-bearing EPUB tag soup),
+  and the **snippet as PLAIN TEXT** (`line-clamp-4 whitespace-pre-wrap`) — **ZERO
+  `dangerouslySetInnerHTML`** (repo invariant). When owned, the card carries a
+  `Read in context` link to `readHref(bookId, chunkIndex)` =
+  `/read/{bookId}?chunk={chunkIndex}` (`rel="noopener"`).
+- **Degraded badge via ONE shared library lookup — NOT per-citation fetches.**
+  `app/sermons/[documentId]/page.tsx` fetches the user's library ONCE on doc open
+  (`getLibrary()`), passes the owned-`book_id` **string[]** to the shell (a `Set`
+  can't cross the RSC boundary), which rebuilds the `Set` and hands it to the
+  editor as `ownedBookIds`. `SermonEditor` wraps `<EditorContent>` in
+  `LibraryMembershipProvider` (`components/editor/library-membership.tsx`); every
+  `CitationView` reads the set with `useLibraryMembership()` to decide
+  owned-vs-degraded — **ZERO per-citation network calls** (the verify's hard
+  requirement). Context reaches the node view because `ReactNodeViewRenderer`
+  portals render inside the `<EditorContent>` React subtree. If `bookId` is not
+  in the set (or no provider — the default is an empty set, so everything
+  degrades safely), the card drops the link and shows a `No longer in your
+  library` badge; the cached snippet still renders (degraded is additive UI,
+  never content-hiding). A failed `/library` fetch on the page is non-fatal — it
+  degrades every card rather than blocking the editor.
+- **`/api/search` proxy** (`app/api/search/route.ts`, `lib/search.ts`
+  `whitelistSearch`): the drawer's same-origin entry. Whitelists `{query}` ONLY
+  (drops `limit`/`rerank`/smuggled `user_id`/`book_ids`), cookie -> bearer
+  server-side, returns RAW `/search` hits (no LLM). Tenant scoping is the API's
+  (`/search` resolves `book_id`s from the JWT user's library); the proxy adds NO
+  unscoped query. Mirrors `search-summary/route.ts` but with a 60s timeout
+  (`/search` is fast/LLM-free, not the 300s summary path).
+
 ## Sermons list — delete + restore (Phase 36, B2 slice C)
 
 `components/SermonList.tsx` is a **client island** (it was a pure server

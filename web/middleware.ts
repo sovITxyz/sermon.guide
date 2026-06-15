@@ -26,5 +26,6 @@ export const config = {
     "/search/:path*",
     "/upload/:path*",
     "/sermons/:path*",
+    "/calendar/:path*",
   ],
 };

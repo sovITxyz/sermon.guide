@@ -81,6 +81,6 @@ pythonpath = ["."]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["extractors", "chunking.py", "db", "embedding.py", "inference.py", "ingest.py", "scripts", "storage.py", "tests", "celery_app.py", "tasks"]
+include = ["extractors", "chunking.py", "convert.py", "db", "embedding.py", "inference.py", "ingest.py", "scripts", "storage.py", "tests", "celery_app.py", "tasks"]
 venvPath = "."
 venv = ".venv"

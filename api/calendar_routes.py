@@ -388,12 +388,31 @@ async def create_events(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="repeat_weekly_until must be on or after event_date.",
             )
-        occurrences = _weekly_dates(payload.event_date, payload.repeat_weekly_until)
-        if len(occurrences) > MATERIALIZER_CAP_ROWS:
+        # Bound the work BEFORE generating. The occurrence count is pure O(1)
+        # date arithmetic: weekly steps from the anchor that land on or before
+        # the end, plus the anchor itself. Both operands are pydantic-validated
+        # ``date`` values, so subtracting them CANNOT overflow (no date.max
+        # arithmetic), and the cap is enforced before any list is built —
+        # closing the far-future ``repeat_weekly_until`` memory/CPU DoS.
+        occurrence_count = (payload.repeat_weekly_until - payload.event_date).days // 7 + 1
+        if occurrence_count > MATERIALIZER_CAP_ROWS:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Weekly recurrence exceeds the {MATERIALIZER_CAP_ROWS}-row cap.",
             )
+        # Count is confirmed <= MATERIALIZER_CAP_ROWS, so the last generated
+        # date is the anchor + (count-1) weekly steps, which is <=
+        # repeat_weekly_until (itself a valid ``date``); the ``+= 7 days`` loop
+        # therefore never steps past date.max. The try/except is
+        # belt-and-suspenders: any residual overflow collapses to the SAME 422,
+        # never an uncaught 500.
+        try:
+            occurrences = _weekly_dates(payload.event_date, payload.repeat_weekly_until)
+        except OverflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Weekly recurrence exceeds the {MATERIALIZER_CAP_ROWS}-row cap.",
+            ) from exc
     else:
         occurrences = [payload.event_date]
 

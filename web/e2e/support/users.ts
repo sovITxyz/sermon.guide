@@ -15,7 +15,7 @@ export interface TestUser {
 }
 
 export function makeUser(): TestUser {
-  return { email: `e2e-${randomUUID()}@example.test`, password: `pw-${randomUUID()}` };
+  return { email: `e2e-${randomUUID()}@example.com`, password: `pw-${randomUUID()}` };
 }
 
 /** Sign up via the same-origin proxy, then return the credentials. */

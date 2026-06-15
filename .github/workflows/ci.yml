@@ -168,8 +168,39 @@ jobs:
         run: cd web && pnpm tsc --noEmit
       - name: Lint
         run: cd web && pnpm biome check
-      - name: Test
+      # Component tests (jsdom, @testing-library/react — Phase 25) ride the same
+      # `pnpm vitest run` as the pure-lib unit tests via the Vitest workspace
+      # split (web/vitest.workspace.ts). One runner, both projects.
+      - name: Test (unit + component)
         run: cd web && pnpm vitest run
+      # Playwright E2E (Phase 25). CI BOUNDARY: this web job has NO Postgres /
+      # Milvus / Celery-worker services, so the E2E runs against an in-memory
+      # fake api (web/e2e/support/fake-api.mjs) that speaks the real api's wire
+      # contracts — auth, a grounded /search-summary whose [book:chunk] markers
+      # resolve into citation chips, upload, and the Phase-20 task-ownership 404.
+      # Playwright's webServer boots the fake api + `next dev` on port 3100
+      # (NOT 3000) itself. The LIVE/nightly path (real api + e2e/support/
+      # stub-llm.mjs via SERMON_API_LLM_BASE_URL over a seeded corpus) is a
+      # manual concern, documented in web/AGENTS.md — not run here.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: playwright-${{ runner.os }}-
+      - name: Install Playwright chromium
+        run: cd web && npx playwright install --with-deps chromium
+      - name: E2E (Playwright, headless)
+        run: cd web && pnpm e2e
+        env:
+          CI: "true"
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report/
+          retention-days: 7
 
   # Phase 17: the compose-backed gate. Everything here is keyless and free —
   # isolation vectors are synthetic (Phase 3), the Phase 31 storage tests

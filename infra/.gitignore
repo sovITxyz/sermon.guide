@@ -1,0 +1,11 @@
+# Backup artifacts (Phase 28) — host-side, NEVER committed.
+#
+# `make backup` writes pg_dump + the milvus-backup mirror + the MinIO originals
+# mirror under infra/backups/ (the default BACKUP_DIR). These contain real user
+# data / PII and the cached milvus-backup binary, so they stay out of git. Push
+# them off-box with rsync instead (see docs/BACKUP_RESTORE.md).
+backups/
+
+# An override BACKUP_DIR can point anywhere; if someone points it back inside
+# infra/, catch the common names too.
+backup-artifacts/

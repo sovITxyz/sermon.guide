@@ -86,6 +86,69 @@ Dep versions (aligned to React 19.2 / Next 15.5 / Vitest 2.1 / Node 22):
 peer-depend on React 18), `@testing-library/jest-dom@^6`,
 `@testing-library/user-event@^14`, `jsdom@^25`, `@vitejs/plugin-react@^4`.
 
+## E2E (Playwright, Phase 25)
+
+Browser regression tests for the hand-verified Phase 15/16 flows live in
+`e2e/**/*.spec.ts` and run with `@playwright/test@^1.60`. They are SEPARATE
+from `pnpm test` (Vitest): `pnpm test` = unit + component (jsdom);
+`pnpm e2e` = Playwright. Vitest globs `test/**/*.test.{ts,tsx}` and Playwright
+globs `e2e/**/*.spec.ts`, so the two never collect each other.
+
+**Run it:**
+
+- `pnpm e2e:install` — one-time `playwright install --with-deps chromium`.
+- `pnpm e2e` — Playwright's `webServer` boots everything itself. No manual
+  server juggling.
+
+**Ports — never 3000.** The dev server binds **3100** (`E2E_WEB_PORT`, the
+:3000 conflict on the dev box is real); the in-memory fake api binds **8081**
+(`FAKE_API_PORT`). Both are env-overridable. `playwright.config.ts` points the
+web server's server-only `API_BASE_URL` at the fake api so the same-origin
+`/api/*` proxies reach it.
+
+**Two backends, one config:**
+
+- **Default / CI — fake api.** `e2e/support/fake-api.mjs` is an in-memory
+  stand-in (no Python, no Postgres/Milvus/worker) that speaks the api's exact
+  WIRE shapes: `/auth/{signup,login}`, a grounded `/search-summary` whose
+  `[book:chunk]` markers exactly match the returned citations (so the Phase 24
+  chip renderer resolves them), `/upload`, and `/tasks/{id}` with the Phase-20
+  ownership-404 (own task → 200, another user's or unknown id → identical 404).
+  This is the documented CI boundary: the web CI job has no services, so the
+  grounded-summary determinism the live path gets from the stub LLM is baked
+  straight into the fake api. It exercises the real browser → same-origin proxy
+  → HTTP contract end to end.
+- **Live / nightly — real api + stub LLM.** Set `E2E_API_BASE_URL` to a booted
+  real api and Playwright skips the fake api. Boot the api against a seeded
+  corpus with the LLM round-trip short-circuited (no DeepInfra call, no ~134s
+  wait) via the Phase-25 api knob `SERMON_API_LLM_BASE_URL`:
+
+  ```sh
+  # 1. deterministic OpenAI-compatible stub (echoes the prompt's markers back)
+  node web/e2e/support/stub-llm.mjs                 # binds 127.0.0.1:8099
+  # 2. real api pointed at the stub (a DUMMY key still satisfies the 503 guard;
+  #    the stub ignores it). Source infra/.env first (never print it).
+  set -a && . infra/.env && set +a
+  cd api && PYTHONPATH=../worker:$PYTHONPATH \
+    SERMON_API_LLM_PROVIDER=deepinfra DEEPINFRA_API_KEY=stub-key-ignored \
+    SERMON_API_LLM_BASE_URL=http://127.0.0.1:8099/v1 \
+    uv run uvicorn main:app --host 0.0.0.0 --port 8000 --no-proxy-headers
+  # 3. point Playwright at it
+  cd web && E2E_API_BASE_URL=http://127.0.0.1:8000 pnpm e2e
+  ```
+
+  `SERMON_API_LLM_BASE_URL` is a TEST-HARNESS-ONLY knob (api/settings.py docs
+  the non-prod posture): it overrides the active provider row's hardcoded
+  `base_url` so the summary LLM hits the local stub instead of the real
+  provider. The live LLM path itself stays a manual/nightly concern (the spec).
+
+**Test users** are throwaway (`e2e/support/users.ts`, random-UUID email +
+password per run) — never commit real creds.
+
+**Artifacts** (`test-results/`, `playwright-report/`, `blob-report/`,
+`.playwright/`) are gitignored (`web/.gitignore`) and biome-ignored
+(`biome.json`). CI uploads `playwright-report/` on failure.
+
 ## Tailwind / Biome
 
 - Tailwind v3 utility classes inline; no CSS modules. Global directives live in

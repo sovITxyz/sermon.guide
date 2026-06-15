@@ -241,6 +241,63 @@ const SEARCH_HITS = [
   },
 ];
 
+// Deterministic sermon-calendar events (Phase 39 — backs GET /calendar/events).
+// Shape mirrors api/calendar_routes.py CalendarEvent EXACTLY: snake_case,
+// event_date a day-only YYYY-MM-DD string (NO time/tz), series + document_id
+// nullable, NO user_id (the response is tenant-scoped server-side via the JWT —
+// here the bearer gate stands in for that). All dates sit in 2028 so the year
+// E2E can spot-check a leap February (29 days) and a Sunday-starting October.
+// They are bearer-scoped like every other endpoint but NOT per-user-seeded —
+// every authenticated user sees the same fixed set, which is all the read-only
+// year/month views assert.
+const CALENDAR_EVENTS = [
+  {
+    event_id: "aaaaaaaa-0000-0000-0000-000000000001",
+    event_date: "2028-02-06",
+    title: "Sermon on the Mount",
+    series: "Matthew",
+    document_id: null,
+    created_at: "2028-01-01T00:00:00Z",
+    updated_at: "2028-01-01T00:00:00Z",
+  },
+  {
+    event_id: "aaaaaaaa-0000-0000-0000-000000000002",
+    event_date: "2028-02-29",
+    title: "Leap-day Vespers",
+    series: "Matthew",
+    document_id: null,
+    created_at: "2028-01-01T00:00:00Z",
+    updated_at: "2028-01-01T00:00:00Z",
+  },
+  {
+    event_id: "aaaaaaaa-0000-0000-0000-000000000003",
+    event_date: "2028-10-01",
+    title: "Harvest Thanksgiving",
+    series: "Psalms",
+    document_id: null,
+    created_at: "2028-01-01T00:00:00Z",
+    updated_at: "2028-01-01T00:00:00Z",
+  },
+  {
+    event_id: "aaaaaaaa-0000-0000-0000-000000000004",
+    event_date: "2028-10-01",
+    title: "Evening Prayer",
+    series: "Psalms",
+    document_id: null,
+    created_at: "2028-01-01T00:00:00Z",
+    updated_at: "2028-01-01T00:00:00Z",
+  },
+  {
+    event_id: "aaaaaaaa-0000-0000-0000-000000000005",
+    event_date: "2028-10-15",
+    title: "Reformation Sunday",
+    series: "Romans",
+    document_id: null,
+    created_at: "2028-01-01T00:00:00Z",
+    updated_at: "2028-01-01T00:00:00Z",
+  },
+];
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
   const path = url.pathname;
@@ -303,6 +360,31 @@ const server = createServer(async (req, res) => {
       return detail(res, 401, "Not authenticated.");
     }
     return send(res, 200, { books: LIBRARY });
+  }
+
+  // --- calendar events (read-only range, Phase 39) --------------------------
+  // GET /calendar/events?start&end — half-open [start, end) on event_date
+  // (an event dated exactly `end` is EXCLUDED), ordered event_date ascending,
+  // bearer-scoped. Range validation (start <= end, span <= 400 days) is the
+  // real api's job; the E2E only exercises in-range fetches, so the stub just
+  // applies the half-open filter the web grouping depends on. String compares
+  // are correct because the dates are zero-padded YYYY-MM-DD.
+  if (req.method === "GET" && path === "/calendar/events") {
+    if (!userIdFor(req)) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const start = url.searchParams.get("start");
+    const end = url.searchParams.get("end");
+    const events = CALENDAR_EVENTS.filter((e) => {
+      if (start !== null && e.event_date < start) {
+        return false;
+      }
+      if (end !== null && e.event_date >= end) {
+        return false;
+      }
+      return true;
+    }).sort((a, b) => (a.event_date < b.event_date ? -1 : a.event_date > b.event_date ? 1 : 0));
+    return send(res, 200, { events });
   }
 
   // --- upload ---------------------------------------------------------------

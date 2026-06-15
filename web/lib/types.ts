@@ -92,3 +92,78 @@ export interface PositionUpdate {
   chunk_index: number;
   offset_ratio?: number | null;
 }
+
+/**
+ * A ProseMirror/TipTap JSON node tree (the sermon `content`). The API stores
+ * it as JSONB and types it `dict[str, object]` (an arbitrary JSON object) —
+ * the editor owns the internal shape, the proxy only checks it is a non-null
+ * object. Typed as an open record of JSON values rather than a fixed node
+ * schema so the proxy/types never drift against TipTap's StarterKit output.
+ */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+export type ProseMirrorDoc = { [key: string]: JsonValue };
+
+/**
+ * GET /documents list item (api/documents.py DocumentSummary). Preview-only:
+ * the first PREVIEW_CHARS (280) of the server-derived `content_text`, never
+ * the full `content` JSON. `preview` renders as PLAIN TEXT in the UI — never
+ * dangerouslySetInnerHTML.
+ */
+export interface DocumentListItem {
+  document_id: string;
+  title: string;
+  preview: string;
+  schema_version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** GET /documents wrapper (api/documents.py DocumentListResponse). */
+export interface DocumentListResponse {
+  documents: DocumentListItem[];
+}
+
+/**
+ * Full document (api/documents.py DocumentResponse) — returned by POST create,
+ * GET /documents/{id}, and PATCH. Includes the full `content` node tree plus
+ * the server-derived `content_text`. `content_text` and `schema_version` are
+ * server-owned and never sent back on a write.
+ */
+export interface DocumentFull {
+  document_id: string;
+  title: string;
+  content: ProseMirrorDoc;
+  content_text: string;
+  schema_version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * POST /documents body (api/documents.py DocumentCreate, extra="forbid"). The
+ * create proxy forwards ONLY these two fields — `content_text`/`schema_version`
+ * are server-derived/-managed and a smuggled one is dropped here before it can
+ * reach the API's 422.
+ */
+export interface DocumentCreate {
+  title: string;
+  content: ProseMirrorDoc;
+}
+
+/**
+ * PATCH /documents/{id} body (api/documents.py DocumentUpdate, extra="forbid").
+ * `base_updated_at` (the optimistic-concurrency token) is REQUIRED; at least
+ * one of `title`/`content` must be present (the API's 422 owns that rule). The
+ * patch proxy forwards ONLY these three fields.
+ */
+export interface DocumentPatch {
+  base_updated_at: string;
+  title?: string;
+  content?: ProseMirrorDoc;
+}

@@ -13,6 +13,13 @@
 //                      chip renderer resolves them in the real browser. No real
 //                      LLM, no retrieval — the determinism the stub-llm gives
 //                      the live path, baked straight in here.
+//   * /search        RAW hybrid hits (Phase 37, no LLM) for the in-editor
+//                    LibraryDrawer: {hits:[{book_id,content_chunk,metadata,
+//                    score}], degraded:[]}, bearer-scoped. book_ids match
+//                    /library so an inserted citation resolves as OWNED.
+//   * /library       the owned-book listing (Phase 15 shape) the editor shell
+//                    fetches once on doc open for the citation owned-set +
+//                    {id -> title} map; bearer-scoped.
 //   * /upload        202 {task_id,upload_id,filename}; records token-scoped
 //                    ownership (Phase 20)
 //   * /tasks/{id}    200 {task_id,status,result} when the bearer OWNS the task;
@@ -183,6 +190,57 @@ const SUMMARY =
   "Grace is given freely, not earned [Grace:3], and faith is the means by " +
   "which it is received [Faith:7]. The passages agree on this point.";
 
+// The user's owned library (Phase 37 — backs GET /library). Its book_ids are the
+// SAME ones the raw-/search hits below reference, so a citation inserted from the
+// drawer resolves as OWNED in the editor (the shell's one-shot /library fetch
+// puts these ids in the owned set + the {id -> title} map): the inserted card
+// shows the title + a Read-in-context link, NOT the degraded badge. Shape mirrors
+// api/library.py LibraryResponse (the Phase-32 progress fields are nullable).
+const LIBRARY = [
+  {
+    book_id: "11111111-1111-1111-1111-111111111111",
+    title: "On Grace",
+    author: "An Author",
+    category: null,
+    added_at: "2026-01-01T00:00:00Z",
+    chunk_count: 100,
+    last_chunk_index: null,
+    progress: null,
+  },
+  {
+    book_id: "22222222-2222-2222-2222-222222222222",
+    title: "Of Faith",
+    author: "An Author",
+    category: null,
+    added_at: "2026-01-01T00:00:00Z",
+    chunk_count: 100,
+    last_chunk_index: null,
+    progress: null,
+  },
+];
+
+// Deterministic RAW POST /search hits (Phase 37 — backs the in-editor
+// LibraryDrawer). Shape mirrors api/search.py SearchHit EXACTLY: book_id +
+// content_chunk + metadata{filename,chunk_index,parent_section} + score, NO
+// top-level title and no `snippet` field (the drawer maps content_chunk ->
+// snippet and sources the title from /library). The book_ids match LIBRARY so an
+// inserted citation is owned.
+const SEARCH_HITS = [
+  {
+    book_id: "11111111-1111-1111-1111-111111111111",
+    content_chunk:
+      "Grace is the unearned favor of God, given freely and not as a wage for any work performed.",
+    metadata: { filename: "on-grace.epub", chunk_index: 3, parent_section: "Chapter 1" },
+    score: 0.91,
+  },
+  {
+    book_id: "22222222-2222-2222-2222-222222222222",
+    content_chunk: "Faith receives what grace offers; the two are never set against one another.",
+    metadata: { filename: "of-faith.epub", chunk_index: 7, parent_section: "Chapter 2" },
+    score: 0.84,
+  },
+];
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
   const path = url.pathname;
@@ -223,6 +281,28 @@ const server = createServer(async (req, res) => {
     }
     await readJson(req); // drain {query}
     return send(res, 200, { summary: SUMMARY, citations: CITATIONS, degraded: [] });
+  }
+
+  // --- search (raw hybrid hits, no LLM) -------------------------------------
+  // Backs the Phase 37 in-editor LibraryDrawer. Bearer-scoped like the rest;
+  // returns the deterministic SEARCH_HITS (already tenant-scoped in the real api
+  // — the JWT user's library — so the stub just gates on a valid session).
+  if (req.method === "POST" && path === "/search") {
+    if (!userIdFor(req)) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    await readJson(req); // drain {query}
+    return send(res, 200, { hits: SEARCH_HITS, degraded: [] });
+  }
+
+  // --- library --------------------------------------------------------------
+  // The editor shell fetches this ONCE on doc open (server-side, bearer) for the
+  // owned-book_id set + the {id -> title} map the drawer uses. Bearer-scoped.
+  if (req.method === "GET" && path === "/library") {
+    if (!userIdFor(req)) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    return send(res, 200, { books: LIBRARY });
   }
 
   // --- upload ---------------------------------------------------------------

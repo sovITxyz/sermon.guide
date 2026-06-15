@@ -103,3 +103,18 @@ def test_proxy_header_trust_defaults_off(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_ratelimit_kill_switch_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SERMON_API_RATELIMIT_ENABLED", raising=False)
     assert ApiSettings().ratelimit_enabled is True
+
+
+def test_llm_base_url_override_defaults_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No SERMON_API_LLM_BASE_URL → ``None`` (the active provider's hardcoded base_url).
+
+    The override exists only to point the summary LLM at a local stub for the
+    web Phase 25 E2E; a fresh prod env must never carry it.
+    """
+    monkeypatch.delenv("SERMON_API_LLM_BASE_URL", raising=False)
+    assert ApiSettings().llm_base_url is None
+
+
+def test_llm_base_url_override_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SERMON_API_LLM_BASE_URL", "http://127.0.0.1:8099/v1")
+    assert ApiSettings().llm_base_url == "http://127.0.0.1:8099/v1"

@@ -18,6 +18,11 @@
 //   * /tasks/{id}    200 {task_id,status,result} when the bearer OWNS the task;
 //                    a UNIFORM 404 {detail} for a non-owned OR unknown id (the
 //                    no-existence-oracle contract the upload E2E asserts)
+//   * /documents     POST create (201 full doc), GET list (preview-only items,
+//                    no `content`), GET/{id} full, PATCH/{id} (200 full / 409 on
+//                    stale base_updated_at), DELETE/{id} (204 soft) — all bearer-
+//                    scoped with the SAME uniform 404 for non-owned/unknown ids
+//                    (the Phase 35 editor smoke create->PATCH->reload + 409 path)
 //
 // The LIVE/nightly path uses the real api + e2e/support/stub-llm.mjs instead
 // (see web/AGENTS.md). Tokens are opaque random strings — no JWT, no secrets.
@@ -34,6 +39,69 @@ const users = new Map();
 const sessions = new Map();
 /** taskId -> { userId, filename } */
 const tasks = new Map();
+/**
+ * documentId -> { userId, title, content, content_text, schema_version,
+ * created_at, updated_at, deleted_at }. Mirrors the api/documents.py row well
+ * enough for the editor smoke: preview-only list, full-doc GET, optimistic-
+ * concurrency PATCH (409 on stale base_updated_at), uniform 404, soft delete.
+ */
+const documents = new Map();
+
+const PREVIEW_CHARS = 280;
+const SCHEMA_VERSION = 1;
+
+/**
+ * Trivial plain-text projection of a ProseMirror/TipTap content tree — the
+ * fake-api stand-in for api/documents.py:derive_content_text. Concatenates the
+ * `text` of every node, depth-first, space-joined. Enough to back a non-empty
+ * preview after the editor smoke types real text; the exact whitespace shape is
+ * not asserted.
+ */
+function deriveContentText(content) {
+  const parts = [];
+  const stack = [content];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+    if (typeof node.text === "string") {
+      parts.push(node.text);
+    }
+    if (Array.isArray(node.content)) {
+      // Push in reverse so the leftmost child is processed first (document order).
+      for (let i = node.content.length - 1; i >= 0; i--) {
+        stack.push(node.content[i]);
+      }
+    }
+  }
+  return parts.join(" ").trim();
+}
+
+/** Full DocumentResponse shape (POST create, GET full, PATCH all return this). */
+function fullDoc(id, record) {
+  return {
+    document_id: id,
+    title: record.title,
+    content: record.content,
+    content_text: record.content_text,
+    schema_version: record.schema_version,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+  };
+}
+
+/** Preview-only DocumentSummary list item (no `content`). */
+function summaryDoc(id, record) {
+  return {
+    document_id: id,
+    title: record.title,
+    preview: record.content_text.slice(0, PREVIEW_CHARS),
+    schema_version: record.schema_version,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+  };
+}
 
 function send(res, status, body) {
   const payload = JSON.stringify(body);
@@ -70,6 +138,19 @@ function bearer(req) {
 function userIdFor(req) {
   const token = bearer(req);
   return token ? (sessions.get(token) ?? null) : null;
+}
+
+/**
+ * A strictly-monotonic ISO timestamp. The optimistic-concurrency gate compares
+ * `base_updated_at` against the stored `updated_at`, so two writes must never
+ * collide on the same millisecond — a real DB-backed updated_at would differ,
+ * and the 409 / round-trip assertions depend on it. The counter guarantees a
+ * distinct, ordered value per call even within one millisecond.
+ */
+let timestampCounter = 0;
+function nextTimestamp() {
+  timestampCounter += 1;
+  return new Date(Date.now() + timestampCounter).toISOString();
 }
 
 // A deterministic grounded summary. The markers below are the exact citation
@@ -178,6 +259,112 @@ const server = createServer(async (req, res) => {
       status: "SUCCESS",
       result: { book_id: randomUUID(), was_duplicate: false, rows_inserted: 42 },
     });
+  }
+
+  // --- documents ------------------------------------------------------------
+  // Collection: POST create, GET list (preview-only).
+  if (path === "/documents") {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+
+    if (req.method === "POST") {
+      const body = await readJson(req);
+      const title = typeof body?.title === "string" ? body.title : null;
+      const content = body?.content;
+      if (!title || typeof content !== "object" || content === null || Array.isArray(content)) {
+        return detail(res, 422, "Invalid document payload.");
+      }
+      const id = randomUUID();
+      const now = nextTimestamp();
+      const record = {
+        userId,
+        title,
+        content,
+        content_text: deriveContentText(content),
+        schema_version: SCHEMA_VERSION,
+        created_at: now,
+        updated_at: now,
+        deleted_at: null,
+      };
+      documents.set(id, record);
+      return send(res, 201, fullDoc(id, record));
+    }
+
+    if (req.method === "GET") {
+      const items = [];
+      for (const [id, record] of documents) {
+        if (record.userId === userId && record.deleted_at === null) {
+          items.push(summaryDoc(id, record));
+        }
+      }
+      // updated_at DESC, matching api/documents.py list ordering.
+      items.sort((a, b) =>
+        a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0,
+      );
+      return send(res, 200, { documents: items });
+    }
+  }
+
+  // Single document: GET full, PATCH, DELETE.
+  const docMatch = path.match(/^\/documents\/([^/]+)$/);
+  if (docMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(docMatch[1]);
+    const record = documents.get(id);
+    // Phase 20/34: non-owned, unknown, AND soft-deleted collapse to ONE 404.
+    const visible = record && record.userId === userId && record.deleted_at === null;
+
+    if (req.method === "GET") {
+      if (!visible) {
+        return detail(res, 404, "Document not found.");
+      }
+      return send(res, 200, fullDoc(id, record));
+    }
+
+    if (req.method === "PATCH") {
+      if (!visible) {
+        return detail(res, 404, "Document not found.");
+      }
+      const body = await readJson(req);
+      const base = typeof body?.base_updated_at === "string" ? body.base_updated_at : null;
+      if (!base) {
+        return detail(res, 422, "base_updated_at is required.");
+      }
+      const hasTitle = typeof body.title === "string";
+      const hasContent =
+        typeof body.content === "object" && body.content !== null && !Array.isArray(body.content);
+      if (!hasTitle && !hasContent) {
+        return detail(res, 422, "PATCH must set at least one of title or content.");
+      }
+      // Optimistic concurrency: a base that doesn't match the stored updated_at
+      // means another write landed first -> 409 (the stale-tab editor path).
+      if (base !== record.updated_at) {
+        return detail(res, 409, "Document was modified since base_updated_at; reload and retry.");
+      }
+      if (hasTitle) {
+        record.title = body.title;
+      }
+      if (hasContent) {
+        record.content = body.content;
+        record.content_text = deriveContentText(body.content);
+      }
+      record.updated_at = nextTimestamp();
+      return send(res, 200, fullDoc(id, record));
+    }
+
+    if (req.method === "DELETE") {
+      if (!visible) {
+        return detail(res, 404, "Document not found.");
+      }
+      record.deleted_at = nextTimestamp();
+      res.writeHead(204);
+      return res.end();
+    }
   }
 
   // Health / fallthrough.

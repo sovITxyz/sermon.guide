@@ -22,6 +22,15 @@ sermon.guide. The k8s/KEDA shape stays post-v0
 - `aws/` — provision/deploy/start/stop/status/destroy lifecycle scripts.
   Tag-based and re-runnable; secrets are generated ON the instance, never
   committed.
+- `scripts/` — `backup.sh` / `restore.sh` (Phase 28), the bodies behind
+  `make backup` / `make restore`. They source `infra/.env` for creds (never
+  echo a value) and write to `BACKUP_DIR` (host, default `infra/backups/`,
+  gitignored — NEVER a docker volume, which `make nuke` wipes). Runbook +
+  restore drill: [docs/BACKUP_RESTORE.md](../docs/BACKUP_RESTORE.md).
+- `backup/backup.yaml` — milvus-backup config (no secrets; MinIO creds are
+  injected at runtime via `--set` from `infra/.env`).
+- `backups/` — gitignored backup-artifact target (created on first
+  `make backup`).
 - `env.prod.template` — documents `/opt/sermon/.env.prod` (generated on-box
   by `aws/deploy.sh`). Deliberately NOT dot-env-named so repo tooling can
   read it.

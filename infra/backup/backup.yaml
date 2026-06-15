@@ -1,0 +1,61 @@
+# milvus-backup config for the sermon.guide compose stack (Phase 28).
+#
+# Consumed by the official zilliztech/milvus-backup tool (pinned v0.5.16) which
+# infra/scripts/backup.sh + restore.sh run as a one-shot container joined to
+# the compose network `sermon_default`. See docs/BACKUP_RESTORE.md.
+#
+# SECRETS: this file is committed, so it carries NO credentials. The MinIO
+# access key + secret are injected at runtime from infra/.env via the binary's
+# `--set minio.accessKeyID=... --set minio.secretAccessKey=...` flags. Do NOT
+# add minio.accessKeyID / minio.secretAccessKey here.
+#
+# The values below already match infra/docker-compose.yml's Milvus defaults
+# (bucket a-bucket, rootPath files, milvus :19530, minio :9000); host names are
+# the compose-internal service names because the tool runs ON `sermon_default`.
+
+log:
+  level: info
+  console: true
+
+# Milvus connection. Auth is OFF in this stack, so user/password are ignored;
+# left at the tool defaults. Addresses are compose-internal service names.
+milvus:
+  address: milvus
+  port: 19530
+  authorizationEnabled: false
+  user: root
+  password: Milvus
+  tlsMode: 0
+
+# MinIO = the compose object store that backs Milvus AND holds the backup.
+#   bucketName/rootPath  -> where Milvus keeps its live segment binlogs (a-bucket/files)
+#   backupBucketName     -> same instance; backupRootPath MUST differ from rootPath
+# accessKeyID / secretAccessKey are intentionally absent — injected via --set.
+minio:
+  storageType: minio
+  address: minio
+  port: 9000
+  useSSL: false
+  bucketName: a-bucket
+  rootPath: files
+  backupStorageType: minio
+  backupAddress: minio
+  backupPort: 9000
+  backupUseSSL: false
+  backupBucketName: a-bucket
+  backupRootPath: backup
+  crossStorage: false
+
+backup:
+  maxSegmentGroupSize: 2G
+  parallelism:
+    backupCollection: 4
+    copydata: 128
+    restoreCollection: 2
+  # keep the backup self-consistent; pause Milvus GC for the collection while
+  # binlogs are copied so a concurrent compaction can't delete a segment
+  # mid-copy.
+  gcPause:
+    enable: true
+    address: http://milvus:9091
+  keepTempFiles: false

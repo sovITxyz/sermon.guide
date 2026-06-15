@@ -251,17 +251,33 @@ tiny module-local dependency on `CurrentUserDep` that calls
 
 ## Cross-package imports from `worker/`
 
-`api/` reaches into `../worker` for five things only — `db` (since
+`api/` reaches into `../worker` for six things only — `db` (since
 Phase 7), `embedding.embed`, `inference` (the Phase 16b remote
 transport: `embed_texts`, `rerank_scores`, and the exception taxonomy
 `main.py` maps to 503/502), `scripts.bootstrap_milvus`'s
-`COLLECTION_NAME` + `make_client`, and `retrieval` (the hybrid
-dense+sparse+RRF kernel from Phase 12). The api venv accordingly
-carries `pymilvus`, `numpy`, `openai`, `httpx`, and `psycopg` (the sync
-driver `embedding.py`'s space guard reads its meta row with). Keep
-`pymilvus` pinned in lockstep with `worker/pyproject.toml` — drift
-surfaces as a wire-protocol mismatch only at runtime; the model-weight
-lockstep concern died with Phase 16b (no process loads weights).
+`COLLECTION_NAME` + `make_client`, `retrieval` (the hybrid
+dense+sparse+RRF kernel from Phase 12), and — since Phase 43 —
+`convert` (the DOCX round-trip: `convert_to_docx`, `convert_from_docx`,
+`ConversionError`, used by `documents.py`'s export/import routes). The
+api venv accordingly carries `pymilvus`, `numpy`, `openai`, `httpx`,
+`psycopg` (the sync driver `embedding.py`'s space guard reads its meta
+row with), and `pypandoc` (`worker.convert` imports it at module scope;
+pinned in lockstep with `worker/pyproject.toml`). Keep `pymilvus` and
+`pypandoc` pinned in lockstep with `worker/pyproject.toml` — drift
+surfaces as a wire-protocol / behavior mismatch only at runtime; the
+model-weight lockstep concern died with Phase 16b (no process loads
+weights).
+
+`worker.convert` itself imports `pypandoc` DIRECTLY and shells out to
+the bundled Node CLI (`worker/convert_node/`); it MUST NOT import
+`worker.extractors` / `ingest` / `chunking` / `dedup` / `celery_app` /
+`tasks.*` — it stays out of the ingestion graph (the same ban below
+applies transitively through it). The `pandoc` binary, Node 22, and the
+populated `worker/convert_node/node_modules` are **new api+worker image
+deps for Phase 29 to bake** (Dockerfiles untouched this phase; the dev
+box already has all three). A missing host dep surfaces as a
+`ConversionError` from `convert.py`, which the routes map to a
+fixed-detail 502 — never a stack-trace oracle.
 
 ## Inference calls made by this process (Phase 16b, ADR 0006)
 
@@ -430,6 +446,58 @@ oracle (the cross-tenant-404 rule above). Migration 0006 (`worker/db`).
   (~60/60) is web/autosave-driven and deferred to Phase 36 (see "Rate
   limiting" → "Adding or widening a bucket"); new routes get no limiter
   automatically.
+
+### DOCX round-trip (`documents.py`, Phase 43)
+
+Two endpoints mount under the EXISTING `documents` resource (the api has no
+`/sermons` prefix — the product term "sermons" == the documents resource; the
+web `/sermons` editor proxies to `/api/documents/...`. Naming deviation
+recorded here). Both go through `worker.convert` (the 6th cross-package import;
+see "Cross-package imports from `worker/`"), which shells out to pandoc + the
+Node leg. A `ConversionError` (a missing/failed host dep) maps to a
+**fixed-detail 502** — never a stack-trace oracle.
+
+- **`GET /documents/{document_id}/export.docx`.** `_require_owned_document`
+  gate FIRST (same byte-identical 404 no-oracle as GET-full), then
+  `convert_to_docx(doc.content)` → a `Response` with the docx `Content-Type`
+  (`application/vnd.openxmlformats-officedocument.wordprocessingml.document`)
+  and a `Content-Disposition: attachment; filename="<sanitized-title>.docx"`.
+  The title is user-controlled, so the filename is sanitized through
+  `_export_filename` (the `uploads._sanitize_filename` class — no
+  header-injection / path chars; empty → `sermon.docx`).
+- **`POST /documents/{document_id}/import`** (multipart `file`). The
+  attacker-controlled-upload pipeline, in order: (1) read the body capped at
+  `MAX_CONTENT_BYTES` → **413** the moment it crosses, then libmagic-**sniff
+  the bytes** (`_sniff_docx`) → **415** on non-docx — BOTH before any disk
+  write or pandoc run (the `uploads.py` edge-sniff posture; content bytes, not
+  the `Content-Type` header); (2) stage under `settings.upload_dir` in a
+  per-import UUID subdir with a `finally` that ALWAYS deletes the staged file
+  AND removes the subdir; (3) `_require_owned_document` gate (after the cheap
+  edge checks); (4) `convert_from_docx` (→ 502 on failure); (5) re-cap the
+  converted JSON to `MAX_CONTENT_BYTES` and **RE-DERIVE `content_text`** via
+  `derive_content_text` (NEVER trust the conversion output); (6)
+  **snapshot-FIRST** in ONE transaction — INSERT the CURRENT (pre-overwrite)
+  `content`/`content_text`/`user_id`/`schema_version` into
+  `sermon_doc_revisions` (`_revision_insert_stmt`), THEN `_update_stmt`
+  overwrites `documents.content`/`content_text` + bumps `updated_at`, THEN
+  commit. The snapshot predates the overwrite, so an import is never
+  destructive.
+- **Tenant gate.** Both endpoints scope by the JWT `user_id` via
+  `_require_owned_document`; the snapshot row's `user_id` is the JWT user (the
+  denormalized tenant gate, `worker/db` migration 0008). Nothing reads a
+  `user_id`/`document_id` from the body. `_revision_insert_stmt` is a
+  module-level `_xxx_stmt` builder so its tenant column is compile-pinned in
+  `tests/test_documents_unit.py` like the rest.
+- **Security.** Import is the only attacker-controlled docx surface: size-cap +
+  byte-sniff before disk, pandoc runs with no network, the staged `/tmp` file
+  is always cleaned (`finally`), the request takes only the multipart file
+  (no JSON body to smuggle fields through), and the imported document renders
+  as TipTap JSON (zero `dangerouslySetInnerHTML`). Any `<a href>` the Node leg
+  reconstructs into a citation is validated to the `/read/{bookId}?chunk=...`
+  shape (the `worker/convert_node` citation extension rejects
+  `javascript:`/`data:`/external/protocol-relative hrefs; StarterKit's Link is
+  disabled so non-citation links degrade to text).
+- **No rate-limit bucket in Phase 43** (like documents/calendar).
 
 ## Calendar — sermon events (`calendar_routes.py`, Phase 38)
 

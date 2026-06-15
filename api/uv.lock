@@ -858,6 +858,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pypandoc"
+version = "1.17"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/d6/410615fc433e5d1eacc00db2044ae2a9c82302df0d35366fe2bd15de024d/pypandoc-1.17.tar.gz", hash = "sha256:51179abfd6e582a25ed03477541b48836b5bba5a4c3b282a547630793934d799", size = 69071, upload-time = "2026-03-14T22:39:07.21Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/86/e2ffa604eacfbec3f430b1d850e7e04c4101eca1a5828f9ae54bf51dfba4/pypandoc-1.17-py3-none-any.whl", hash = "sha256:01fdbffa61edb9f8e82e8faad6954efcb7b6f8f0634aead4d89e322a00225a67", size = 23554, upload-time = "2026-03-14T22:38:46.007Z" },
+]
+
+[[package]]
 name = "pyright"
 version = "1.1.409"
 source = { registry = "https://pypi.org/simple" }
@@ -1065,6 +1074,7 @@ dependencies = [
     { name = "pydantic", extra = ["email"] },
     { name = "pydantic-settings" },
     { name = "pymilvus" },
+    { name = "pypandoc" },
     { name = "python-jose", extra = ["cryptography"] },
     { name = "python-magic" },
     { name = "python-multipart" },
@@ -1096,6 +1106,7 @@ requires-dist = [
     { name = "pydantic", extras = ["email"], specifier = ">=2,<3" },
     { name = "pydantic-settings", specifier = ">=2.6,<3" },
     { name = "pymilvus", specifier = ">=2.6,<4" },
+    { name = "pypandoc", specifier = ">=1.17,<2" },
     { name = "python-jose", extras = ["cryptography"], specifier = ">=3.3,<4" },
     { name = "python-magic", specifier = ">=0.4.27,<0.5" },
     { name = "python-multipart", specifier = ">=0.0.20,<1" },

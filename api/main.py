@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from inference import MissingInferenceKeyError, RemoteInferenceError
 
 import auth
+import documents
 import library
 import reader
 import readyz
@@ -154,6 +155,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(documents.router)
 app.include_router(library.router)
 app.include_router(reader.router)
 app.include_router(uploads.router)

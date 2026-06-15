@@ -1,0 +1,561 @@
+"""Sermon document routes — user-owned TipTap/ProseMirror JSON storage.
+
+Phase 34 (B2 slice A): the storage + API half of the sermon editor. The
+canonical sermon body is ProseMirror/TipTap JSON in ``documents.content``
+(JSONB, Cross-item contract — markdown-canonical was rejected because a
+citation node's structured attrs cannot round-trip through string syntax).
+``content_text`` is a server-derived plain-text projection used for list
+previews and future FTS; it is NEVER accepted from the client — the server
+re-derives it from ``content`` on every write by walking the node tree.
+Phases 35-37 build the web side on this surface; there are no web changes
+here.
+
+- ``POST /documents`` — create. Body is ``{title, content}`` (extra
+  forbidden). ``schema_version`` is server-managed (the ``SCHEMA_VERSION``
+  constant), never client-supplied; ``content_text`` is derived. Content
+  whose serialized JSON exceeds ``MAX_CONTENT_BYTES`` is a 413.
+- ``GET /documents`` — list the caller's NON-deleted docs, ``updated_at``
+  DESC, each carrying a ``content_text`` PREVIEW (first
+  ``PREVIEW_CHARS`` chars) — never the full ``content`` JSON.
+- ``GET /documents/{document_id}`` — the full document (including
+  ``content``). A non-owned, nonexistent, or soft-deleted id is a uniform
+  404 with no existence oracle.
+- ``PATCH /documents/{document_id}`` — partial update of ``title`` and/or
+  ``content``. ``base_updated_at`` is REQUIRED and gates single-author
+  optimistic concurrency: a mismatch against the stored ``updated_at`` is a
+  409. On a ``content`` change ``content_text`` is re-derived; ``updated_at``
+  is bumped EXPLICITLY (the column has ``server_default`` but no
+  ``onupdate``).
+- ``DELETE /documents/{document_id}`` — soft delete (sets ``deleted_at``);
+  the row vanishes from the list and GET, but the bytes survive for restore.
+- ``POST /documents/{document_id}/restore`` — clears ``deleted_at``;
+  idempotent on an already-active doc; 404 if not owned.
+
+## Tenant gate (load-bearing)
+
+``documents`` is user-owned like ``highlights``: EVERY query filters by
+``user_id`` derived from the JWT (``current_user.user_id``), never from the
+body, query params, or path. The per-id endpoints resolve the row through
+``_require_owned_document`` FIRST — non-UUID garbage, nonexistent ids,
+another tenant's doc, AND a soft-deleted doc all collapse to one
+byte-identical 404 (the ``uploads.py`` ``GET /tasks/{task_id}`` /
+``reader.py`` no-existence-oracle contract). Path/body ids are never
+capabilities.
+
+Every statement is factored into a module-level ``_xxx_stmt`` builder so the
+``user_id`` scoping can be compile-pinned in ``tests/test_documents_unit.py``
+without a live database (the ``library._library_stmt`` pattern) — the
+mechanical tenant audit.
+
+Request models set ``extra="forbid"`` (Phase 18): a smuggled ``user_id`` or
+``content_text`` is a hard 422 naming the field, never a silently-dropped
+key.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import UTC, datetime
+from typing import cast
+
+from db import Document
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import Select, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.dml import ReturningUpdate
+
+from auth import CurrentUserDep, SessionDep
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+# Server-managed ProseMirror schema version stamped on every write. A
+# module constant (the authoritative source per the Phase 34 pre-made
+# decision); the DB column DEFAULT is only a backstop. Never client-supplied.
+SCHEMA_VERSION = 1
+
+# List-preview budget: the first N chars of the server-derived
+# ``content_text``. The list never ships the full ``content`` JSON — a
+# preview keeps the sermon-list response small (the GET-full endpoint
+# returns the whole document).
+PREVIEW_CHARS = 280
+
+# Hard cap on the serialized ``content`` JSON, measured in bytes (the Phase
+# 34 pre-made decision: measured on the serialized JSON byte size, enforced
+# in-handler -> 413). ~2 MB — a single sermon is kilobytes; this only stops
+# a pathological or abusive payload, mirroring the ``/upload`` size cap.
+MAX_CONTENT_BYTES = 2 * 1024 * 1024
+
+
+class DocumentCreate(BaseModel):
+    """POST body. No ``user_id``/``content_text``/``schema_version`` fields.
+
+    ``extra="forbid"`` (Phase 18 posture): a smuggled ``user_id`` is a hard
+    422, never a silently-dropped key — the tenant invariant made
+    mechanical. ``content_text`` is likewise forbidden: the server
+    re-derives it from ``content`` on every write, so a client-supplied
+    value (which could disagree with ``content``) must fail loud.
+    ``content`` is the ProseMirror/TipTap JSON node tree (an arbitrary JSON
+    object); its byte size is capped in-handler.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=512)
+    content: dict[str, object]
+
+
+class DocumentUpdate(BaseModel):
+    """PATCH body — partial (title and/or content); base_updated_at REQUIRED.
+
+    ``extra="forbid"`` (Phase 18): a smuggled ``user_id`` / ``content_text``
+    is a hard 422. ``base_updated_at`` is the optimistic-concurrency token:
+    it MUST equal the stored ``updated_at`` or the PATCH is a 409 (single
+    author, no versions table — B2). ``title`` and ``content`` are both
+    optional, but at least one must be present (an empty patch is a 422).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_updated_at: datetime
+    title: str | None = Field(default=None, min_length=1, max_length=512)
+    content: dict[str, object] | None = None
+
+
+class DocumentSummary(BaseModel):
+    """List item — metadata + a ``content_text`` PREVIEW, never full content."""
+
+    document_id: uuid.UUID
+    title: str
+    preview: str
+    schema_version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentSummary]
+
+
+class DocumentResponse(BaseModel):
+    """Full document — includes the ``content`` JSON node tree."""
+
+    document_id: uuid.UUID
+    title: str
+    content: dict[str, object]
+    content_text: str
+    schema_version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+def derive_content_text(content: object) -> str:
+    """Walk a ProseMirror/TipTap JSON node tree → plain text.
+
+    Pure helper (no I/O), unit-tested directly. Concatenates every
+    ``text``-node's ``text`` string; block-level nodes are joined with a
+    newline so paragraphs/headings/list-items read as separate lines in the
+    derived projection. Marks (bold/italic/links) wrap a text node's
+    ``text`` and so are picked up transparently; non-text leaf nodes (an
+    image, a hard break, a citation node with no text) contribute nothing.
+    Malformed / non-dict input degrades to an empty string rather than
+    raising — the byte-size cap and JSON-shape are the client's contract,
+    this projection is best-effort.
+
+    The output backs list previews (first ``PREVIEW_CHARS`` chars) and
+    future FTS. It is re-derived on EVERY write; the client never supplies
+    it.
+    """
+    # A ProseMirror text node: {"type": "text", "text": "..."}.
+    if isinstance(content, dict):
+        node = cast("dict[str, object]", content)
+        if node.get("type") == "text":
+            text = node.get("text")
+            return text if isinstance(text, str) else ""
+        # Recurse into the node's children. Block-level container nodes
+        # (doc, paragraph, heading, list_item, blockquote, …) hold their
+        # children under "content"; joining those children's projections
+        # with a newline keeps blocks on separate lines.
+        children = node.get("content")
+        if isinstance(children, list):
+            kids = cast("list[object]", children)
+            return "\n".join(part for part in (derive_content_text(c) for c in kids) if part)
+        return ""
+    # A bare list of nodes (e.g. the top-level doc.content handed in raw).
+    if isinstance(content, list):
+        nodes = cast("list[object]", content)
+        return "\n".join(part for part in (derive_content_text(c) for c in nodes) if part)
+    return ""
+
+
+def _content_byte_size(content: dict[str, object]) -> int:
+    """Serialized JSON byte size of *content* (the 413 measure).
+
+    The cap is on the canonical serialized form, not the in-memory dict —
+    ``ensure_ascii=False`` so multibyte text counts its real UTF-8 length,
+    not an escaped expansion.
+    """
+    return len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
+
+
+def _require_content_within_cap(content: dict[str, object]) -> None:
+    """413 unless *content* serializes within ``MAX_CONTENT_BYTES``."""
+    size = _content_byte_size(content)
+    if size > MAX_CONTENT_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Document content exceeds {MAX_CONTENT_BYTES} bytes.",
+        )
+
+
+def _list_stmt(user_id: uuid.UUID) -> Select[tuple[uuid.UUID, str, str, int, datetime, datetime]]:
+    """Build the tenant-scoped sermon list: the user's NON-deleted docs.
+
+    Factored out so BOTH the ``user_id`` filter and the
+    ``deleted_at IS NULL`` predicate can be compile-pinned without a live
+    database (the ``library._library_stmt`` pattern). The ``user_id`` filter
+    is the load-bearing line: drop it and every user sees every user's
+    sermons. ``user_id`` is ALWAYS the JWT-derived value. ``ORDER BY
+    updated_at DESC`` rides ``ix_documents_user_updated``.
+    """
+    return (
+        select(
+            Document.document_id,
+            Document.title,
+            Document.content_text,
+            Document.schema_version,
+            Document.created_at,
+            Document.updated_at,
+        )
+        .where(
+            Document.user_id == user_id,
+            Document.deleted_at.is_(None),
+        )
+        .order_by(Document.updated_at.desc())
+    )
+
+
+def _owned_active_stmt(document_id: uuid.UUID, user_id: uuid.UUID) -> Select[tuple[Document]]:
+    """Build the owned + ACTIVE document lookup (GET-full / PATCH / DELETE).
+
+    Triply-predicated: ``document_id`` from the path, ``user_id`` ALWAYS
+    from the JWT, and ``deleted_at IS NULL`` so a soft-deleted doc reads as
+    404 (per the Verify matrix: GET on a soft-deleted doc -> 404). Drop
+    ``user_id`` and any authenticated user reads any sermon — this is the
+    tenant gate.
+    """
+    return select(Document).where(
+        Document.document_id == document_id,
+        Document.user_id == user_id,
+        Document.deleted_at.is_(None),
+    )
+
+
+def _owned_any_stmt(document_id: uuid.UUID, user_id: uuid.UUID) -> Select[tuple[Document]]:
+    """Build the owned lookup INCLUDING soft-deleted (restore path only).
+
+    Restore must find a soft-deleted row, so this variant omits the
+    ``deleted_at IS NULL`` predicate — but KEEPS the ``user_id`` gate so a
+    cross-tenant restore is the same 404. ``user_id`` is ALWAYS the
+    JWT-derived value.
+    """
+    return select(Document).where(
+        Document.document_id == document_id,
+        Document.user_id == user_id,
+    )
+
+
+def _delete_stmt(
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    now: datetime,
+) -> ReturningUpdate[tuple[uuid.UUID]]:
+    """Build the soft-delete UPDATE: set ``deleted_at`` on an ACTIVE owned row.
+
+    Scoped by ``document_id`` AND ``user_id`` (the tenant gate) AND
+    ``deleted_at IS NULL`` so a second DELETE on an already-deleted doc
+    matches nothing and the handler 404s — idempotency is not the contract
+    here (restore is). ``RETURNING document_id`` lets the handler tell "soft
+    deleted one row" from "matched nothing -> 404" without a prior SELECT.
+    ``user_id`` is ALWAYS the JWT-derived value.
+    """
+    return (
+        update(Document)
+        .where(
+            Document.document_id == document_id,
+            Document.user_id == user_id,
+            Document.deleted_at.is_(None),
+        )
+        .values(deleted_at=now)
+        .returning(Document.document_id)
+    )
+
+
+def _update_stmt(
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    values: dict[str, object],
+) -> ReturningUpdate[tuple[uuid.UUID, str, dict[str, object], str, int, datetime, datetime]]:
+    """Build the PATCH UPDATE: apply *values* + bump ``updated_at`` on an owned row.
+
+    Scoped by ``document_id`` AND ``user_id`` (the tenant gate) AND
+    ``deleted_at IS NULL`` (a soft-deleted doc is not patchable — same 404 as
+    nonexistent). ``updated_at`` is bumped EXPLICITLY via ``func.now()`` in
+    the value set (the column has ``server_default`` but no ``onupdate``, the
+    schema-wide convention) so the new value reads back for the NEXT PATCH's
+    optimistic-concurrency gate. ``RETURNING`` the full row avoids a second
+    round-trip. ``user_id`` is ALWAYS the JWT-derived value.
+
+    The 409 base-mismatch check is the caller's job (it needs the prior
+    ``updated_at`` from the gate SELECT); this builder only carries the
+    tenant + active predicates.
+    """
+    return (
+        update(Document)
+        .where(
+            Document.document_id == document_id,
+            Document.user_id == user_id,
+            Document.deleted_at.is_(None),
+        )
+        .values(**values, updated_at=func.now())
+        .returning(
+            Document.document_id,
+            Document.title,
+            Document.content,
+            Document.content_text,
+            Document.schema_version,
+            Document.created_at,
+            Document.updated_at,
+        )
+    )
+
+
+async def _require_owned_document(
+    document_id: str,
+    user_id: uuid.UUID,
+    session: AsyncSession,
+) -> Document:
+    """Return the owned, ACTIVE document or raise a no-oracle 404.
+
+    Non-UUID garbage, nonexistent ids, another tenant's doc, AND a
+    soft-deleted doc are byte-identical 404s — no existence oracle (the
+    ``reader._require_owned_book`` contract). Used by GET-full / PATCH /
+    DELETE; restore uses ``_owned_any_stmt`` directly because it must see
+    soft-deleted rows.
+    """
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Document not found.",
+    )
+    try:
+        document_uuid = uuid.UUID(document_id)
+    except ValueError as exc:
+        # Not a UUID → cannot be a documents PK → same 404 shape.
+        raise not_found from exc
+    result = await session.execute(_owned_active_stmt(document_uuid, user_id))
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise not_found
+    return document
+
+
+def _to_response(document: Document) -> DocumentResponse:
+    return DocumentResponse(
+        document_id=document.document_id,
+        title=document.title,
+        content=document.content,
+        content_text=document.content_text,
+        schema_version=document.schema_version,
+        created_at=document.created_at,
+        updated_at=document.updated_at,
+    )
+
+
+@router.post("", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
+async def create_document(
+    payload: DocumentCreate,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> DocumentResponse:
+    """Create a sermon document for the JWT user. 413 if content too large."""
+    _require_content_within_cap(payload.content)
+    document = Document(
+        user_id=current_user.user_id,
+        title=payload.title,
+        content=payload.content,
+        content_text=derive_content_text(payload.content),
+        schema_version=SCHEMA_VERSION,
+    )
+    session.add(document)
+    await session.commit()
+    await session.refresh(document)
+    return _to_response(document)
+
+
+@router.get("", response_model=DocumentListResponse)
+async def list_documents(
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> DocumentListResponse:
+    """List the caller's non-deleted sermons, newest first, with previews."""
+    result = await session.execute(_list_stmt(current_user.user_id))
+    documents = [
+        DocumentSummary(
+            document_id=document_id,
+            title=title,
+            preview=content_text[:PREVIEW_CHARS],
+            schema_version=schema_version,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+        for (
+            document_id,
+            title,
+            content_text,
+            schema_version,
+            created_at,
+            updated_at,
+        ) in result.tuples().all()
+    ]
+    return DocumentListResponse(documents=documents)
+
+
+@router.get("/{document_id}", response_model=DocumentResponse)
+async def get_document(
+    document_id: str,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> DocumentResponse:
+    """Return the full document for the JWT user; 404 (no oracle) otherwise."""
+    document = await _require_owned_document(document_id, current_user.user_id, session)
+    return _to_response(document)
+
+
+@router.patch("/{document_id}", response_model=DocumentResponse)
+async def update_document(
+    document_id: str,
+    payload: DocumentUpdate,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> DocumentResponse:
+    """Partial update under optimistic concurrency. 409 on stale base, 404 no-oracle.
+
+    ``base_updated_at`` must equal the stored ``updated_at`` (single-author
+    409 gate). At least one of ``title``/``content`` must be present. On a
+    ``content`` change, ``content_text`` is re-derived and the size cap is
+    enforced; ``updated_at`` is bumped EXPLICITLY (no ``onupdate`` on the
+    column) so the new value reads back for the next PATCH's gate.
+    """
+    if payload.title is None and payload.content is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PATCH must set at least one of title or content.",
+        )
+    if payload.content is not None:
+        _require_content_within_cap(payload.content)
+
+    # Gate FIRST (ownership + active + 404-no-oracle); the loaded row also
+    # carries the stored updated_at for the 409 check.
+    document = await _require_owned_document(document_id, current_user.user_id, session)
+
+    # Optimistic concurrency: the client's base must match what we stored.
+    # Mismatch -> 409 (another write landed since the client last read).
+    if document.updated_at != payload.base_updated_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document was modified since base_updated_at; reload and retry.",
+        )
+
+    values: dict[str, object] = {}
+    if payload.title is not None:
+        values["title"] = payload.title
+    if payload.content is not None:
+        values["content"] = payload.content
+        # content_text is server-derived on every content write — the client
+        # never supplies it (extra="forbid" forbids the field outright).
+        values["content_text"] = derive_content_text(payload.content)
+
+    # Statement-level UPDATE bumps updated_at via func.now() in the value set
+    # (the column has server_default but no onupdate — the schema-wide
+    # convention; reader._position_upsert_stmt does the same) and RETURNs the
+    # fresh row.
+    row = (
+        await session.execute(
+            _update_stmt(document.document_id, current_user.user_id, values=values),
+        )
+    ).one()
+    await session.commit()
+    document_id_val, title, content, content_text, schema_version, created_at, updated_at = row
+    return DocumentResponse(
+        document_id=document_id_val,
+        title=title,
+        content=content,
+        content_text=content_text,
+        schema_version=schema_version,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(
+    document_id: str,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> None:
+    """Soft-delete the document (sets ``deleted_at``). 404 (no oracle) otherwise.
+
+    A second DELETE on an already soft-deleted doc is a 404 (the active-row
+    predicate matches nothing) — symmetric with GET-on-deleted; restore is
+    the idempotent inverse.
+    """
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Document not found.",
+    )
+    try:
+        document_uuid = uuid.UUID(document_id)
+    except ValueError as exc:
+        raise not_found from exc
+    result = await session.execute(
+        _delete_stmt(document_uuid, current_user.user_id, now=datetime.now(tz=UTC)),
+    )
+    if result.scalar_one_or_none() is None:
+        raise not_found
+    await session.commit()
+
+
+@router.post("/{document_id}/restore", response_model=DocumentResponse)
+async def restore_document(
+    document_id: str,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> DocumentResponse:
+    """Clear ``deleted_at``. Idempotent on an active doc; 404 (no oracle) otherwise.
+
+    Restore is the only endpoint that must SEE soft-deleted rows, so it
+    resolves through ``_owned_any_stmt`` (no ``deleted_at IS NULL``) — but
+    KEEPS the ``user_id`` gate, so a cross-tenant restore is the same 404 as
+    a nonexistent id. Restoring an already-active doc is a no-op 200 (the
+    pre-made idempotency decision).
+    """
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Document not found.",
+    )
+    try:
+        document_uuid = uuid.UUID(document_id)
+    except ValueError as exc:
+        raise not_found from exc
+    result = await session.execute(_owned_any_stmt(document_uuid, current_user.user_id))
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise not_found
+    if document.deleted_at is not None:
+        document.deleted_at = None
+        await session.commit()
+        await session.refresh(document)
+    return _to_response(document)

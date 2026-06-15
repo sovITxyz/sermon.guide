@@ -241,62 +241,74 @@ const SEARCH_HITS = [
   },
 ];
 
-// Deterministic sermon-calendar events (Phase 39 — backs GET /calendar/events).
-// Shape mirrors api/calendar_routes.py CalendarEvent EXACTLY: snake_case,
-// event_date a day-only YYYY-MM-DD string (NO time/tz), series + document_id
-// nullable, NO user_id (the response is tenant-scoped server-side via the JWT —
-// here the bearer gate stands in for that). All dates sit in 2028 so the year
-// E2E can spot-check a leap February (29 days) and a Sunday-starting October.
-// They are bearer-scoped like every other endpoint but NOT per-user-seeded —
-// every authenticated user sees the same fixed set, which is all the read-only
-// year/month views assert.
-const CALENDAR_EVENTS = [
-  {
-    event_id: "aaaaaaaa-0000-0000-0000-000000000001",
-    event_date: "2028-02-06",
-    title: "Sermon on the Mount",
-    series: "Matthew",
-    document_id: null,
-    created_at: "2028-01-01T00:00:00Z",
-    updated_at: "2028-01-01T00:00:00Z",
-  },
-  {
-    event_id: "aaaaaaaa-0000-0000-0000-000000000002",
-    event_date: "2028-02-29",
-    title: "Leap-day Vespers",
-    series: "Matthew",
-    document_id: null,
-    created_at: "2028-01-01T00:00:00Z",
-    updated_at: "2028-01-01T00:00:00Z",
-  },
-  {
-    event_id: "aaaaaaaa-0000-0000-0000-000000000003",
-    event_date: "2028-10-01",
-    title: "Harvest Thanksgiving",
-    series: "Psalms",
-    document_id: null,
-    created_at: "2028-01-01T00:00:00Z",
-    updated_at: "2028-01-01T00:00:00Z",
-  },
-  {
-    event_id: "aaaaaaaa-0000-0000-0000-000000000004",
-    event_date: "2028-10-01",
-    title: "Evening Prayer",
-    series: "Psalms",
-    document_id: null,
-    created_at: "2028-01-01T00:00:00Z",
-    updated_at: "2028-01-01T00:00:00Z",
-  },
-  {
-    event_id: "aaaaaaaa-0000-0000-0000-000000000005",
-    event_date: "2028-10-15",
-    title: "Reformation Sunday",
-    series: "Romans",
-    document_id: null,
-    created_at: "2028-01-01T00:00:00Z",
-    updated_at: "2028-01-01T00:00:00Z",
-  },
+// Sermon-calendar event store (Phase 39 read + Phase 40 CRUD — backs
+// /calendar/events). Each record mirrors api/calendar_routes.py CalendarEvent
+// EXACTLY (snake_case, event_date a day-only YYYY-MM-DD string, series +
+// document_id nullable) plus an internal `userId` for tenant scoping (the
+// CalendarEvent wire shape has NO user_id — it is stripped before sending).
+//
+// The five deterministic 2028 seeds are owned by `userId: null` = SHARED /
+// visible to ALL authenticated users, which is what the read-only Phase 39
+// year/month specs assert (a freshly-signed-up user sees them). The dates sit
+// in 2028 so the year E2E can spot-check a leap February (29 days) and a
+// Sunday-starting October. Rows created via POST are owned by the creating user
+// and are visible only to them (the no-existence-oracle 404 covers cross-tenant
+// reads of a created row), so the Phase 40 mutation specs sign up a fresh user
+// per spec and assert only their OWN rows.
+//
+// eventId -> { userId|null, event_date, title, series, document_id,
+//              created_at, updated_at }.
+const calendarEvents = new Map();
+const CALENDAR_SEEDS = [
+  ["aaaaaaaa-0000-0000-0000-000000000001", "2028-02-06", "Sermon on the Mount", "Matthew"],
+  ["aaaaaaaa-0000-0000-0000-000000000002", "2028-02-29", "Leap-day Vespers", "Matthew"],
+  ["aaaaaaaa-0000-0000-0000-000000000003", "2028-10-01", "Harvest Thanksgiving", "Psalms"],
+  ["aaaaaaaa-0000-0000-0000-000000000004", "2028-10-01", "Evening Prayer", "Psalms"],
+  ["aaaaaaaa-0000-0000-0000-000000000005", "2028-10-15", "Reformation Sunday", "Romans"],
 ];
+for (const [eventId, eventDate, title, series] of CALENDAR_SEEDS) {
+  calendarEvents.set(eventId, {
+    userId: null, // shared/visible to all (the read-only specs depend on this)
+    event_date: eventDate,
+    title,
+    series,
+    document_id: null,
+    created_at: "2028-01-01T00:00:00Z",
+    updated_at: "2028-01-01T00:00:00Z",
+  });
+}
+
+/** The materializer cap (api/calendar_routes.py MATERIALIZER_CAP_ROWS). */
+const MATERIALIZER_CAP_ROWS = 53;
+
+/** Public CalendarEvent wire shape — strips the internal `userId`. */
+function calendarWire(eventId, record) {
+  return {
+    event_id: eventId,
+    event_date: record.event_date,
+    title: record.title,
+    series: record.series,
+    document_id: record.document_id,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+  };
+}
+
+/**
+ * Add `delta` calendar days to a YYYY-MM-DD string, returning a fresh
+ * YYYY-MM-DD. Uses Date.UTC with numeric args (never `new Date("YYYY-MM-DD")`)
+ * so it is timezone-immune — mirrors web/lib/dates.ts:addDays for the weekly
+ * materializer below.
+ */
+function addUtcDays(value, delta) {
+  const [y, m, d] = value.split("-").map(Number);
+  const ms = Date.UTC(y, m - 1, d) + delta * 86400000;
+  const dt = new Date(ms);
+  const yy = String(dt.getUTCFullYear()).padStart(4, "0");
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
@@ -362,29 +374,153 @@ const server = createServer(async (req, res) => {
     return send(res, 200, { books: LIBRARY });
   }
 
-  // --- calendar events (read-only range, Phase 39) --------------------------
-  // GET /calendar/events?start&end — half-open [start, end) on event_date
-  // (an event dated exactly `end` is EXCLUDED), ordered event_date ascending,
-  // bearer-scoped. Range validation (start <= end, span <= 400 days) is the
-  // real api's job; the E2E only exercises in-range fetches, so the stub just
-  // applies the half-open filter the web grouping depends on. String compares
-  // are correct because the dates are zero-padded YYYY-MM-DD.
-  if (req.method === "GET" && path === "/calendar/events") {
-    if (!userIdFor(req)) {
+  // --- calendar events collection (Phase 39 GET + Phase 40 POST) ------------
+  // Same path for the range GET and the create POST (a FastAPI collection
+  // route). Bearer-scoped; a row is visible when it is a shared seed
+  // (userId === null) OR owned by the requesting user.
+  if (path === "/calendar/events") {
+    const userId = userIdFor(req);
+    if (!userId) {
       return detail(res, 401, "Not authenticated.");
     }
-    const start = url.searchParams.get("start");
-    const end = url.searchParams.get("end");
-    const events = CALENDAR_EVENTS.filter((e) => {
-      if (start !== null && e.event_date < start) {
-        return false;
+
+    // GET ?start&end — half-open [start, end) on event_date (an event dated
+    // exactly `end` is EXCLUDED), ordered event_date ascending. Range validation
+    // (start <= end, span <= 400 days) is the real api's job; the E2E only
+    // exercises in-range fetches. String compares are correct because the dates
+    // are zero-padded YYYY-MM-DD.
+    if (req.method === "GET") {
+      const start = url.searchParams.get("start");
+      const end = url.searchParams.get("end");
+      const events = [];
+      for (const [id, record] of calendarEvents) {
+        if (record.userId !== null && record.userId !== userId) {
+          continue;
+        }
+        if (start !== null && record.event_date < start) {
+          continue;
+        }
+        if (end !== null && record.event_date >= end) {
+          continue;
+        }
+        events.push(calendarWire(id, record));
       }
-      if (end !== null && e.event_date >= end) {
-        return false;
+      events.sort((a, b) =>
+        a.event_date < b.event_date ? -1 : a.event_date > b.event_date ? 1 : 0,
+      );
+      return send(res, 200, { events });
+    }
+
+    // POST create. Validates event_date + title (the proxy already dropped
+    // document_id). When repeat_weekly_until is set, MATERIALIZES independent
+    // weekly rows from event_date THROUGH that date inclusive (anchor + every +7
+    // days <= until), enforcing the real api's caps: until < event_date -> 422,
+    // and occurrence_count > MATERIALIZER_CAP_ROWS (53) -> 422. Each occurrence
+    // is its own row owned by the creator. Response: 201 { events } (a LIST,
+    // event_date ascending) even for a single create.
+    if (req.method === "POST") {
+      const body = await readJson(req);
+      const eventDate = typeof body?.event_date === "string" ? body.event_date : null;
+      const title = typeof body?.title === "string" ? body.title : null;
+      if (!eventDate || !title) {
+        return detail(res, 422, "event_date and title are required.");
       }
-      return true;
-    }).sort((a, b) => (a.event_date < b.event_date ? -1 : a.event_date > b.event_date ? 1 : 0));
-    return send(res, 200, { events });
+      const series = typeof body?.series === "string" ? body.series : null;
+      const until = typeof body?.repeat_weekly_until === "string" ? body.repeat_weekly_until : null;
+
+      let occurrences = 1;
+      if (until !== null) {
+        if (until < eventDate) {
+          return detail(res, 422, "repeat_weekly_until must be on or after event_date.");
+        }
+        // (until - event_date).days // 7 + 1, computed on UTC-midnight ms.
+        const [sy, sm, sd] = eventDate.split("-").map(Number);
+        const [uy, um, ud] = until.split("-").map(Number);
+        const days = Math.floor((Date.UTC(uy, um - 1, ud) - Date.UTC(sy, sm - 1, sd)) / 86400000);
+        occurrences = Math.floor(days / 7) + 1;
+        if (occurrences > MATERIALIZER_CAP_ROWS) {
+          return detail(
+            res,
+            422,
+            `A weekly repeat would create ${occurrences} events, over the ${MATERIALIZER_CAP_ROWS} limit.`,
+          );
+        }
+      }
+
+      const created = [];
+      for (let i = 0; i < occurrences; i += 1) {
+        const id = randomUUID();
+        const now = nextTimestamp();
+        const record = {
+          userId,
+          event_date: addUtcDays(eventDate, i * 7),
+          title,
+          series,
+          document_id: null,
+          created_at: now,
+          updated_at: now,
+        };
+        calendarEvents.set(id, record);
+        created.push(calendarWire(id, record));
+      }
+      created.sort((a, b) =>
+        a.event_date < b.event_date ? -1 : a.event_date > b.event_date ? 1 : 0,
+      );
+      return send(res, 201, { events: created });
+    }
+  }
+
+  // --- single calendar event (Phase 40 PATCH / DELETE) ----------------------
+  // PATCH edits (title/series/event_date, present-only); DELETE hard-deletes.
+  // A non-owned / unknown / non-UUID id collapses to the SAME uniform 404 (the
+  // no-existence-oracle contract). Shared seeds (userId === null) are read-only
+  // here — a mutation on one is NOT owned by the caller, so it 404s, matching
+  // "the user can only mutate their own rows". The Phase 40 specs create their
+  // own rows before editing/deleting.
+  const calendarMatch = path.match(/^\/calendar\/events\/([^/]+)$/);
+  if (calendarMatch && (req.method === "PATCH" || req.method === "DELETE")) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(calendarMatch[1]);
+    const record = calendarEvents.get(id);
+    const owned = record && record.userId === userId;
+
+    if (req.method === "PATCH") {
+      if (!owned) {
+        return detail(res, 404, "Event not found.");
+      }
+      const body = await readJson(req);
+      const hasDate = typeof body?.event_date === "string";
+      const hasTitle = typeof body?.title === "string";
+      // series is three-state: present-and-null detaches, present-and-string
+      // re-sets, absent leaves alone.
+      const hasSeries = body !== null && "series" in body;
+      if (!hasDate && !hasTitle && !hasSeries) {
+        return detail(res, 422, "PATCH must set at least one field.");
+      }
+      if (hasDate) {
+        record.event_date = body.event_date;
+      }
+      if (hasTitle) {
+        record.title = body.title;
+      }
+      if (hasSeries) {
+        record.series = typeof body.series === "string" ? body.series : null;
+      }
+      record.updated_at = nextTimestamp();
+      return send(res, 200, calendarWire(id, record));
+    }
+
+    if (req.method === "DELETE") {
+      if (!owned) {
+        return detail(res, 404, "Event not found.");
+      }
+      calendarEvents.delete(id);
+      res.writeHead(204);
+      return res.end();
+    }
   }
 
   // --- upload ---------------------------------------------------------------

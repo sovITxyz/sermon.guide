@@ -15,12 +15,13 @@ function firstParam(value: string | string[] | undefined): string | null {
 }
 
 /**
- * The sermon calendar (Phase 39, read-only). All state lives in the URL —
- * `?view=year|month&date=YYYY-MM-DD` — so the page is linkable/deep-linkable
- * and a shared link opens the exact view + period. The server normalizes the
- * (possibly malformed) query into a {@link CalendarState} and computes the
- * single canonical "today" once, then hands both to the client island, which
- * owns the one range fetch that drives whichever view is active.
+ * The sermon calendar (Phase 39 read views + Phase 40 week view & CRUD). All
+ * state lives in the URL — `?view=year|month|week&date=YYYY-MM-DD` — so the page
+ * is linkable/deep-linkable and a shared link opens the exact view + period. The
+ * server normalizes the (possibly malformed) query into a {@link CalendarState}
+ * and computes the single canonical "today" once, then hands both to the client
+ * island, which owns the one range fetch (and the create/edit/delete mutations)
+ * that drive whichever view is active.
  *
  * Auth: the route is gated by middleware.ts (the `/calendar/:path*` matcher
  * bounces an unauthenticated request to /login before this renders), and the

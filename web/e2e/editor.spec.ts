@@ -79,7 +79,12 @@ test("a stale-tab Save surfaces the 409 conflict as a non-destructive error", as
     await editorBody(page).fill("First tab, stale edit.");
     await page.getByRole("button", { name: "Save" }).click();
 
-    await expect(page.getByRole("alert")).toContainText(/changed in another tab or device/i);
+    // Scope to SermonEditor's inline 409 copy: a bare getByRole("alert") also
+    // matches Next.js's always-present #__next-route-announcer__ (strict-mode
+    // violation), so assert on the conflict message text directly.
+    await expect(
+      page.getByText("This sermon was changed in another tab or device since you opened it."),
+    ).toBeVisible();
     await expect(editorBody(page)).toContainText("First tab, stale edit.");
   } finally {
     await otherTab.close();

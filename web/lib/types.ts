@@ -223,3 +223,33 @@ export interface DocumentPatch {
   title?: string;
   content?: ProseMirrorDoc;
 }
+
+/**
+ * One sermon calendar event (api/calendar_routes.py CalendarEvent). Field
+ * names/casing match the FastAPI JSON verbatim. `event_date` is a Postgres
+ * DATE serialized day-only as `YYYY-MM-DD` (NO time/timezone) — keep it a
+ * string end-to-end and do string arithmetic (web/lib/dates.ts); never
+ * `new Date("YYYY-MM-DD")` (UTC parse shifts the day in UTC-minus zones).
+ * `created_at`/`updated_at` are full ISO datetimes. `series` and `document_id`
+ * are nullable (`document_id` FK ON DELETE SET NULL → null when the linked
+ * sermon is gone). There is NO `user_id` — the response is tenant-scoped
+ * server-side via the JWT.
+ */
+export interface CalendarEvent {
+  event_id: string;
+  event_date: string;
+  title: string;
+  series: string | null;
+  document_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * GET /calendar/events response (api/calendar_routes.py
+ * CalendarEventListResponse). Just `events`, ordered by `event_date`
+ * ascending — no pagination/total.
+ */
+export interface CalendarEventListResponse {
+  events: CalendarEvent[];
+}

@@ -494,11 +494,23 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const hasDate = typeof body?.event_date === "string";
       const hasTitle = typeof body?.title === "string";
-      // series is three-state: present-and-null detaches, present-and-string
-      // re-sets, absent leaves alone.
+      // series + document_id are three-state: present-and-null detaches,
+      // present-and-string re-sets, absent leaves alone (key-presence, NOT
+      // truthiness — an explicit null must survive to detach / unlink).
       const hasSeries = body !== null && "series" in body;
-      if (!hasDate && !hasTitle && !hasSeries) {
+      const hasDoc = body !== null && "document_id" in body;
+      if (!hasDate && !hasTitle && !hasSeries && !hasDoc) {
         return detail(res, 422, "PATCH must set at least one field.");
+      }
+      // Phase 38 ownership gate: a NON-NULL document_id must be a doc owned by
+      // the caller (active OR soft-deleted — ownership is what matters). A
+      // cross-tenant / nonexistent / non-UUID id collapses to the SAME no-oracle
+      // 404 (no title/existence leak). A null document_id always passes (unlink).
+      if (hasDoc && typeof body.document_id === "string") {
+        const doc = documents.get(body.document_id);
+        if (!doc || doc.userId !== userId) {
+          return detail(res, 404, "Document not found.");
+        }
       }
       if (hasDate) {
         record.event_date = body.event_date;
@@ -508,6 +520,9 @@ const server = createServer(async (req, res) => {
       }
       if (hasSeries) {
         record.series = typeof body.series === "string" ? body.series : null;
+      }
+      if (hasDoc) {
+        record.document_id = typeof body.document_id === "string" ? body.document_id : null;
       }
       record.updated_at = nextTimestamp();
       return send(res, 200, calendarWire(id, record));
@@ -661,6 +676,17 @@ const server = createServer(async (req, res) => {
         return detail(res, 404, "Document not found.");
       }
       record.deleted_at = nextTimestamp();
+      // Cross-item contract (Phase 41 Verify / ON DELETE SET NULL): any calendar
+      // event still linked to this document loses the link, so the event
+      // survives with document_id NULL and its chip reverts to the edit-popover
+      // (unlinked) click. The stub nulls it on delete to model the FK SET NULL
+      // the Verify checklist asserts.
+      for (const ev of calendarEvents.values()) {
+        if (ev.document_id === id) {
+          ev.document_id = null;
+          ev.updated_at = nextTimestamp();
+        }
+      }
       res.writeHead(204);
       return res.end();
     }

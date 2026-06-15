@@ -13,9 +13,31 @@ import {
   seriesColor,
 } from "@/lib/calendar-view";
 import { addDays, addMonths, formatDate, monthsOfYear, weekRange } from "@/lib/dates";
-import type { CalendarEvent, CalendarEventListResponse } from "@/lib/types";
+import type {
+  CalendarEvent,
+  CalendarEventListResponse,
+  DocumentFull,
+  ProseMirrorDoc,
+} from "@/lib/types";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
+
+/**
+ * Seed content for a brand-new sermon created from an empty calendar day — the
+ * same minimal-but-valid ProseMirror/TipTap doc the standalone "New sermon"
+ * button uses (web/components/NewSermonButton.tsx). One empty paragraph inside a
+ * `doc` node; TipTap renders it as an empty editor with the placeholder showing.
+ */
+const SEED_CONTENT: ProseMirrorDoc = {
+  type: "doc",
+  content: [{ type: "paragraph" }],
+};
+
+/** Editor route for a linked manuscript. Mirrors web/components/SermonList. */
+function sermonHref(documentId: string): string {
+  return `/sermons/${encodeURIComponent(documentId)}`;
+}
 
 const MONTH_NAMES = [
   "January",
@@ -60,6 +82,7 @@ interface CalendarViewProps {
  * Every await re-checks a mounted ref before touching state.
  */
 export function CalendarView({ state, todayStr }: CalendarViewProps) {
+  const router = useRouter();
   const [status, setStatus] = useState<LoadStatus>("loading");
   const [events, setEvents] = useState<readonly CalendarEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -123,7 +146,21 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
   }, []);
 
   const openCreate = useCallback((date: string) => setPopover({ kind: "create", date }), []);
-  const openEdit = useCallback((event: CalendarEvent) => setPopover({ kind: "edit", event }), []);
+  // A chip/card click branches on the link state (Phase 41): a LINKED event
+  // opens its manuscript at /sermons/{document_id}; an UNLINKED event opens the
+  // Phase 40 edit popover (where it can be linked). The views call this for
+  // every event — the branch lives here, not in the view, so all three views
+  // share one rule.
+  const openEdit = useCallback(
+    (event: CalendarEvent) => {
+      if (event.document_id !== null) {
+        router.push(sermonHref(event.document_id));
+        return;
+      }
+      setPopover({ kind: "edit", event });
+    },
+    [router],
+  );
   const closePopover = useCallback(() => setPopover({ kind: "none" }), []);
 
   const eventsByDate = groupByDate(events);
@@ -199,6 +236,20 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
             }
             return message;
           }}
+          onCreateDraft={async (input) => {
+            // Create-from-date (Phase 41): make the event, create a draft sermon,
+            // link the event to it, then open the editor. Two existing endpoints
+            // (POST /documents + PATCH the event's document_id) — no new route.
+            // On any step's failure the message surfaces inline and we DON'T
+            // navigate; a partial state (event created, link missing) is recoverable
+            // from the calendar (the event shows unlinked).
+            const message = await createDraftForDate(input);
+            if (typeof message === "string") {
+              return message;
+            }
+            router.push(sermonHref(message.documentId));
+            return null;
+          }}
         />
       ) : null}
 
@@ -267,10 +318,23 @@ async function createEvent(input: {
   }
 }
 
-/** PATCH an edit (title / series / event_date). Returns null on success. */
+/**
+ * PATCH an edit (title / series / event_date plus the optional three-state
+ * `document_id`). The input object is passed VERBATIM to the proxy whitelist —
+ * a present `document_id: null` UNLINKS, a present string RE-LINKS, an absent
+ * key leaves the link alone. The proxy forwards a non-null `document_id` to the
+ * API, which ownership-checks it (Phase 38) and returns a no-oracle 404 on a
+ * cross-tenant/nonexistent id; that 404 (and the 422) surfaces here as the
+ * error string the popover renders. Returns null on success.
+ */
 async function patchEvent(
   eventId: string,
-  input: { event_date: string; title: string; series: string | null },
+  input: {
+    event_date?: string;
+    title?: string;
+    series?: string | null;
+    document_id?: string | null;
+  },
 ): Promise<string | null> {
   try {
     const res = await fetch(`/api/sermon-events/${encodeURIComponent(eventId)}`, {
@@ -286,6 +350,69 @@ async function patchEvent(
   } catch {
     return "Network error. Please try again.";
   }
+}
+
+/**
+ * Create-doc-from-empty-date (Phase 41). Three steps over EXISTING endpoints:
+ *   1. POST /api/sermon-events to create the event (the proxy drops document_id
+ *      on create — link is a separate PATCH);
+ *   2. POST /api/documents to create a draft sermon seeded with an empty doc,
+ *      titled after the event;
+ *   3. PATCH the new event's document_id to the new doc id.
+ * Returns `{ documentId }` on success (the caller navigates into the editor) or
+ * a human-readable error string on any step's failure. There is no rollback: a
+ * created-but-unlinked event simply shows unlinked in the calendar, recoverable
+ * from the edit popover's picker.
+ */
+async function createDraftForDate(input: {
+  event_date: string;
+  title: string;
+  series: string | null;
+  repeat_weekly_until: string | null;
+}): Promise<{ documentId: string } | string> {
+  let eventId: string;
+  try {
+    const res = await fetch("/api/sermon-events", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      return await errorMessage(res, "Could not create the event.");
+    }
+    const data = (await res.json()) as CalendarEventListResponse;
+    const created = data.events[0];
+    if (!created) {
+      return "Could not create the event.";
+    }
+    eventId = created.event_id;
+  } catch {
+    return "Network error. Please try again.";
+  }
+
+  let documentId: string;
+  try {
+    const res = await fetch("/api/documents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: input.title, content: SEED_CONTENT }),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      return await errorMessage(res, "Could not create the sermon draft.");
+    }
+    const doc = (await res.json()) as DocumentFull;
+    documentId = doc.document_id;
+  } catch {
+    return "Network error. Please try again.";
+  }
+
+  const linkError = await patchEvent(eventId, { document_id: documentId });
+  if (linkError !== null) {
+    return linkError;
+  }
+  return { documentId };
 }
 
 /** DELETE an event. Returns null on success (204). */

@@ -18,6 +18,20 @@ interface QuickCreatePopoverProps {
     series: string | null;
     repeat_weekly_until: string | null;
   }) => Promise<string | null>;
+  /**
+   * Create-doc-from-date (Phase 41): create the event, create a draft sermon
+   * titled after it, link them, and open the editor. The caller owns all the
+   * fetches + the navigation; this resolves to `null` only if it DIDN'T navigate
+   * (an error to show inline). On success the caller routes away and this
+   * popover unmounts. The weekly-repeat is intentionally ignored for the draft
+   * flow — a draft is linked to a single dated event, not a materialized run.
+   */
+  onCreateDraft: (input: {
+    event_date: string;
+    title: string;
+    series: string | null;
+    repeat_weekly_until: string | null;
+  }) => Promise<string | null>;
 }
 
 /**
@@ -30,7 +44,12 @@ interface QuickCreatePopoverProps {
  * All entered text is held in React state and rendered through controlled
  * inputs / text nodes — never `dangerouslySetInnerHTML`.
  */
-export function QuickCreatePopover({ date, onClose, onSubmit }: QuickCreatePopoverProps) {
+export function QuickCreatePopover({
+  date,
+  onClose,
+  onSubmit,
+  onCreateDraft,
+}: QuickCreatePopoverProps) {
   const titleId = useId();
   const seriesId = useId();
   const repeatId = useId();
@@ -42,6 +61,15 @@ export function QuickCreatePopover({ date, onClose, onSubmit }: QuickCreatePopov
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  function buildInput() {
+    return {
+      event_date: date,
+      title,
+      series: series.trim() === "" ? null : series,
+      repeat_weekly_until: repeat && repeatUntil !== "" ? repeatUntil : null,
+    };
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (saving) {
@@ -49,14 +77,30 @@ export function QuickCreatePopover({ date, onClose, onSubmit }: QuickCreatePopov
     }
     setSaving(true);
     setError(null);
-    const message = await onSubmit({
-      event_date: date,
-      title,
-      series: series.trim() === "" ? null : series,
-      repeat_weekly_until: repeat && repeatUntil !== "" ? repeatUntil : null,
-    });
+    const message = await onSubmit(buildInput());
     if (message === null) {
       // Success — the caller refetches and unmounts this popover.
+      return;
+    }
+    setError(message);
+    setSaving(false);
+  }
+
+  async function handleCreateDraft() {
+    if (saving) {
+      return;
+    }
+    // The native title input's `required` is only enforced on form submit; this
+    // is a type=button so guard the empty title here (the API would 422 anyway).
+    if (title.trim() === "") {
+      setError("Add a title before creating a draft.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    const message = await onCreateDraft(buildInput());
+    if (message === null) {
+      // Success — the caller navigated into the editor; this popover unmounts.
       return;
     }
     setError(message);
@@ -116,13 +160,21 @@ export function QuickCreatePopover({ date, onClose, onSubmit }: QuickCreatePopov
           </p>
         ) : null}
 
-        <div className="flex justify-end gap-2 pt-1">
+        <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
           <button
             type="button"
             onClick={onClose}
-            className="rounded border border-gray-300 px-3 py-1 text-sm hover:bg-gray-50"
+            className="mr-auto rounded border border-gray-300 px-3 py-1 text-sm hover:bg-gray-50"
           >
             Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleCreateDraft}
+            disabled={saving}
+            className="rounded border border-gray-300 px-3 py-1 text-sm hover:bg-gray-50 disabled:opacity-50"
+          >
+            {saving ? "Working…" : "Write a draft"}
           </button>
           <button
             type="submit"

@@ -322,3 +322,184 @@ test("the same series renders the same color across week and month views", async
   const bgChip = (chipClass.match(/bg-[a-z]+-100/) ?? [])[0];
   expect(bgChip).toBe(bgA);
 });
+
+/**
+ * Phase 41 — calendar ↔ manuscript linking (pure UX over the Phase 38 FK +
+ * ownership check; no new endpoints). These drive the same-origin proxies:
+ *   * link/unlink via PATCH /api/sermon-events/[id] with a three-state
+ *     `document_id` (a string re-links, an explicit null unlinks);
+ *   * create-doc-from-date = POST /api/sermon-events + POST /api/documents +
+ *     PATCH document_id, then navigate into /sermons/[newId];
+ *   * a LINKED chip/card click navigates straight to its manuscript;
+ *   * the Phase 38 ownership 404 (a cross-tenant/nonexistent document_id)
+ *     surfaces VISIBLY in the popover — never swallowed.
+ *
+ * Fresh year 2030 + fresh user per spec so only the user's OWN rows assert
+ * (the 2028 seeds are shared and unlinked; the Phase 40 specs work in 2029).
+ *
+ * 2030-04-10 is a Wednesday → its week (Sunday-aligned) is 2030-04-07 .. 04-13.
+ */
+
+const Y3 = "2030";
+const LINK_DATE = "2030-04-10";
+const LINK_WEEK = "2030-04-10";
+
+test("create-from-date: makes a draft, links the event, and opens the editor", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // From an empty day, "Write a draft" creates the event, a draft sermon
+  // titled after it, links them, and routes into the editor.
+  await page.goto(`/calendar?view=week&date=${LINK_WEEK}`);
+  await page.getByRole("button", { name: `Add an event on ${LINK_DATE}` }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Palm Sunday");
+  await dialog.getByRole("button", { name: "Write a draft" }).click();
+
+  // Lands in the editor for the brand-new doc, titled after the event.
+  await page.waitForURL(/\/sermons\/.+/);
+  await expect(page.getByLabel("Sermon title")).toHaveValue("Palm Sunday");
+
+  // Back on the calendar the event is now LINKED: clicking its chip navigates
+  // to the manuscript (it does NOT open the edit popover).
+  await page.goto(`/calendar?view=week&date=${LINK_WEEK}`);
+  await page.getByRole("button", { name: "Edit Palm Sunday" }).click();
+  await page.waitForURL(/\/sermons\/.+/);
+  await expect(page.getByLabel("Sermon title")).toHaveValue("Palm Sunday");
+  // No edit dialog opened — the linked click navigated instead.
+  await expect(page.getByRole("dialog")).toBeHidden();
+});
+
+test("link an existing sermon via the picker, then unlink it", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // Seed a manuscript to link to: create-from-date on one day makes + links its
+  // own event, leaving an owned doc the picker will offer for OTHER events.
+  await page.goto(`/calendar?view=month&date=${Y3}-04-01`);
+  await page.getByRole("button", { name: "Add an event on 2030-04-03" }).click();
+  let dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Existing Manuscript");
+  await dialog.getByRole("button", { name: "Write a draft" }).click();
+  await page.waitForURL(/\/sermons\/.+/);
+
+  // Create a SECOND, unlinked event we'll link to that manuscript via the picker.
+  await page.goto(`/calendar?view=month&date=${Y3}-04-01`);
+  await page.getByRole("button", { name: "Add an event on 2030-04-17" }).click();
+  dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Needs A Sermon");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  // Open the unlinked event's edit popover and LINK it via the picker.
+  await page.getByRole("button", { name: "Edit Needs A Sermon" }).click();
+  dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await dialog
+    .getByLabel("Linked sermon", { exact: false })
+    .selectOption({ label: "Existing Manuscript" });
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(dialog).toBeHidden();
+
+  // Now LINKED: the chip click navigates to the linked manuscript instead of
+  // opening the popover.
+  await page.getByRole("button", { name: "Edit Needs A Sermon" }).click();
+  await page.waitForURL(/\/sermons\/.+/);
+  await expect(page.getByLabel("Sermon title")).toHaveValue("Existing Manuscript");
+
+  // UNLINK: a linked chip navigates, so the unlink PATCH (document_id: null) is
+  // driven through the proxy directly — the three-state explicit null must reach
+  // the API. Find the event id from the range the calendar fetches.
+  const list = await page.request.get("/api/sermon-events?start=2030-04-01&end=2030-05-01");
+  const { events } = (await list.json()) as { events: { event_id: string; title: string }[] };
+  const target = events.find((e) => e.title === "Needs A Sermon");
+  expect(target, "the linked event should be in range").toBeTruthy();
+  const unlink = await page.request.patch(
+    `/api/sermon-events/${encodeURIComponent(target?.event_id ?? "")}`,
+    { data: { document_id: null } },
+  );
+  expect(unlink.ok(), "explicit null must pass the whitelist and detach").toBeTruthy();
+  const unlinked = (await unlink.json()) as { document_id: string | null };
+  expect(unlinked.document_id).toBeNull();
+
+  // After the unlink the chip reverts to opening the edit popover (no navigate).
+  await page.goto(`/calendar?view=month&date=${Y3}-04-01`);
+  await page.getByRole("button", { name: "Edit Needs A Sermon" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+});
+
+test("deleting the linked doc leaves the event alive and unlinked (ON DELETE SET NULL)", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // Create-from-date makes the event + draft + link, then opens the editor.
+  await page.goto(`/calendar?view=month&date=${Y3}-05-01`);
+  await page.getByRole("button", { name: "Add an event on 2030-05-08" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Ascension Draft");
+  await dialog.getByRole("button", { name: "Write a draft" }).click();
+  await page.waitForURL(/\/sermons\/.+/);
+
+  // Delete the manuscript from the /sermons list (soft delete + FK SET NULL).
+  // The native confirm() fires synchronously on click, so the dialog handler
+  // MUST be registered before the click.
+  await page.goto("/sermons");
+  page.once("dialog", (d) => void d.accept());
+  await page.getByRole("button", { name: "Delete Ascension Draft" }).click();
+  // The list refreshes (the row leaves; an undo toast appears).
+  await expect(page.getByText("Deleted “Ascension Draft”.")).toBeVisible();
+
+  // Back on the calendar the event SURVIVES and is now UNLINKED: clicking its
+  // chip opens the edit popover (does NOT navigate, because document_id is null).
+  await page.goto(`/calendar?view=month&date=${Y3}-05-01`);
+  await expect(page.getByTestId("calendar-month").getByText("Ascension Draft")).toBeVisible();
+  await page.getByRole("button", { name: "Edit Ascension Draft" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  // The picker shows "No linked sermon" selected (the deleted doc dropped out).
+  await expect(page.getByRole("dialog").getByLabel("Linked sermon", { exact: false })).toHaveValue(
+    "",
+  );
+});
+
+test("a cross-tenant/nonexistent document_id surfaces the visible 404 (Phase 38)", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // Create an unlinked event we'll try to (mis)link.
+  await page.goto(`/calendar?view=month&date=${Y3}-06-01`);
+  await page.getByRole("button", { name: "Add an event on 2030-06-12" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Title").fill("Mislink Target");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  // Drive the PATCH proxy DIRECTLY with a document_id the caller does NOT own
+  // (a fixed UUID never created here) — the API ownership-checks it and returns
+  // the no-oracle 404, which the proxy passes through {detail}. The picker only
+  // ever offers OWNED docs, so this is the regression guard for the proxy path.
+  // Find the event's id by reading the range the calendar fetched.
+  const list = await page.request.get("/api/sermon-events?start=2030-06-01&end=2030-07-01");
+  expect(list.ok()).toBeTruthy();
+  const { events } = (await list.json()) as { events: { event_id: string; title: string }[] };
+  const target = events.find((e) => e.title === "Mislink Target");
+  expect(target, "the created event should be in range").toBeTruthy();
+  const eventId = target?.event_id ?? "";
+
+  const patch = await page.request.patch(`/api/sermon-events/${encodeURIComponent(eventId)}`, {
+    data: { document_id: "99999999-9999-9999-9999-999999999999" },
+  });
+  // The Phase 38 no-oracle 404 passes through byte-for-byte.
+  expect(patch.status()).toBe(404);
+  const body = (await patch.json()) as { detail?: string };
+  expect(typeof body.detail).toBe("string");
+
+  // And the event is STILL unlinked (the failed link never landed): its chip
+  // opens the edit popover rather than navigating.
+  await page.goto(`/calendar?view=month&date=${Y3}-06-01`);
+  await page.getByRole("button", { name: "Edit Mislink Target" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+});

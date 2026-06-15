@@ -32,6 +32,9 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
                 <Link href="/library" className="hover:underline">
                   Library
                 </Link>
+                <Link href="/sermons" className="hover:underline">
+                  Sermons
+                </Link>
                 <Link href="/upload" className="hover:underline">
                   Upload
                 </Link>

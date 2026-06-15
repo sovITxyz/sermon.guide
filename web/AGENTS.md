@@ -49,7 +49,7 @@ This is load-bearing; do not weaken it.
   `library.ts` are pure (no `server-only`) so middleware and Vitest can
   import them.
 
-## Editor — TipTap, code-split off non-editor routes (Phase 35)
+## Editor — TipTap, code-split off non-editor routes (Phase 35; autosave Phase 36)
 
 The sermon manuscript editor (`/sermons/[documentId]`) is a headless TipTap
 contenteditable. Locked decisions:
@@ -74,16 +74,48 @@ contenteditable. Locked decisions:
   contenteditable — it renders its own DOM from the ProseMirror document and the
   content round-trips as JSON, never as injected markup. List previews render the
   server-derived `content_text` (`preview` field) as PLAIN TEXT.
-- **Explicit Save only this phase (autosave is Phase 36).** The Save button
-  PATCHes `{title, content: editor.getJSON(), base_updated_at}` through the
-  same-origin `/api/documents/[id]` proxy (which whitelists exactly those three
-  fields — `lib/documents.ts`). On **200** the component adopts the returned
-  `updated_at` as its new in-memory `base_updated_at` (a `useRef`) so a second
-  save from the same tab is never a false self-conflict. On **409** (a write
-  landed elsewhere since this tab loaded) it shows a **non-destructive** inline
-  error and KEEPS the user's buffer — the reload/merge conflict UX is Phase 36.
-  413/404 get their own sensible messages. No autosave, no debounce, no
-  citations.
+- **Autosave (Phase 36, B2 slice C — the editor stops losing work).** No Save
+  button: the editor PATCHes `{title, content: editor.getJSON(),
+  base_updated_at}` through the same-origin `/api/documents/[id]` proxy (which
+  whitelists exactly those three fields — `lib/documents.ts`). The autosave
+  pattern MIRRORS the Phase 33 reader position-persistence loop
+  (`lib/reader-view.ts`: debounce + single-flight + pagehide keepalive +
+  shouldPersist + adopt-server-value); the **pure, easy-to-get-wrong decisions
+  live in `lib/sermon-autosave.ts`** (unit-tested in `test/sermon-autosave.test.ts`)
+  and the **imperative loop (timers + fetch + 409 stop) stays in
+  `components/SermonEditor.tsx`** (component-tested with fake timers in
+  `test/components/SermonEditor.test.tsx`). Locked decisions:
+  - **2 s debounce + 15 s max-interval** (`AUTOSAVE_DEBOUNCE_MS` /
+    `AUTOSAVE_MAX_INTERVAL_MS`). Each edit resets the debounce; the first dirty
+    edit since the last save arms the max-interval ceiling so a writer who never
+    pauses still gets saved. Whichever fires first clears the other.
+  - **ONE in-flight PATCH at a time.** Edits arriving during a flight are
+    COALESCED into a single trailing save fired after it resolves — **never
+    parallel PATCHes** (parallel writes race `base_updated_at` → spurious 409s).
+    Encoded as the `FlightState` machine (`onSaveRequested`/`onFlightSettled`).
+  - **Dirty check** (`isDirty`): an unchanged buffer (e.g. a selection-only
+    `update`) never PATCHes. Compares title + a JSON serialization of content
+    (TipTap returns a fresh object each `getJSON()`).
+  - **Adopt the server value:** after every **200**, adopt the returned
+    `updated_at` as the next `base_updated_at` (a `useRef`); reusing the stale
+    load value manufactures self-conflicts.
+  - **pagehide keepalive flush** via `fetch(..., {keepalive:true})`, only when
+    dirty AND the serialized body is within the **~64 KB keepalive ceiling**
+    (`KEEPALIVE_BODY_LIMIT`, `canKeepaliveFlush`). An oversize doc **SKIPS the
+    flush silently** (status stays unsaved; the next open saves it) instead of
+    throwing. Also flushed on unmount (SPA nav never fires pagehide).
+  - **On 409: status=conflict, STOP the loop, show a banner** offering
+    "Reload latest" — re-GET the doc, reset editor content + title +
+    `base_updated_at` + dirty baseline, then resume. The user's buffer is KEPT
+    until they choose; autosave is gated off (`conflicted` ref) so a stale tab
+    never silently clobbers the other side. 413/404 surface a non-destructive
+    error and autosave retries as the user keeps typing.
+  - **SaveStatus indicator:** `saved` / `saving` / `unsaved` / `error` /
+    `conflict` (an `aria-live="polite"` span with a `data-save-status` hook).
+  - **No api change for the limiter.** PATCH `/documents` has no per-user
+    rate-limit bucket (only signup/login per-IP and search-summary per-user are
+    bucketed), so sustained ~1 PATCH/2s autosave is already unthrottled — see
+    `api/AGENTS.md`. No bucket was added.
 
 ## Tests
 

@@ -16,10 +16,16 @@ import { loginViaUi, makeUser, signUp } from "./support/users";
  *      first tab's autosave fires a 409 -> the inline conflict banner appears
  *      (non-destructive: the first tab's buffer is untouched), and "Reload
  *      latest" recovers the first tab to the second tab's content.
+ *   5. CITATION DRAWER (Phase 37): open the in-editor LibraryDrawer, search the
+ *      library through /api/search (RAW hits, no LLM wait), click a hit to insert
+ *      a `citation` block (cached title + snippet + a Read-in-context deep link),
+ *      let autosave settle, and reload — the node parses on load and persists
+ *      through documents.content JSON.
  *
- * Backend is the in-memory fake api in CI (e2e/support/fake-api.mjs, documents
- * endpoints, with a strictly-monotonic updated_at so the 409 is deterministic)
- * and the real api on the nightly live path.
+ * Backend is the in-memory fake api in CI (e2e/support/fake-api.mjs: documents
+ * endpoints with a strictly-monotonic updated_at so the 409 is deterministic,
+ * plus the Phase-37 /search raw hits + /library owned set) and the real api on
+ * the nightly live path.
  */
 
 const SERMON_TEXT = "The grace of God appears in this manuscript.";
@@ -77,6 +83,54 @@ test("create -> type -> autosave persists the content across reload", async ({ p
   // persisted content.
   await page.reload();
   await expect(editorBody(page)).toContainText(SERMON_TEXT);
+});
+
+test("drawer search inserts a citation block that persists across reload", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/sermons");
+
+  await page.getByRole("button", { name: "New sermon" }).click();
+  await page.waitForURL(/\/sermons\/[^/]+$/);
+
+  // The editor (dynamic-imported) mounts; type a little so the doc is non-empty,
+  // then let autosave settle before opening the drawer.
+  await typeAndAwaitSaved(page, "A sermon about grace.");
+
+  // Open the in-editor LibraryDrawer from the toolbar affordance.
+  await page.getByRole("button", { name: "Cite from your library" }).click();
+
+  // Search the library through the NEW /api/search proxy (raw hits, NO LLM wait —
+  // the drawer settles fast, no minutes-long ticker). The fake api returns
+  // deterministic hits whose book_ids are in the user's /library.
+  await page.getByLabel("Search your library").fill("grace");
+  await page.getByRole("button", { name: "Search" }).click();
+
+  // A hit row renders the title (from the one-shot /library map) + the snippet
+  // (the raw content_chunk) — clicking it inserts the citation node.
+  const hitRow = page.getByTestId("library-drawer-hit").first();
+  await expect(hitRow).toContainText("On Grace");
+  await hitRow.click();
+
+  // The inserted citation block shows the cached title + snippet and, because the
+  // book is in the library, a "Read in context" deep-link to the cited chunk.
+  const card = page.locator('[data-type="citation"]');
+  await expect(card).toContainText("On Grace");
+  await expect(card).toContainText("Grace is the unearned favor of God");
+  await expect(page.getByTestId("citation-read-link")).toHaveAttribute(
+    "href",
+    "/read/11111111-1111-1111-1111-111111111111?chunk=3",
+  );
+
+  // The insert fired the editor `update` -> autosave persists it; wait for saved.
+  await expect(saveStatus(page)).toHaveAttribute("data-save-status", "saved", { timeout: 15_000 });
+
+  // Reload: the server shell re-fetches the doc; the stored citation node parses
+  // on load and re-renders from its cached attrs — the block survives the round
+  // trip through documents.content JSON.
+  await page.reload();
+  const reloaded = page.locator('[data-type="citation"]');
+  await expect(reloaded).toContainText("On Grace");
+  await expect(reloaded).toContainText("Grace is the unearned favor of God");
 });
 
 test("a stale-tab autosave surfaces the 409 conflict and reloads to latest", async ({ page }) => {

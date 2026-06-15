@@ -1,3 +1,4 @@
+import { DRAG_MIME } from "@/lib/calendar-dnd";
 import { type seriesColor as SeriesColorFn, calendarHref } from "@/lib/calendar-view";
 import { monthGrid } from "@/lib/dates";
 import type { CalendarEvent } from "@/lib/types";
@@ -33,6 +34,13 @@ interface MiniMonthProps {
   colorFor: typeof SeriesColorFn;
   /** Today's `YYYY-MM-DD`, to ring the current day. */
   todayStr: string;
+  /**
+   * Drag-to-reschedule (Phase 42): an event row dragged (from its day's popover)
+   * onto another day box moves that event to the box's `YYYY-MM-DD`.
+   * CalendarView applies the move optimistically and PATCHes; a same-day drop is
+   * the owner's no-op.
+   */
+  onMove: (eventId: string, toDate: string) => void;
 }
 
 /**
@@ -43,7 +51,14 @@ interface MiniMonthProps {
  * hover-only affordance, no `dangerouslySetInnerHTML`. The whole month title is
  * a link that drills into the month view.
  */
-export function MiniMonth({ year, month, eventsByDate, colorFor, todayStr }: MiniMonthProps) {
+export function MiniMonth({
+  year,
+  month,
+  eventsByDate,
+  colorFor,
+  todayStr,
+  onMove,
+}: MiniMonthProps) {
   const weeks = monthGrid(year, month);
   const monthName = MONTH_NAMES[month - 1] ?? "";
   const monthAnchor = `${year}-${String(month).padStart(2, "0")}-01`;
@@ -72,6 +87,7 @@ export function MiniMonth({ year, month, eventsByDate, colorFor, todayStr }: Min
             eventsByDate={eventsByDate}
             colorFor={colorFor}
             todayStr={todayStr}
+            onMove={onMove}
           />
         ))}
       </div>
@@ -85,11 +101,13 @@ function MiniWeek({
   eventsByDate,
   colorFor,
   todayStr,
+  onMove,
 }: {
   week: ReturnType<typeof monthGrid>[number];
   eventsByDate: Map<string, CalendarEvent[]>;
   colorFor: typeof SeriesColorFn;
   todayStr: string;
+  onMove: (eventId: string, toDate: string) => void;
 }) {
   return (
     <>
@@ -105,6 +123,7 @@ function MiniWeek({
             isToday={isToday}
             events={events}
             colorFor={colorFor}
+            onMove={onMove}
           />
         );
       })}
@@ -119,6 +138,7 @@ function MiniDay({
   isToday,
   events,
   colorFor,
+  onMove,
 }: {
   date: string;
   day: number;
@@ -126,15 +146,40 @@ function MiniDay({
   isToday: boolean;
   events: CalendarEvent[];
   colorFor: typeof SeriesColorFn;
+  onMove: (eventId: string, toDate: string) => void;
 }) {
   const base = "flex aspect-square flex-col items-center justify-start rounded p-0.5 text-[10px]";
   const tone = inMonth ? "text-gray-700" : "text-gray-300";
   const ring = isToday ? "ring-1 ring-blue-500" : "";
 
-  // Adjacent-month padding cells never carry events — render a bare number.
+  // Drop target: only IN-MONTH boxes accept a drop (adjacent-month padding cells
+  // are inert). preventDefault on dragover is required for `drop` to fire.
+  const dropProps = inMonth
+    ? {
+        onDragOver: (e: React.DragEvent<HTMLElement>) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+        },
+        onDrop: (e: React.DragEvent<HTMLElement>) => {
+          e.preventDefault();
+          const eventId = e.dataTransfer.getData(DRAG_MIME);
+          if (eventId) {
+            onMove(eventId, date);
+          }
+        },
+      }
+    : {};
+
+  // Adjacent-month padding cells (and in-month days with no events) render a
+  // bare number. In-month empty days are still drop targets so an event can be
+  // dragged onto an otherwise-empty day.
   if (!inMonth || events.length === 0) {
     return (
-      <div className={`${base} ${tone} ${ring}`}>
+      <div
+        className={`${base} ${tone} ${ring}`}
+        data-drop-date={inMonth ? date : undefined}
+        {...dropProps}
+      >
         <span>{day}</span>
       </div>
     );
@@ -147,6 +192,8 @@ function MiniDay({
     <details
       className={`group ${base} ${tone} ${ring} cursor-pointer`}
       data-has-events="true"
+      data-drop-date={date}
+      {...dropProps}
       aria-label={`${date}, ${events.length} event${events.length === 1 ? "" : "s"}`}
     >
       <summary className="flex list-none flex-col items-center gap-0.5">
@@ -166,7 +213,17 @@ function MiniDay({
         {events.map((event) => {
           const color = colorFor(event.series);
           return (
-            <li key={event.event_id} className="text-xs">
+            <li
+              key={event.event_id}
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.setData(DRAG_MIME, event.event_id);
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              data-event-chip
+              data-event-id={event.event_id}
+              className="cursor-grab text-xs"
+            >
               <span
                 className={`mr-1 inline-block h-2 w-2 rounded-full align-middle ${color.dot}`}
                 aria-hidden="true"

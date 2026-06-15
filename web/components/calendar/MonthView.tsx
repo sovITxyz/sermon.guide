@@ -1,3 +1,4 @@
+import { DRAG_MIME } from "@/lib/calendar-dnd";
 import type { seriesColor as SeriesColorFn } from "@/lib/calendar-view";
 import { monthGrid } from "@/lib/dates";
 import type { CalendarEvent } from "@/lib/types";
@@ -21,6 +22,12 @@ interface MonthViewProps {
   onCreate: (date: string) => void;
   /** Open the edit/delete popover for an event chip. */
   onEdit: (event: CalendarEvent) => void;
+  /**
+   * Drag-to-reschedule (Phase 42): an event chip dragged onto an in-month day
+   * cell moves that event to the cell's `YYYY-MM-DD`. CalendarView applies the
+   * move optimistically and PATCHes; a same-day drop is the owner's no-op.
+   */
+  onMove: (eventId: string, toDate: string) => void;
 }
 
 /**
@@ -41,6 +48,7 @@ export function MonthView({
   todayStr,
   onCreate,
   onEdit,
+  onMove,
 }: MonthViewProps) {
   const weeks = monthGrid(year, month);
 
@@ -69,6 +77,7 @@ export function MonthView({
                 colorFor={colorFor}
                 onCreate={onCreate}
                 onEdit={onEdit}
+                onMove={onMove}
               />
             );
           }),
@@ -87,6 +96,7 @@ function MonthDay({
   colorFor,
   onCreate,
   onEdit,
+  onMove,
 }: {
   date: string;
   day: number;
@@ -96,13 +106,35 @@ function MonthDay({
   colorFor: typeof SeriesColorFn;
   onCreate: (date: string) => void;
   onEdit: (event: CalendarEvent) => void;
+  onMove: (eventId: string, toDate: string) => void;
 }) {
   const chips = events.slice(0, MAX_CHIPS);
   const overflow = events.length - chips.length;
 
+  // Drop target: only IN-MONTH cells accept a drop (adjacent-month padding
+  // cells are inert). preventDefault on dragover is required for the browser to
+  // fire `drop`; preventDefault on drop stops the browser's default handling.
+  const dropProps = inMonth
+    ? {
+        onDragOver: (e: React.DragEvent<HTMLDivElement>) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+        },
+        onDrop: (e: React.DragEvent<HTMLDivElement>) => {
+          e.preventDefault();
+          const eventId = e.dataTransfer.getData(DRAG_MIME);
+          if (eventId) {
+            onMove(eventId, date);
+          }
+        },
+      }
+    : {};
+
   return (
     <div
       data-has-events={inMonth && events.length > 0 ? "true" : undefined}
+      data-drop-date={inMonth ? date : undefined}
+      {...dropProps}
       className={`min-h-24 border-gray-100 border-r border-b p-1.5 ${
         inMonth ? "bg-white" : "bg-gray-50"
       }`}
@@ -130,10 +162,17 @@ function MonthDay({
             <li key={event.event_id}>
               <button
                 type="button"
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.setData(DRAG_MIME, event.event_id);
+                  e.dataTransfer.effectAllowed = "move";
+                }}
                 onClick={() => onEdit(event)}
                 aria-label={`Edit ${event.title}`}
                 title={event.series ? `${event.title} · ${event.series}` : event.title}
-                className={`block w-full truncate rounded px-1 py-0.5 text-left text-[11px] leading-tight hover:opacity-80 ${color.bg} ${color.text}`}
+                data-event-chip
+                data-event-id={event.event_id}
+                className={`block w-full cursor-grab truncate rounded px-1 py-0.5 text-left text-[11px] leading-tight hover:opacity-80 ${color.bg} ${color.text}`}
               >
                 {event.title}
               </button>

@@ -437,6 +437,94 @@ class Document(Base):
     )
 
 
+class SermonDocRevision(Base):
+    """A prior-content snapshot of a sermon document — docx-import undo (Phase 43).
+
+    The snapshot-first half of the B2 docx round-trip. ``POST
+    /documents/{document_id}/import`` accepts an attacker-controlled .docx,
+    converts it (pandoc + the ``worker.convert`` Node leg) and OVERWRITES
+    ``documents.content``. Before that overwrite, in ONE transaction, the API
+    inserts a row here holding the CURRENT (pre-overwrite) ``content`` /
+    ``content_text`` so an import is never destructive — the prior state is
+    always recoverable.
+
+    ``content`` is the PRIOR ProseMirror/TipTap JSON node tree (JSONB);
+    ``content_text`` is the prior server-derived plain-text projection
+    (re-derived from ``content``, NEVER accepted from the client — same rule
+    as ``Document``). ``schema_version`` mirrors ``documents.schema_version``
+    (server-managed). ``source`` records what triggered the snapshot
+    (DEFAULT ``'import'``).
+
+    ``user_id`` is DENORMALIZED — duplicated from the owning ``documents``
+    row — so the tenant gate filters revisions by the JWT-derived ``user_id``
+    WITHOUT a join back to ``documents`` (which may itself be soft-deleted).
+    Like every user-owned table it MUST be queried scoped to ``user_id``
+    derived from the request's JWT (CLAUDE.md), never from request input.
+
+    Both FKs are ON DELETE CASCADE: a revision is a snapshot OF a document
+    (gone with the document's real row delete — the documents API
+    soft-deletes, so this fires only on a true delete) and is meaningless
+    once its user is gone.
+
+    ``created_at`` has the schema-wide ``server_default=func.now()``; there
+    is no ``updated_at`` — a revision is an immutable snapshot.
+    """
+
+    __tablename__ = "sermon_doc_revisions"
+
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.document_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # DENORMALIZED owner — duplicated from the documents row so the tenant
+    # gate filters here without a join back to documents (which may be
+    # soft-deleted). See class docstring.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # PRIOR (pre-overwrite) ProseMirror/TipTap JSON node tree — the snapshot.
+    content: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    # Prior server-derived plain text; re-derived from ``content``, never
+    # client-supplied (same rule as Document).
+    content_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Mirrors documents.schema_version (server-managed).
+    schema_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("1"),
+    )
+    # What triggered the snapshot — DEFAULT 'import'.
+    source: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'import'"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Revision-history hot path: newest snapshot first per document. The
+        # DESC on ``created_at`` matches the history query's ORDER BY so the
+        # planner walks the index in order; ``document_id`` prefix scopes it.
+        Index(
+            "ix_sermon_doc_revisions_document_created",
+            "document_id",
+            text("created_at DESC"),
+        ),
+    )
+
+
 class SermonEvent(Base):
     """A dated entry on a user's preaching calendar (Phase 38 — B3 slice).
 

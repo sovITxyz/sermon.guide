@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from inference import MissingInferenceKeyError, RemoteInferenceError
 
 import auth
+import calendar_routes
 import documents
 import library
 import reader
@@ -155,6 +156,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(calendar_routes.router)
 app.include_router(documents.router)
 app.include_router(library.router)
 app.include_router(reader.router)

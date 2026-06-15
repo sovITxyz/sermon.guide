@@ -19,6 +19,7 @@ import StarterKit from "@tiptap/starter-kit";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CitationNode } from "./editor/CitationNode";
+import { LibraryDrawer } from "./editor/LibraryDrawer";
 import { LibraryMembershipProvider } from "./editor/library-membership";
 
 /**
@@ -80,6 +81,7 @@ function buildExtensions() {
 export function SermonEditor({
   document: initialDocument,
   ownedBookIds,
+  bookTitles,
 }: {
   document: DocumentFull;
   // The user's owned-`book_id` set, resolved ONCE by the shell's single
@@ -87,14 +89,24 @@ export function SermonEditor({
   // context — so the degraded badge costs ZERO per-citation fetches. Defaults to
   // an empty set (everything degraded) when the shell does not supply one.
   ownedBookIds?: ReadonlySet<string>;
+  // The {book_id -> title} map from the SAME one-shot /library fetch — the only
+  // source of a citation's title (a raw /search hit carries none). Used by the
+  // in-editor LibraryDrawer to cache `bookTitle` at insert. Empty by default.
+  bookTitles?: ReadonlyMap<string, string>;
 }) {
   const [title, setTitle] = useState(initialDocument.title);
   const [status, setStatus] = useState<SaveStatus>("saved");
+  // The LibraryDrawer is opened from a toolbar affordance; closed by default so
+  // the editor opens uncluttered.
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   // Stabilize the membership set so a re-render does not hand the provider a new
   // reference (and re-render every node view). The empty-set fallback keeps the
   // degraded path safe when no set is supplied.
   const membership = useMemo(() => ownedBookIds ?? new Set<string>(), [ownedBookIds]);
+  // Stabilize the title map likewise so the drawer never re-renders on a new
+  // empty-map reference.
+  const titleMap = useMemo(() => bookTitles ?? new Map<string, string>(), [bookTitles]);
 
   // --- autosave machinery (refs so the loop reads fresh values, never stale
   //     closures) -----------------------------------------------------------
@@ -433,10 +445,25 @@ export function SermonEditor({
           1. List
         </ToolbarButton>
 
+        <button
+          type="button"
+          aria-label="Cite from your library"
+          aria-expanded={drawerOpen}
+          disabled={!editor}
+          onClick={() => setDrawerOpen((open) => !open)}
+          className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+        >
+          + Citation
+        </button>
+
         <div className="ml-auto flex items-center gap-3">
           <SaveIndicator status={status} />
         </div>
       </div>
+
+      {drawerOpen ? (
+        <LibraryDrawer editor={editor} bookTitles={titleMap} onClose={() => setDrawerOpen(false)} />
+      ) : null}
 
       <LibraryMembershipProvider ownedBookIds={membership}>
         <EditorContent editor={editor} />

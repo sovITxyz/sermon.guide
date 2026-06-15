@@ -248,8 +248,44 @@ export interface CalendarEvent {
 /**
  * GET /calendar/events response (api/calendar_routes.py
  * CalendarEventListResponse). Just `events`, ordered by `event_date`
- * ascending — no pagination/total.
+ * ascending — no pagination/total. POST /calendar/events also returns this
+ * shape (a LIST even for a single create — a weekly-repeat materializes many
+ * independent rows), so the create proxy/client must read `data.events`.
  */
 export interface CalendarEventListResponse {
   events: CalendarEvent[];
+}
+
+/**
+ * POST /calendar/events body (api/calendar_routes.py CalendarEventCreate,
+ * extra="forbid"). The create proxy forwards ONLY these fields: `event_date`
+ * and `title` are required; `series` and `repeat_weekly_until` are optional and
+ * nullable. `document_id` is DELIBERATELY EXCLUDED here — Phase 40 defers
+ * sermon-linking to Phase 41, so a smuggled `document_id` is dropped by the
+ * whitelist before it can reach the API. `series: null` is a meaningful value
+ * (no series), distinct from omitting the field. Length/range/cap validation
+ * (title 1..512, repeat cap, until >= event_date) is the API's 422 to own.
+ */
+export interface CalendarEventCreate {
+  event_date: string;
+  title: string;
+  series?: string | null;
+  repeat_weekly_until?: string | null;
+}
+
+/**
+ * PATCH /calendar/events/{id} body (api/calendar_routes.py CalendarEventUpdate,
+ * extra="forbid"). All fields are optional; the API's 422 owns the
+ * at-least-one-of rule and length checks. Three-state `series` is preserved:
+ * present-and-null DETACHES the series, present-and-non-null re-links, absent
+ * leaves it alone — so `series` is `string | null` when present, omitted when
+ * absent. `document_id` and `repeat_weekly_until` are DELIBERATELY EXCLUDED:
+ * `document_id` is deferred to Phase 41, and `repeat_weekly_until` is NOT a
+ * PATCH field on the API (materialized rows are independent) — forwarding it
+ * would trip the API's `extra="forbid"` 422. The patch proxy drops both.
+ */
+export interface CalendarEventPatch {
+  event_date?: string;
+  title?: string;
+  series?: string | null;
 }

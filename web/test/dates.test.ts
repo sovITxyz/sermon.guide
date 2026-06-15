@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   WEEK_STARTS_ON,
+  addDays,
   addMonths,
   daysInMonth,
   formatDate,
@@ -10,6 +11,10 @@ import {
   monthsOfYear,
   parseDate,
   today,
+  weekGrid,
+  weekRange,
+  weekStart,
+  weekdayOf,
   weekdayOfFirst,
   yearRange,
 } from "../lib/dates";
@@ -216,5 +221,170 @@ describe("today", () => {
     // regardless of the runner's timezone offset.
     const fixed = new Date(2026, 5, 15, 23, 30); // 2026-06-15 local, late evening
     expect(today(fixed)).toBe("2026-06-15");
+  });
+});
+
+describe("weekdayOf", () => {
+  it("is timezone-immune and matches known weekdays for arbitrary days", () => {
+    // 2026-06-15 is a Monday; 2026-06-14 is a Sunday; 2026-06-20 is a Saturday.
+    expect(weekdayOf(2026, 6, 14)).toBe(0); // Sunday
+    expect(weekdayOf(2026, 6, 15)).toBe(1); // Monday
+    expect(weekdayOf(2026, 6, 20)).toBe(6); // Saturday
+  });
+});
+
+describe("addDays — pure string day arithmetic", () => {
+  it("steps forward and backward within a month", () => {
+    expect(addDays("2026-06-15", 1)).toBe("2026-06-16");
+    expect(addDays("2026-06-15", -1)).toBe("2026-06-14");
+    expect(addDays("2026-06-15", 0)).toBe("2026-06-15");
+  });
+
+  it("rolls forward across a month boundary", () => {
+    // June has 30 days; +1 from the 30th is July 1.
+    expect(addDays("2026-06-30", 1)).toBe("2026-07-01");
+    expect(addDays("2026-06-25", 7)).toBe("2026-07-02");
+  });
+
+  it("rolls backward across a month boundary (borrows the previous month's length)", () => {
+    expect(addDays("2026-07-01", -1)).toBe("2026-06-30");
+    expect(addDays("2026-03-03", -5)).toBe("2026-02-26");
+  });
+
+  it("rolls across a leap-year February correctly", () => {
+    // 2024 is a leap year — Feb 29 exists.
+    expect(addDays("2024-02-28", 1)).toBe("2024-02-29");
+    expect(addDays("2024-02-29", 1)).toBe("2024-03-01");
+    expect(addDays("2024-03-01", -1)).toBe("2024-02-29");
+    // 2026 is NOT a leap year — Feb ends on the 28th.
+    expect(addDays("2026-02-28", 1)).toBe("2026-03-01");
+  });
+
+  it("rolls forward and backward across the year boundary", () => {
+    expect(addDays("2026-12-31", 1)).toBe("2027-01-01");
+    expect(addDays("2027-01-01", -1)).toBe("2026-12-31");
+  });
+
+  it("handles multi-week deltas spanning several months", () => {
+    expect(addDays("2026-01-01", 365)).toBe("2027-01-01"); // 2026 is a common year
+    expect(addDays("2024-01-01", 366)).toBe("2025-01-01"); // 2024 is a leap year
+  });
+
+  it("never parses the string through a Date (canonical YYYY-MM-DD out)", () => {
+    expect(addDays("2026-06-09", 7)).toBe("2026-06-16");
+    expect(addDays("2026-06-09", 7)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+describe("weekStart — Sunday-aligned (WEEK_STARTS_ON)", () => {
+  it("returns the same day when the anchor is already a Sunday", () => {
+    // 2026-06-14 is a Sunday.
+    expect(weekStart("2026-06-14")).toBe("2026-06-14");
+  });
+
+  it("steps back to the containing Sunday for a mid-week anchor", () => {
+    // 2026-06-15 (Mon) … 2026-06-20 (Sat) all belong to the week of 2026-06-14.
+    expect(weekStart("2026-06-15")).toBe("2026-06-14");
+    expect(weekStart("2026-06-17")).toBe("2026-06-14");
+    expect(weekStart("2026-06-20")).toBe("2026-06-14");
+  });
+
+  it("walks back across a month boundary to the previous month's Sunday", () => {
+    // 2026-07-01 is a Wednesday; its week starts Sunday 2026-06-28.
+    expect(weekStart("2026-07-01")).toBe("2026-06-28");
+  });
+
+  it("walks back across a year boundary", () => {
+    // 2027-01-01 is a Friday; its week starts Sunday 2026-12-27.
+    expect(weekStart("2027-01-01")).toBe("2026-12-27");
+  });
+});
+
+describe("weekGrid — 7 consecutive Sunday-first day cells", () => {
+  it("produces exactly 7 contiguous cells starting on the containing Sunday", () => {
+    const grid = weekGrid("2026-06-17"); // Wednesday
+    expect(grid).toHaveLength(7);
+    expect(grid.map((c) => c.date)).toEqual([
+      "2026-06-14",
+      "2026-06-15",
+      "2026-06-16",
+      "2026-06-17",
+      "2026-06-18",
+      "2026-06-19",
+      "2026-06-20",
+    ]);
+    // A week has no borrowed-adjacent-month notion: every cell is in-month.
+    for (const cell of grid) {
+      expect(cell.inMonth).toBe(true);
+      expect(cell.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(cell.day).toBe(parseDate(cell.date).day);
+    }
+  });
+
+  it("spans a month rollover within a single week", () => {
+    // The week of 2026-07-01 (Wed) starts Sunday 2026-06-28 and crosses into July.
+    const grid = weekGrid("2026-07-01");
+    expect(grid.map((c) => c.date)).toEqual([
+      "2026-06-28",
+      "2026-06-29",
+      "2026-06-30",
+      "2026-07-01",
+      "2026-07-02",
+      "2026-07-03",
+      "2026-07-04",
+    ]);
+  });
+
+  it("spans a year rollover within a single week", () => {
+    // The week of 2027-01-01 (Fri) starts Sunday 2026-12-27 and crosses into 2027.
+    const grid = weekGrid("2026-12-31");
+    expect(grid.map((c) => c.date)).toEqual([
+      "2026-12-27",
+      "2026-12-28",
+      "2026-12-29",
+      "2026-12-30",
+      "2026-12-31",
+      "2027-01-01",
+      "2027-01-02",
+    ]);
+  });
+
+  it("the first cell's weekday is always WEEK_STARTS_ON (Sunday)", () => {
+    for (const anchor of ["2026-06-15", "2026-07-01", "2026-12-31", "2024-02-29"]) {
+      const grid = weekGrid(anchor);
+      const first = grid[0];
+      expect(first).toBeDefined();
+      if (!first) {
+        continue;
+      }
+      const { year, month, day } = parseDate(first.date);
+      expect(weekdayOf(year, month, day)).toBe(WEEK_STARTS_ON);
+    }
+  });
+});
+
+describe("weekRange — half-open [start, end) of exactly 7 days", () => {
+  it("starts on the containing Sunday and ends on the FOLLOWING Sunday (exclusive)", () => {
+    // Week containing Wed 2026-06-17: [2026-06-14, 2026-06-21).
+    expect(weekRange("2026-06-17")).toEqual({ start: "2026-06-14", end: "2026-06-21" });
+  });
+
+  it("is exactly 7 days wide (end = start + 7)", () => {
+    const { start, end } = weekRange("2026-06-15");
+    expect(addDays(start, 7)).toBe(end);
+  });
+
+  it("rolls the exclusive end across a month boundary", () => {
+    // Week of 2026-07-01 starts Sunday 2026-06-28, ends Sunday 2026-07-05.
+    expect(weekRange("2026-07-01")).toEqual({ start: "2026-06-28", end: "2026-07-05" });
+  });
+
+  it("rolls across a year boundary", () => {
+    // Week of 2026-12-31 starts Sunday 2026-12-27, ends Sunday 2027-01-03.
+    expect(weekRange("2026-12-31")).toEqual({ start: "2026-12-27", end: "2027-01-03" });
+  });
+
+  it("a Sunday anchor yields the week starting that same day", () => {
+    expect(weekRange("2026-06-14")).toEqual({ start: "2026-06-14", end: "2026-06-21" });
   });
 });

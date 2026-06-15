@@ -1,0 +1,50 @@
+import { getSessionToken } from "@/lib/api-server";
+import { apiBaseUrl } from "@/lib/config";
+import { errorDetail } from "@/lib/http";
+import type { CalendarEventListResponse } from "@/lib/types";
+import { NextResponse } from "next/server";
+
+/**
+ * Proxy GET /calendar/events?start&end with the bearer from the HttpOnly
+ * cookie (Phase 39). Only `start` and `end` are forwarded — built into a FRESH
+ * URLSearchParams, copied verbatim, so nothing else from the incoming query
+ * string ever reaches upstream (the structural-whitelist invariant; never
+ * forward `req.url`'s params wholesale).
+ *
+ * All range validation belongs to the API alone: `start <= end`, and the span
+ * `(end - start).days <= RANGE_CAP_DAYS` (400), are 422s the API owns — this
+ * proxy does NOT pre-check them so there is a single owner of the contract. A
+ * full year (≤ 366 days) fits in one call. The endpoint has no path id, so it
+ * never 404s; non-OK upstream statuses surface the FastAPI `{detail}` as
+ * `{error}`. Per-user data → `cache: "no-store"`.
+ */
+export async function GET(req: Request): Promise<Response> {
+  const token = await getSessionToken();
+  if (!token) {
+    return NextResponse.json({ error: "Not authenticated." }, { status: 401 });
+  }
+
+  const incoming = new URL(req.url).searchParams;
+  const forwarded = new URLSearchParams();
+  for (const key of ["start", "end"] as const) {
+    const value = incoming.get(key);
+    if (value !== null) {
+      forwarded.set(key, value);
+    }
+  }
+  const query = forwarded.toString();
+  const res = await fetch(`${apiBaseUrl()}/calendar/events${query ? `?${query}` : ""}`, {
+    headers: { authorization: `Bearer ${token}` },
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    return NextResponse.json(
+      { error: await errorDetail(res, "Could not load the calendar.") },
+      { status: res.status },
+    );
+  }
+
+  const data = (await res.json()) as CalendarEventListResponse;
+  return NextResponse.json(data);
+}

@@ -1,6 +1,6 @@
 "use client";
 
-import type { DocumentFull } from "@/lib/types";
+import type { DocumentFull, LibraryBookRef } from "@/lib/types";
 import dynamic from "next/dynamic";
 
 /**
@@ -17,11 +17,12 @@ import dynamic from "next/dynamic";
  * import only defers the editor CODE, not the data.
  *
  * Phase 37: the page also fetches the user's library ONCE (one /library call on
- * doc open) and passes the owned-`book_id` set down as `ownedBookIds`. The
- * editor shares it with every citation node view via context, so the
- * degraded-badge decision ("no longer in your library") costs ZERO per-citation
- * fetches. The set arrives as a string[] from the server component (Sets do not
- * cross the RSC boundary) and is rebuilt into a Set here on the client.
+ * doc open) and passes it down as `libraryBooks` ({book_id, title}[] — plain
+ * JSON crosses the RSC boundary, a Set does not). This client shell derives two
+ * shared lookups from it: the owned-`book_id` Set every citation node view reads
+ * via context for the degraded badge (ZERO per-citation fetches), and the
+ * `book_id` -> title map the in-editor LibraryDrawer uses to cache `bookTitle`
+ * into a citation at insert (a raw /search hit carries no title).
  */
 const SermonEditor = dynamic(
   () => import("@/components/SermonEditor").then((mod) => mod.SermonEditor),
@@ -33,10 +34,12 @@ const SermonEditor = dynamic(
 
 export function SermonEditorShell({
   document,
-  ownedBookIds,
+  libraryBooks,
 }: {
   document: DocumentFull;
-  ownedBookIds: readonly string[];
+  libraryBooks: readonly LibraryBookRef[];
 }) {
-  return <SermonEditor document={document} ownedBookIds={new Set(ownedBookIds)} />;
+  const ownedBookIds = new Set(libraryBooks.map((book) => book.book_id));
+  const bookTitles = new Map(libraryBooks.map((book) => [book.book_id, book.title]));
+  return <SermonEditor document={document} ownedBookIds={ownedBookIds} bookTitles={bookTitles} />;
 }

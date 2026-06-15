@@ -176,15 +176,34 @@ export function EditEventPopover({ event, onClose, onSave, onDelete }: EditEvent
 
         <div>
           <label htmlFor={dateId} className="mb-1 block font-medium text-gray-700 text-sm">
-            Date
+            Date <span className="font-normal text-gray-400">(reschedule)</span>
           </label>
-          <input
-            id={dateId}
-            type="date"
-            value={eventDate}
-            onChange={(e) => setEventDate(e.target.value)}
-            className="w-full rounded border border-gray-300 px-2 py-1 text-sm"
-          />
+          {/*
+            Keyboard-accessible reschedule (Phase 42). HTML5 drag-and-drop is
+            mouse-only, so this date control is the REQUIRED accessible path to
+            move an event to another day: pick/type a new date and either Save
+            (saves the whole form) or the dedicated "Move to date" button (which
+            submits the same form → PATCH event_date → refetch + close). On
+            failure the shared inline error below shows and the popover stays
+            open.
+          */}
+          <div className="flex gap-2">
+            <input
+              id={dateId}
+              type="date"
+              value={eventDate}
+              onChange={(e) => setEventDate(e.target.value)}
+              className="w-full rounded border border-gray-300 px-2 py-1 text-sm"
+            />
+            <button
+              type="submit"
+              disabled={busy || eventDate === event.event_date}
+              aria-label="Move to date"
+              className="shrink-0 rounded border border-gray-300 px-3 py-1 text-sm hover:bg-gray-50 disabled:opacity-50"
+            >
+              Move
+            </button>
+          </div>
         </div>
 
         <div>

@@ -5,6 +5,7 @@ import { MiniMonth } from "@/components/calendar/MiniMonth";
 import { MonthView } from "@/components/calendar/MonthView";
 import { QuickCreatePopover } from "@/components/calendar/QuickCreatePopover";
 import { WeekView } from "@/components/calendar/WeekView";
+import { applyMove, rollbackMove } from "@/lib/calendar-dnd";
 import {
   type CalendarState,
   calendarHref,
@@ -88,6 +89,12 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
   const [popover, setPopover] = useState<Popover>({ kind: "none" });
+  // A NON-blocking error for a failed drag-to-reschedule (Phase 42). It is kept
+  // SEPARATE from `status`/`error` on purpose: flipping `status` to "error"
+  // would blank the whole grid, but a rollback must leave the snapped-back chip
+  // ON SCREEN with the error visible beside it. Set on PATCH failure (after the
+  // optimistic move is rolled back), cleared when the next move starts.
+  const [moveError, setMoveError] = useState<string | null>(null);
 
   const mounted = useRef(true);
   useEffect(() => {
@@ -163,6 +170,41 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
   );
   const closePopover = useCallback(() => setPopover({ kind: "none" }), []);
 
+  /**
+   * Drag-to-reschedule (Phase 42). Optimistically move the event to `toDate` in
+   * local state so the chip jumps immediately in WHICHEVER view is active, then
+   * fire EXACTLY ONE PATCH. On success the optimistic state already reflects the
+   * move (no refetch — that would flash the loading state). On failure roll back
+   * to the EXACT prior date (captured BEFORE the optimistic update) and surface a
+   * non-blocking error so the snapped-back chip and the error are both visible.
+   * A drop on the event's current day is a no-op: `applyMove` returns the same
+   * array reference, so we skip both the state churn and the network call.
+   */
+  const onMove = useCallback(
+    async (eventId: string, toDate: string) => {
+      const prior = events.find((e) => e.event_id === eventId);
+      // Capture the EXACT prior date now — rollback restores this, never a
+      // recomputed value. No event found or same-day drop → no PATCH.
+      if (!prior || prior.event_date === toDate) {
+        return;
+      }
+      const priorDate = prior.event_date;
+
+      setMoveError(null);
+      setEvents((evs) => applyMove(evs, eventId, toDate));
+
+      const message = await patchEvent(eventId, { event_date: toDate });
+      if (!mounted.current) {
+        return;
+      }
+      if (message !== null) {
+        setEvents((evs) => rollbackMove(evs, eventId, priorDate));
+        setMoveError(message);
+      }
+    },
+    [events],
+  );
+
   const eventsByDate = groupByDate(events);
 
   return (
@@ -173,6 +215,26 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
         <p role="alert" className="mb-4 text-red-600 text-sm">
           {error}
         </p>
+      ) : null}
+
+      {moveError ? (
+        // A dismissible, NON-blocking banner for a failed drag-to-reschedule:
+        // the grid stays visible (status is still "ready"), so the chip that
+        // snapped back to its original day and this error show together.
+        <div
+          role="alert"
+          className="mb-4 flex items-start justify-between gap-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-red-700 text-sm"
+        >
+          <span>{moveError}</span>
+          <button
+            type="button"
+            onClick={() => setMoveError(null)}
+            aria-label="Dismiss error"
+            className="shrink-0 font-medium text-red-700 hover:text-red-900"
+          >
+            ✕
+          </button>
+        </div>
       ) : null}
 
       {status === "loading" ? (
@@ -194,6 +256,7 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
               eventsByDate={eventsByDate}
               colorFor={seriesColor}
               todayStr={todayStr}
+              onMove={onMove}
             />
           ))}
         </div>
@@ -209,6 +272,7 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
             todayStr={todayStr}
             onCreate={openCreate}
             onEdit={openEdit}
+            onMove={onMove}
           />
         </div>
       ) : null}
@@ -221,6 +285,7 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
           todayStr={todayStr}
           onCreate={openCreate}
           onEdit={openEdit}
+          onMove={onMove}
         />
       ) : null}
 

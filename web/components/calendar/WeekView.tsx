@@ -1,3 +1,4 @@
+import { DRAG_MIME } from "@/lib/calendar-dnd";
 import type { seriesColor as SeriesColorFn } from "@/lib/calendar-view";
 import { type DayCell, parseDate, weekGrid, weekdayOf } from "@/lib/dates";
 import type { CalendarEvent } from "@/lib/types";
@@ -27,6 +28,12 @@ interface WeekViewProps {
   onCreate: (date: string) => void;
   /** Called when an event card is clicked — opens the edit/delete popover. */
   onEdit: (event: CalendarEvent) => void;
+  /**
+   * Drag-to-reschedule (Phase 42): an event card dragged onto a day COLUMN
+   * moves that event to the column's `YYYY-MM-DD`. CalendarView applies the move
+   * optimistically and PATCHes; a same-day drop is the owner's no-op.
+   */
+  onMove: (eventId: string, toDate: string) => void;
 }
 
 /**
@@ -45,6 +52,7 @@ export function WeekView({
   todayStr,
   onCreate,
   onEdit,
+  onMove,
 }: WeekViewProps) {
   const cells = weekGrid(anchor);
 
@@ -62,6 +70,7 @@ export function WeekView({
           colorFor={colorFor}
           onCreate={onCreate}
           onEdit={onEdit}
+          onMove={onMove}
         />
       ))}
     </div>
@@ -75,6 +84,7 @@ function WeekDay({
   colorFor,
   onCreate,
   onEdit,
+  onMove,
 }: {
   cell: DayCell;
   events: CalendarEvent[];
@@ -82,6 +92,7 @@ function WeekDay({
   colorFor: typeof SeriesColorFn;
   onCreate: (date: string) => void;
   onEdit: (event: CalendarEvent) => void;
+  onMove: (eventId: string, toDate: string) => void;
 }) {
   const { year, month, day } = parseDate(cell.date);
   const weekdayLabel = WEEKDAYS[weekdayOf(year, month, day)] ?? "";
@@ -91,6 +102,19 @@ function WeekDay({
   return (
     <div
       data-has-events={events.length > 0 ? "true" : undefined}
+      data-drop-date={cell.date}
+      onDragOver={(e) => {
+        // Allow drop: preventDefault is required for the drop event to fire.
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        const eventId = e.dataTransfer.getData(DRAG_MIME);
+        if (eventId) {
+          onMove(eventId, cell.date);
+        }
+      }}
       className="flex min-h-40 flex-col border-gray-200 border-b bg-white sm:border-r sm:border-b-0 sm:last:border-r-0"
     >
       <div className="flex items-baseline justify-between border-gray-100 border-b bg-gray-50 px-2 py-1">
@@ -111,9 +135,16 @@ function WeekDay({
             <li key={event.event_id}>
               <button
                 type="button"
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.setData(DRAG_MIME, event.event_id);
+                  e.dataTransfer.effectAllowed = "move";
+                }}
                 onClick={() => onEdit(event)}
                 aria-label={`Edit ${event.title}`}
-                className={`block w-full rounded px-1.5 py-1 text-left text-[11px] leading-tight hover:opacity-80 ${color.bg} ${color.text}`}
+                data-event-chip
+                data-event-id={event.event_id}
+                className={`block w-full cursor-grab rounded px-1.5 py-1 text-left text-[11px] leading-tight hover:opacity-80 ${color.bg} ${color.text}`}
               >
                 <span className="block truncate font-medium">{event.title}</span>
                 {event.series ? (

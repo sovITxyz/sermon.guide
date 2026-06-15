@@ -734,6 +734,89 @@ const server = createServer(async (req, res) => {
     return send(res, 200, fullDoc(id, record));
   }
 
+  // --- documents DOCX round-trip (Phase 43) ---------------------------------
+  // GET /documents/{id}/export.docx — streams a STUB .docx (not real OOXML; the
+  // E2E only asserts the proxy forwards the binary content-type + the sanitized
+  // Content-Disposition filename, never that the bytes open in Word). Bearer-
+  // scoped with the SAME uniform 404 for non-owned / unknown / soft-deleted ids.
+  const exportMatch = path.match(/^\/documents\/([^/]+)\/export\.docx$/);
+  if (req.method === "GET" && exportMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(exportMatch[1]);
+    const record = documents.get(id);
+    const visible = record && record.userId === userId && record.deleted_at === null;
+    if (!visible) {
+      return detail(res, 404, "Document not found.");
+    }
+    // The API sanitizes the user-controlled title into the filename; the stub
+    // mirrors a benign sanitized name (no quote/CR/LF/slash) so the proxy has a
+    // realistic Content-Disposition to forward. Real OOXML is not needed.
+    const safeTitle = record.title.replace(/[^A-Za-z0-9 _-]/g, "").trim() || "sermon";
+    const body = Buffer.from(`PK stub-docx for ${id}`);
+    res.writeHead(200, {
+      "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "content-disposition": `attachment; filename="${safeTitle}.docx"`,
+    });
+    return res.end(body);
+  }
+
+  // POST /documents/{id}/import — multipart .docx. The real API runs the
+  // attacker-controlled-upload pipeline (size cap, libmagic docx sniff, /tmp
+  // staging, snapshot-first overwrite); the stub just drains the multipart body
+  // and OVERWRITES content with a deterministic imported TipTap doc, then bumps
+  // updated_at and returns the full document (the editor reloads it as JSON).
+  // Bearer-scoped with the SAME uniform 404. A file named exactly
+  // "reject.docx" returns a 415 so the E2E can assert the visible-error path
+  // (mirrors the API's libmagic 415 on a non-docx upload, surfaced to the user).
+  const importMatch = path.match(/^\/documents\/([^/]+)\/import$/);
+  if (req.method === "POST" && importMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    // Drain the multipart body; capture the filename for the reject sentinel
+    // without a full multipart parse (the boundary carries `filename="…"`).
+    let raw = "";
+    await new Promise((resolve) => {
+      req.on("data", (chunk) => {
+        // Cap what we buffer — only need the headers' filename token.
+        if (raw.length < 4096) {
+          raw += chunk.toString("latin1");
+        }
+      });
+      req.on("end", resolve);
+    });
+    const id = decodeURIComponent(importMatch[1]);
+    const record = documents.get(id);
+    const visible = record && record.userId === userId && record.deleted_at === null;
+    if (!visible) {
+      return detail(res, 404, "Document not found.");
+    }
+    // Reject sentinel: a file the API's libmagic sniff would refuse -> 415.
+    if (/filename="[^"]*reject\.docx"/i.test(raw)) {
+      return detail(res, 415, "Unsupported file type. Upload a .docx document.");
+    }
+    // Overwrite with a deterministic imported TipTap doc (the snapshot-first
+    // prior-content row is the API's job; the stub models only the visible
+    // result the editor reloads).
+    const importedContent = {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [{ type: "text", text: "Imported from a Word document." }],
+        },
+      ],
+    };
+    record.content = importedContent;
+    record.content_text = deriveContentText(importedContent);
+    record.updated_at = nextTimestamp();
+    return send(res, 200, fullDoc(id, record));
+  }
+
   // Health / fallthrough.
   return send(res, 200, { ok: true });
 });

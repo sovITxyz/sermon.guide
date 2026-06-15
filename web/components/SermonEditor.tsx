@@ -60,6 +60,31 @@ import { LibraryMembershipProvider } from "./editor/library-membership";
 
 type SaveStatus = "saved" | "saving" | "error" | "conflict" | "unsaved";
 
+/** A safe default for a downloaded export when the header has no usable name. */
+const DEFAULT_EXPORT_FILENAME = "sermon.docx";
+
+/**
+ * Recover the download filename from a Content-Disposition header (the export
+ * proxy forwards the API's already-sanitized `filename="…"`). Strips any path
+ * separators as defense-in-depth and falls back to a safe constant when the
+ * header is absent or unparseable — the browser only uses this for the saved
+ * file name, never for a request, so a bad value cannot escape the download.
+ */
+function filenameFromDisposition(disposition: string | null): string {
+  if (!disposition) {
+    return DEFAULT_EXPORT_FILENAME;
+  }
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
+  const raw = match?.[1];
+  if (!raw) {
+    return DEFAULT_EXPORT_FILENAME;
+  }
+  // Drop any path segments a crafted header might carry — keep only the basename.
+  const base = raw.split(/[\\/]/).pop() ?? "";
+  const trimmed = base.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_EXPORT_FILENAME;
+}
+
 const CONFLICT_MESSAGE =
   "This sermon was changed in another tab or device since you opened it. " +
   "Autosave is paused so neither side is clobbered. Your edits here are safe — " +
@@ -99,6 +124,17 @@ export function SermonEditor({
   // The LibraryDrawer is opened from a toolbar affordance; closed by default so
   // the editor opens uncluttered.
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // DOCX round-trip (Phase 43) UI state: a visible, dismissable message for an
+  // export/import failure (the API's 404/413/415/502 surfaces here), and a busy
+  // flag that disables both buttons + the file picker during a round-trip so a
+  // user cannot fire overlapping imports. Distinct from the autosave SaveStatus
+  // because a failed export/import must NOT masquerade as a failed save.
+  const [docxError, setDocxError] = useState<string | null>(null);
+  const [docxBusy, setDocxBusy] = useState(false);
+  // The hidden <input type=file> the Import button proxies its click to (the
+  // Uploader sr-only-input pattern). Reset to "" after each pick so re-choosing
+  // the same file re-fires onChange.
+  const importInputRef = useRef<HTMLInputElement>(null);
 
   // Stabilize the membership set so a re-render does not hand the provider a new
   // reference (and re-render every node view). The empty-set fallback keeps the
@@ -353,6 +389,106 @@ export function SermonEditor({
     }
   }, [editor, documentId]);
 
+  // --- DOCX round-trip (Phase 43) ------------------------------------------
+  // Download .docx: fetch the export proxy as a Blob and trigger a browser
+  // download via an object URL, so a 404/502 surfaces as a VISIBLE message
+  // instead of navigating the page away from the editor (a plain <a href> to the
+  // proxy would render the error JSON as a page). The proxy forwards the API's
+  // sanitized Content-Disposition; we recover the filename from it (with a safe
+  // fallback) for the saved file.
+  const onExport = useCallback(async (): Promise<void> => {
+    setDocxError(null);
+    setDocxBusy(true);
+    try {
+      const res = await fetch(`/api/documents/${encodeURIComponent(documentId)}/export`, {
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        let message = "Could not export the sermon.";
+        try {
+          const data = (await res.json()) as { detail?: unknown; error?: unknown };
+          const detail = typeof data.detail === "string" ? data.detail : null;
+          const error = typeof data.error === "string" ? data.error : null;
+          message = detail ?? error ?? message;
+        } catch {
+          // Non-JSON body — keep the generic message.
+        }
+        setDocxError(message);
+        return;
+      }
+      const blob = await res.blob();
+      const filename = filenameFromDisposition(res.headers.get("content-disposition"));
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = window.document.createElement("a");
+        anchor.href = url;
+        anchor.download = filename;
+        window.document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    } catch {
+      setDocxError("Could not export the sermon.");
+    } finally {
+      setDocxBusy(false);
+    }
+  }, [documentId]);
+
+  // Import .docx: POST the chosen file through the import proxy. On success the
+  // API has already SNAPSHOTTED the prior content and OVERWRITTEN the doc, and
+  // returns the full updated document — adopt it into the editor exactly like a
+  // conflict reload (setContent + title + base_updated_at + dirty baseline), so
+  // the editor renders the imported content as TipTap JSON (ZERO
+  // dangerouslySetInnerHTML). On a 4xx/404/502 show the API's reason. Clears any
+  // paused-conflict state because the buffer is now the freshly-imported doc.
+  const onImportFile = useCallback(
+    async (file: File): Promise<void> => {
+      if (!editor) {
+        return;
+      }
+      setDocxError(null);
+      setDocxBusy(true);
+      try {
+        const body = new FormData();
+        body.append("file", file);
+        const res = await fetch(`/api/documents/${encodeURIComponent(documentId)}/import`, {
+          method: "POST",
+          body,
+          cache: "no-store",
+        });
+        if (!res.ok) {
+          let message = "Could not import the document.";
+          try {
+            const data = (await res.json()) as { detail?: unknown; error?: unknown };
+            const detail = typeof data.detail === "string" ? data.detail : null;
+            const error = typeof data.error === "string" ? data.error : null;
+            message = detail ?? error ?? message;
+          } catch {
+            // Non-JSON body — keep the generic message.
+          }
+          setDocxError(message);
+          return;
+        }
+        const imported = (await res.json()) as DocumentFull;
+        editor.commands.setContent(imported.content);
+        setTitle(imported.title);
+        titleRef.current = imported.title;
+        baseUpdatedAt.current = imported.updated_at;
+        lastSaved.current = { title: imported.title, content: imported.content };
+        flight.current = idleFlight();
+        conflicted.current = false;
+        setStatus("saved");
+      } catch {
+        setDocxError("Could not import the document.");
+      } finally {
+        setDocxBusy(false);
+      }
+    },
+    [editor, documentId],
+  );
+
   // Toolbar active-states. useEditorState re-runs the selector on every editor
   // transaction and only re-renders the toolbar when a boolean actually flips —
   // cheaper than re-rendering on every keystroke.
@@ -456,6 +592,44 @@ export function SermonEditor({
           + Citation
         </button>
 
+        {/* DOCX round-trip (Phase 43). Download streams the export proxy as a
+            blob and triggers a browser download; Import proxies its click to the
+            hidden file input below, then POSTs the chosen .docx and reloads the
+            editor with the returned TipTap JSON. Both disable while busy. */}
+        <button
+          type="button"
+          aria-label="Download as Word document"
+          disabled={!editor || docxBusy}
+          onClick={() => void onExport()}
+          className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+        >
+          Download .docx
+        </button>
+        <button
+          type="button"
+          aria-label="Import a Word document"
+          disabled={!editor || docxBusy}
+          onClick={() => importInputRef.current?.click()}
+          className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+        >
+          Import .docx
+        </button>
+        <input
+          ref={importInputRef}
+          type="file"
+          aria-label="Word document to import"
+          accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          className="sr-only"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            // Reset first so re-choosing the same file re-fires onChange.
+            e.target.value = "";
+            if (file) {
+              void onImportFile(file);
+            }
+          }}
+        />
+
         <div className="ml-auto flex items-center gap-3">
           <SaveIndicator status={status} />
         </div>
@@ -486,6 +660,24 @@ export function SermonEditor({
         <p role="alert" className="mt-3 text-red-600 text-sm">
           Could not save the sermon. Your edits here are safe — autosave will retry as you type.
         </p>
+      ) : null}
+
+      {docxError !== null ? (
+        <div
+          role="alert"
+          data-testid="docx-error"
+          className="mt-3 flex items-start justify-between gap-3 rounded-lg border border-red-300 bg-red-50 p-3"
+        >
+          <p className="text-red-700 text-sm">{docxError}</p>
+          <button
+            type="button"
+            aria-label="Dismiss error"
+            onClick={() => setDocxError(null)}
+            className="shrink-0 text-red-700 text-sm hover:underline"
+          >
+            Dismiss
+          </button>
+        </div>
       ) : null}
     </section>
   );

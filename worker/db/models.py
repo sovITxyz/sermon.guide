@@ -27,8 +27,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -352,3 +353,84 @@ class Collection(Base):
     )
 
     __table_args__ = (Index("ix_collections_user_id", "user_id"),)
+
+
+class Document(Base):
+    """A user's sermon document — canonical TipTap/ProseMirror JSON (Phase 34).
+
+    The storage half of the B2 sermon editor (slice A). ``content`` holds the
+    canonical ProseMirror/TipTap node tree as JSONB; ``content_text`` is the
+    server-derived plain-text projection used for list previews and future
+    FTS — it is NEVER accepted from the client, the API re-derives it from
+    ``content`` on every write by walking the node tree. ``schema_version``
+    is server-managed (a module constant in ``api/documents.py``), not
+    client-supplied.
+
+    User-owned like ``highlights``: every query MUST filter by ``user_id``
+    (JWT-derived); a non-owned ``document_id`` is a uniform 404 with no
+    existence oracle (the Phase 20 ``/tasks`` posture). Deletion is soft —
+    ``deleted_at`` flips from NULL (active) to a timestamp; ``POST
+    /documents/{document_id}/restore`` clears it.
+
+    ``updated_at`` carries the repo's ``server_default=func.now()`` for the
+    insert, but has NO ``onupdate`` (the schema-wide convention): PATCH bumps
+    it EXPLICITLY via ``func.now()`` so the value is read back for the
+    single-author optimistic-concurrency ``base_updated_at`` 409 gate. An
+    ``onupdate`` here would silently change the column outside that gate.
+    """
+
+    __tablename__ = "documents"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    # Canonical sermon body — ProseMirror/TipTap JSON node tree (Cross-item
+    # contract). JSONB so the document survives round-trips without the
+    # string-syntax corruption a markdown-canonical form would suffer.
+    content: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    # Server-derived plain text from ``content`` (text-node concatenation,
+    # block nodes joined with newlines). Re-derived on every write; the
+    # client never supplies it. Backs list previews and future FTS.
+    content_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Server-managed ProseMirror schema version (a constant in the API),
+    # never client-supplied.
+    schema_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("1"),
+    )
+    # Soft-delete sentinel: NULL = active, a timestamp = deleted. Restore
+    # clears it back to NULL.
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Hot path: a user's sermon list ordered newest-first. The DESC on
+        # ``updated_at`` matches the list query's ORDER BY so the planner
+        # walks the index in order; ``user_id`` prefix scopes it per tenant.
+        Index(
+            "ix_documents_user_updated",
+            "user_id",
+            text("updated_at DESC"),
+        ),
+    )

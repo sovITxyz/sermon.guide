@@ -276,16 +276,21 @@ export interface CalendarEventCreate {
 /**
  * PATCH /calendar/events/{id} body (api/calendar_routes.py CalendarEventUpdate,
  * extra="forbid"). All fields are optional; the API's 422 owns the
- * at-least-one-of rule and length checks. Three-state `series` is preserved:
- * present-and-null DETACHES the series, present-and-non-null re-links, absent
- * leaves it alone — so `series` is `string | null` when present, omitted when
- * absent. `document_id` and `repeat_weekly_until` are DELIBERATELY EXCLUDED:
- * `document_id` is deferred to Phase 41, and `repeat_weekly_until` is NOT a
- * PATCH field on the API (materialized rows are independent) — forwarding it
- * would trip the API's `extra="forbid"` 422. The patch proxy drops both.
+ * at-least-one-of rule and length checks. Three-state `series` and
+ * `document_id` are preserved: present-and-null DETACHES (series cleared /
+ * sermon unlinked), present-and-non-null re-links, absent leaves it alone — so
+ * each is `string | null` when present, omitted when absent. The API
+ * distinguishes the three states via `model_fields_set`; for `document_id` the
+ * API also ownership-checks a non-null value against the JWT user's documents
+ * (Phase 38) and returns a no-oracle 404 on a cross-tenant/nonexistent id — the
+ * proxy never does that check, it just forwards the value verbatim.
+ * `repeat_weekly_until` stays DELIBERATELY EXCLUDED: it is NOT a PATCH field on
+ * the API (materialized rows are independent) — forwarding it would trip the
+ * API's `extra="forbid"` 422. The patch proxy drops it.
  */
 export interface CalendarEventPatch {
   event_date?: string;
   title?: string;
   series?: string | null;
+  document_id?: string | null;
 }

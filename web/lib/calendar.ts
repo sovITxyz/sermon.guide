@@ -7,11 +7,17 @@ import type { CalendarEventCreate, CalendarEventPatch } from "./types";
  *
  * These mirror lib/documents.ts:whitelistCreateDocument /
  * whitelistPatchDocument — a STRUCTURAL whitelist that re-serializes ONLY the
- * allowed fields into a FRESH object so nothing else reaches the API.
- * Critically, `document_id` is DROPPED by both whitelists: Phase 40 defers
- * sermon-linking to Phase 41, and forwarding it early would re-open the
- * cross-tenant ownership trap the API closed in Phase 38. The PATCH whitelist
- * also drops `repeat_weekly_until` (not a PATCH field on the API — would trip
+ * allowed fields into a FRESH object so nothing else reaches the API. The
+ * CREATE whitelist still DROPS `document_id` (the create-from-date flow POSTs
+ * the document first, then PATCHes the event's `document_id` — link is never
+ * part of the create body). The PATCH whitelist now FORWARDS `document_id` with
+ * the same three-state semantics as `series` (Phase 41 sermon-linking):
+ * present-and-string re-links, present-and-null detaches, absent leaves it
+ * alone. Forwarding the value verbatim is safe because the API ownership-checks
+ * a non-null `document_id` against the JWT user's documents (Phase 38,
+ * `model_fields_set`) and returns a no-oracle 404 on a cross-tenant/nonexistent
+ * id — the proxy must NOT swallow or pre-validate that. The PATCH whitelist
+ * still drops `repeat_weekly_until` (not a PATCH field on the API — would trip
  * `extra="forbid"` with a 422).
  *
  * Checks here are STRUCTURAL only (object-ness + primitive types). Every
@@ -69,14 +75,20 @@ export function whitelistCreateEvent(body: unknown): CalendarBodyResult<Calendar
 
 /**
  * Whitelist for the PATCH /calendar/events/{id} proxy body. Forwards ONLY
- * `event_date`, `title`, and `series` when present; every other key —
- * including `document_id` and `repeat_weekly_until` — is dropped. There is NO
- * required token (unlike documents' `base_updated_at`): calendar events have no
+ * `event_date`, `title`, `series`, and `document_id` when present; every other
+ * key — including `repeat_weekly_until` — is dropped. There is NO required
+ * token (unlike documents' `base_updated_at`): calendar events have no
  * optimistic-concurrency field. An absent optional field is OMITTED from the
  * forwarded body (not sent as null) so the API's three-state PATCH semantics
- * see only what the client set; `series: null` is forwarded verbatim to DETACH
- * the series. The at-least-one-of-field rule and length checks are the API's
- * 422 to own — this layer only guarantees the structural shape.
+ * see only what the client set; `series: null` and `document_id: null` are each
+ * forwarded VERBATIM to DETACH the series / UNLINK the sermon. The check is
+ * pure key-presence (`!== undefined`), NEVER truthiness — a present `null` must
+ * survive to the API (a truthiness guard would silently drop the unlink). A
+ * non-null `document_id` is forwarded as-is: the API (Phase 38) ownership-checks
+ * it against the JWT user's documents and returns a no-oracle 404 on a
+ * cross-tenant/nonexistent id, so the proxy must NOT pre-validate it here. The
+ * at-least-one-of-field rule and length checks are the API's 422 to own — this
+ * layer only guarantees the structural shape.
  */
 export function whitelistPatchEvent(body: unknown): CalendarBodyResult<CalendarEventPatch> {
   const record = asRecord(body);
@@ -101,6 +113,12 @@ export function whitelistPatchEvent(body: unknown): CalendarBodyResult<CalendarE
       return { ok: false, error: "series must be a string or null." };
     }
     out.series = record.series;
+  }
+  if (record.document_id !== undefined) {
+    if (record.document_id !== null && typeof record.document_id !== "string") {
+      return { ok: false, error: "document_id must be a string or null." };
+    }
+    out.document_id = record.document_id;
   }
   return { ok: true, body: out };
 }

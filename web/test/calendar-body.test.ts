@@ -133,12 +133,40 @@ describe("whitelistPatchEvent", () => {
     }
   });
 
-  it("DROPS document_id — Phase 41 deferral", () => {
+  it("forwards a present document_id UUID verbatim to RE-LINK a sermon (Phase 41)", () => {
     const result = whitelistPatchEvent({
       title: "Updated",
       document_id: "11111111-1111-1111-1111-111111111111",
     });
-    expect(result).toEqual({ ok: true, body: { title: "Updated" } });
+    expect(result).toEqual({
+      ok: true,
+      body: { title: "Updated", document_id: "11111111-1111-1111-1111-111111111111" },
+    });
+  });
+
+  it("forwards document_id: null verbatim to UNLINK the sermon (three-state, not truthiness)", () => {
+    // The single most likely Phase 41 defect: a truthiness guard would DROP this
+    // null and silently break unlink. Key-presence must let an explicit null pass.
+    const result = whitelistPatchEvent({ document_id: null });
+    expect(result).toEqual({ ok: true, body: { document_id: null } });
+    if (result.ok) {
+      expect("document_id" in result.body).toBe(true);
+      expect(result.body.document_id).toBeNull();
+    }
+  });
+
+  it("omits document_id when ABSENT — leaves the existing link alone", () => {
+    const result = whitelistPatchEvent({ title: "Updated" });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect("document_id" in result.body).toBe(false);
+    }
+  });
+
+  it("rejects a document_id that is neither string nor null", () => {
+    expect(whitelistPatchEvent({ document_id: 12 }).ok).toBe(false);
+    expect(whitelistPatchEvent({ document_id: {} }).ok).toBe(false);
+    expect(whitelistPatchEvent({ document_id: [] }).ok).toBe(false);
   });
 
   it("DROPS repeat_weekly_until — not a PATCH field on the API (would 422 on extra=forbid)", () => {

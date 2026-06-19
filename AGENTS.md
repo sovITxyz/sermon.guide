@@ -55,9 +55,9 @@ or query params.
 
 Before merging anything that touches a Milvus or DB query, run:
 
-- `/check-tenant-leak` — grep-based audit (Phase 6).
-- `tenant-auditor` subagent — semantic audit (Phase 6).
-- `make test-isolation` in `worker/` — golden isolation test (Phase 3).
+- `/check-tenant-leak` — grep-based audit.
+- `tenant-auditor` subagent — semantic audit.
+- `make test-isolation` in `worker/` — golden isolation test.
 
 If the changes are non-trivial, run all three.
 

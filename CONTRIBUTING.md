@@ -41,8 +41,8 @@ on Debian/Ubuntu, `brew install pandoc` on macOS).
 Run these before pushing. The PR template will ask you to confirm them.
 
 - [ ] **Conventional commits.** `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`. One logical change per commit. No "WIP" or "fixes" commits — squash before opening the PR.
-- [ ] **`/test-isolation`** — if you touched search, auth, or ingestion. Skill ships in Phase 3.
-- [ ] **`/check-tenant-leak`** — if you touched any DB or Milvus query. Skill ships in Phase 6.
+- [ ] **`/test-isolation`** — if you touched search, auth, or ingestion.
+- [ ] **`/check-tenant-leak`** — if you touched any DB or Milvus query.
 - [ ] **`/security-review`** — built-in Claude Code skill. Run for any change handling user input (uploads, search queries, API routes).
 - [ ] **Golden retrieval test added** — if you changed retrieval, ranking, or chunking.
 - [ ] **No variant-file litter.** Files named `*_v2.py`, `*_old.ts`, `*_fixed.tsx`, `*_backup.*`, `*_copy.*` are blocked by pre-commit. If you need to keep an old version around, branch.

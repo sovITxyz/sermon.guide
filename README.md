@@ -4,8 +4,9 @@ Multi-tenant ebook RAG platform for theological libraries and sermon
 preparation. Upload your library; ask natural-language questions; get
 1–2 paragraph grounded summaries with citations back to your own books.
 
-> **Status:** Phase 0 (repo skeleton). See [docs/PHASES.md](./docs/PHASES.md)
-> for current progress and the phased build plan.
+> **Status:** v0 complete; v1/v2 work landed (through Phase 43 merged). See
+> [docs/PHASES.md](./docs/PHASES.md) for the phased build plan and current
+> progress.
 
 ## What it is
 
@@ -16,7 +17,7 @@ preparation. Upload your library; ask natural-language questions; get
 
 For the full picture, read [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-## Quick start (when phases land)
+## Quick start
 
 ### System dependencies
 
@@ -28,31 +29,29 @@ sudo apt install pandoc libmagic1
 ```
 
 On macOS: `brew install pandoc libmagic`. `pandoc` is used for EPUB →
-Markdown conversion (Phase 4); `libmagic` backs `python-magic` for MIME
-sniffing.
+Markdown conversion (and the Phase 43 .docx manuscript round-trip);
+`libmagic` backs `python-magic` for MIME sniffing.
 
 ### Per-package commands
 
 ```bash
-# Phase 1+ : bring infra up
+# bring infra up
 make up
 
-# Phase 2+ : bootstrap Milvus collection
+# bootstrap Milvus collection
 cd worker && uv run python -m worker.scripts.bootstrap_milvus
 
-# Phase 4+ : extract a book to Markdown
+# extract a book to Markdown
 cd worker && uv run python -m extractors path/to/book.epub
 
-# Phase 10+ : run the API
+# run the API
 cd api && uv run uvicorn api.main:app --reload
 
-# Phase 15+ : run the web frontend
+# run the web frontend
 cd web && pnpm dev
 ```
 
-Each phase fills in more of the picture — only some of these commands work
-yet at the current phase. See [docs/PHASES.md](./docs/PHASES.md) for what's
-built and what's next.
+See [docs/PHASES.md](./docs/PHASES.md) for what's built and what's next.
 
 ## Repo map
 

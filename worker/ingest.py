@@ -107,6 +107,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 import dedup
+import obs
 import storage
 from chunking import Chunk, chunk
 from db import Chunk as ChunkRow
@@ -385,10 +386,10 @@ def ingest_markdown(
     ``None`` (manual CLI) keeps the legacy posture.
     """
     title = title if title is not None else filename
-    sig = dedup.signature(markdown)
-    index = dedup_index if dedup_index is not None else dedup.dedup_index()
-
-    existing = index.find_duplicate(sig)
+    with obs.log_stage("dedup"):
+        sig = dedup.signature(markdown)
+        index = dedup_index if dedup_index is not None else dedup.dedup_index()
+        existing = index.find_duplicate(sig)
     if existing is not None:
         # Library row first: a loud backfill failure below still leaves
         # the user's ownership converged (retry is a no-op upsert).
@@ -438,37 +439,42 @@ def ingest_markdown(
     # whose object doesn't exist (crash after upload → orphan object on
     # the claim-less path; claimed re-runs overwrite the same key — see
     # module docstring).
-    text_pointer = (
-        storage.put_original(book_id=book_id, filename=filename, data=original)
-        if original is not None
-        else None
-    )
-    chunks = chunk(markdown)
+    with obs.log_stage("originals_put", book_id=str(book_id)):
+        text_pointer = (
+            storage.put_original(book_id=book_id, filename=filename, data=original)
+            if original is not None
+            else None
+        )
+    with obs.log_stage("chunk", book_id=str(book_id)):
+        chunks = chunk(markdown)
     rows_inserted = 0
     if chunks:
-        embeddings = embed([c.text for c in chunks])
+        with obs.log_stage("embed", book_id=str(book_id)):
+            embeddings = embed([c.text for c in chunks])
         rows = _build_rows(
             filename=filename,
             chunks=chunks,
             embeddings=embeddings,
             book_id=str(book_id),
         )
-        client.insert(collection_name=COLLECTION_NAME, data=rows)
-        client.flush(collection_name=COLLECTION_NAME)
-        client.load_collection(collection_name=COLLECTION_NAME)
+        with obs.log_stage("milvus_insert", book_id=str(book_id)):
+            client.insert(collection_name=COLLECTION_NAME, data=rows)
+            client.flush(collection_name=COLLECTION_NAME)
+            client.load_collection(collection_name=COLLECTION_NAME)
         rows_inserted = len(rows)
 
-    _insert_book_with_chunks(
-        book_id=book_id,
-        title=title,
-        author=author,
-        signature_bytes=dedup.serialize(sig),
-        text_pointer=text_pointer,
-        chunks=chunks,
-        filename=filename,
-    )
-    _upsert_user_library(user_id=user_id, book_id=book_id)
-    index.add(book_id, sig)
+    with obs.log_stage("db_commit", book_id=str(book_id)):
+        _insert_book_with_chunks(
+            book_id=book_id,
+            title=title,
+            author=author,
+            signature_bytes=dedup.serialize(sig),
+            text_pointer=text_pointer,
+            chunks=chunks,
+            filename=filename,
+        )
+        _upsert_user_library(user_id=user_id, book_id=book_id)
+        index.add(book_id, sig)
 
     return IngestResult(
         book_id=book_id,
@@ -494,8 +500,10 @@ def ingest(
     Celery task UUID for the Phase 20 idempotency claim (``None`` on
     the manual CLI path).
     """
+    with obs.log_stage("extract", filename=path.name):
+        markdown = extract(path)
     return ingest_markdown(
-        markdown=extract(path),
+        markdown=markdown,
         filename=path.name,
         user_id=user_id,
         client=client,

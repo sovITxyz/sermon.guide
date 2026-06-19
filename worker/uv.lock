@@ -1556,6 +1556,24 @@ wheels = [
 ]
 
 [[package]]
+name = "sentry-sdk"
+version = "2.63.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ba/c8/b3c970a5b186722d276cd40a05b3254e03bccc0208560aff20f612e018e8/sentry_sdk-2.63.0.tar.gz", hash = "sha256:2a1502bf864769275dbc8c2c9fc7a0f7f5e18358180b615d262d13a31ffba216", size = 912449, upload-time = "2026-06-16T12:45:57.553Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/57/cb205f7d93373120f666b9c5736dc0815524d96a9b278e7a728f018dc22a/sentry_sdk-2.63.0-py3-none-any.whl", hash = "sha256:3a9b5ddd403f79eb73bd670f75f04485819db53d28f76ced7bc09041cb0dfd6a", size = 495950, upload-time = "2026-06-16T12:45:55.819Z" },
+]
+
+[package.optional-dependencies]
+celery = [
+    { name = "celery" },
+]
+
+[[package]]
 name = "sermon-worker"
 version = "0.0.0"
 source = { virtual = "." }
@@ -1578,7 +1596,9 @@ dependencies = [
     { name = "pypandoc" },
     { name = "python-magic" },
     { name = "redis" },
+    { name = "sentry-sdk", extra = ["celery"] },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "structlog" },
     { name = "tokenizers" },
 ]
 
@@ -1609,7 +1629,9 @@ requires-dist = [
     { name = "pypandoc", specifier = ">=1.17,<2" },
     { name = "python-magic", specifier = ">=0.4.27,<0.5" },
     { name = "redis", specifier = ">=5,<9" },
+    { name = "sentry-sdk", extras = ["celery"], specifier = ">=2,<3" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3" },
+    { name = "structlog", specifier = ">=24,<26" },
     { name = "tokenizers", specifier = ">=0.20,<1" },
 ]
 
@@ -1679,6 +1701,15 @@ wheels = [
 [package.optional-dependencies]
 asyncio = [
     { name = "greenlet" },
+]
+
+[[package]]
+name = "structlog"
+version = "25.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ef/52/9ba0f43b686e7f3ddfeaa78ac3af750292662284b3661e91ad5494f21dbc/structlog-25.5.0.tar.gz", hash = "sha256:098522a3bebed9153d4570c6d0288abf80a031dfdb2048d59a49e9dc2190fc98", size = 1460830, upload-time = "2025-10-27T08:28:23.028Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/45/a132b9074aa18e799b891b91ad72133c98d8042c70f6240e4c5f9dabee2f/structlog-25.5.0-py3-none-any.whl", hash = "sha256:a8453e9b9e636ec59bd9e79bbd4a72f025981b3ba0f5837aebf48f02f37a7f9f", size = 72510, upload-time = "2025-10-27T08:28:21.535Z" },
 ]
 
 [[package]]

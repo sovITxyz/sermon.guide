@@ -107,3 +107,7 @@ worker/tests/golden/cache/
 # Drop your own EPUB/PDF in worker/tests/samples/ to enable smoke tests locally.
 worker/tests/samples/*
 !worker/tests/samples/.gitkeep
+
+# k8s — never commit a real Secret (only secret.example.yaml template is tracked)
+infra/k8s/**/secret.yaml
+infra/k8s/**/*.secret.yaml

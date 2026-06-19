@@ -1,0 +1,37 @@
+# Public entrypoint — routes the public host to `web` ONLY. This replaces the
+# compose Caddy TLS-termination role: TLS terminates at the ingress controller
+# with a cert-manager-issued Let's Encrypt cert.
+#
+# The api is DELIBERATELY absent here — it stays ClusterIP-only. A misconfigured
+# Ingress that exposes :8000 would be a tenant-isolation-adjacent leak: the api
+# trusts the rightmost X-Forwarded-For when TRUST_PROXY_HEADERS=true, which is
+# only safe because clients cannot reach it directly.
+#
+# ingressClassName + the cert-manager issuer name are environment-specific —
+# patch them in the overlay. Host is patched per environment too.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: web
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - web.example.com
+      secretName: web-tls
+  rules:
+    - host: web.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 3000

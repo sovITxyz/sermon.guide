@@ -1,0 +1,40 @@
+# Scales the `worker` Deployment on Celery broker queue depth.
+#
+# Queue/list name is CONFIRMED from the codebase: there is no task_routes,
+# no task_default_queue, and no queue= on any apply_async/delay, so all tasks
+# land on Celery's default Redis list `celery` on broker db 0 (matches
+# api/metrics.py `_CELERY_QUEUE_KEY = "celery"`).
+#
+# CAVEAT: LLEN(celery) is an APPROXIMATION — it undercounts in-flight
+# acks_late messages (same caveat api/metrics.py documents). Tune listLength
+# conservatively; a single stuck in-flight task is invisible to LLEN.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+spec:
+  scaleTargetRef:
+    name: worker
+  # §2 locked decision: "scales workers to zero".
+  minReplicaCount: 0
+  # Honest cap for I/O-bound remote-inference ingest.
+  maxReplicaCount: 10
+  pollingInterval: 15
+  # MUST be >= the 300s broker visibility_timeout (worker/celery_app.py) so
+  # KEDA does not scale-to-zero out from under an acks_late in-flight ingest
+  # (minutes long; prefetch=1) that would then be requeued.
+  cooldownPeriod: 300
+  triggers:
+    - type: redis
+      metadata:
+        # Override host/port in the prod overlay (managed Redis endpoint).
+        host: sermon-redis.sermon.svc.cluster.local
+        port: "6379"
+        listName: "celery"
+        # Scale out when more than 5 messages are backlogged per replica.
+        listLength: "5"
+        # SERMON_REDIS broker_db = 0 (NOT 1 = result backend, NOT 2 = limiter).
+        databaseIndex: "0"
+        enableTLS: "false"
+      authenticationRef:
+        name: keda-redis-auth

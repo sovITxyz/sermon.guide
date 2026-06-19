@@ -32,7 +32,12 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0
 WORKDIR /app
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+# Run as the unprivileged `node` user baked into the base image (uid 1000).
+# next.config.ts pins outputFileTracingRoot to web/, so the standalone bundle
+# is flat: server.js sits at the root of .next/standalone. --chown keeps the
+# copied tree owned by node so no root-owned files leak into the runtime.
+COPY --from=builder --chown=node:node /app/.next/standalone ./
+COPY --from=builder --chown=node:node /app/.next/static ./.next/static
+USER node
 EXPOSE 3000
 CMD ["node", "server.js"]

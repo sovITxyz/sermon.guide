@@ -16,8 +16,18 @@
 # the llama-index OpenAI-compatible embedder), which dropped the ~1.5GB
 # torch/sentence-transformers layer and the hf-cache volume. NLTK WordNet
 # (~40MB) IS still baked, so the first dedup signature() never does a
-# runtime download.
+# runtime download. No HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE flags: there is
+# no local model to guard, so they would be inert (kept off deliberately).
+#
+# Phase 29: the DOCX round-trip (convert.py) shells out to a React-free Node
+# CLI (convert_node/cli.mjs, @tiptap/html) — so this image also bakes Node 22
+# and an `npm ci --omit=dev` of the committed convert_node lockfile. The
+# host's convert_node/node_modules is stripped by the root .dockerignore
+# (**/node_modules), so the image rebuilds a clean, platform-correct copy from
+# package.json + package-lock.json (which arrive via COPY worker/). Same
+# recipe as api/Dockerfile — both images run convert.py.
 
+# uv is pinned by digest (no :latest) for reproducible dependency resolution.
 FROM python:3.12-slim AS deps
 COPY --from=ghcr.io/astral-sh/uv:0.11.19 /uv /usr/local/bin/uv
 ENV UV_PYTHON_DOWNLOADS=never \
@@ -28,15 +38,42 @@ COPY worker/pyproject.toml worker/uv.lock ./
 RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim
-# pandoc:    EPUB extraction shells out via pypandoc (extractors/epub.py).
+# pandoc:    EPUB extraction shells out via pypandoc (extractors/epub.py), and
+#            the Phase 43 DOCX round-trip (convert.py) drives it directly.
 # libmagic1: MIME sniffing via python-magic (extractors/extract.py) — NOT
 #            preinstalled on -slim images.
-# ca-certificates: HTTPS to the remote inference endpoint (api.deepinfra.com).
+# ca-certificates: HTTPS to the remote inference endpoint (api.deepinfra.com)
+#            AND to NodeSource for the Node 22 install below.
+# curl + gnupg: pull and trust the NodeSource signing key so we can install a
+#            current Node 22 via a signed-by= apt source (no curl-pipe-bash) —
+#            same recipe as api/Dockerfile.
+# Node 22: the DOCX round-trip's Node leg (convert_node/cli.mjs) needs
+#            @tiptap/html to (de)serialize ProseMirror JSON <-> HTML with the
+#            same extension set as the editor (worker/AGENTS.md "System
+#            binaries"). curl/gnupg are purged after the install to keep the
+#            attack surface and image size down.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pandoc libmagic1 ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        pandoc libmagic1 ca-certificates curl gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    # curl + gnupg were only needed to add the repo; drop them to keep the
+    # runtime surface small. pandoc/libmagic1/nodejs/ca-certificates stay.
+    && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/worker/.venv /app/worker/.venv
 COPY worker/ /app/worker/
+# Rebuild convert_node/node_modules inside the image from the committed
+# lockfile (host node_modules was stripped by .dockerignore). --omit=dev: the
+# bundle has no devDependencies, but the flag keeps it lean if any are added.
+# Pandoc's reference.docx (worker/assets/) and the *.mjs CLI sources arrive via
+# the COPY worker/ above.
+RUN npm ci --omit=dev --prefix /app/worker/convert_node
 ENV PATH="/app/worker/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     NLTK_DATA=/usr/share/nltk_data
@@ -50,6 +87,12 @@ RUN python -m nltk.downloader -d /usr/share/nltk_data wordnet omw-1.4 \
 [(zipfile.ZipFile(z).extractall(z.parent), z.unlink()) \
  for z in pathlib.Path('/usr/share/nltk_data/corpora').glob('*.zip')]"
 WORKDIR /app/worker
+# Drop privileges: the worker only reads its app dir / venv / nltk_data (all
+# world-readable from the root-run COPY + installs above) and writes only to
+# /tmp (pandoc scratch). alembic-migrate and bootstrap-milvus, the image's two
+# alternate one-shot commands, are equally read-only against the filesystem.
+RUN useradd --create-home --uid 10001 worker
+USER worker
 # --concurrency=1: ingest is network-bound now (remote embeddings), not the
 # 3-4GB-resident model loads of the in-process era, but one-at-a-time keeps
 # pandoc/pymupdf CPU spikes and provider request bursts predictable on the

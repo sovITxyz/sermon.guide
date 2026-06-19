@@ -1,0 +1,85 @@
+# One-shot bootstrap Jobs, mirroring the compose "ops" profile one-shots.
+# Run BEFORE the first app rollout (README §"Apply order"):
+#   - migrate         -> alembic upgrade head      (Postgres schema)
+#   - bootstrap-milvus -> create library_vectors    (Milvus collection)
+#
+# Both run on the worker image (it carries alembic + scripts/bootstrap_milvus).
+# Re-running is safe (alembic is idempotent at head; bootstrap is create-if-
+# absent). Delete + re-apply to re-run a completed Job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    app.kubernetes.io/name: migrate
+    app.kubernetes.io/component: ops
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrate
+        app.kubernetes.io/component: ops
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: regcred
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/sovitxyz/sermon-worker:latest
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: sermon-config
+            - secretRef:
+                name: sermon-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bootstrap-milvus
+  labels:
+    app.kubernetes.io/name: bootstrap-milvus
+    app.kubernetes.io/component: ops
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bootstrap-milvus
+        app.kubernetes.io/component: ops
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: regcred
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap-milvus
+          image: ghcr.io/sovitxyz/sermon-worker:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "scripts/bootstrap_milvus.py"]
+          envFrom:
+            - configMapRef:
+                name: sermon-config
+            - secretRef:
+                name: sermon-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL

@@ -1,0 +1,11 @@
+# Feeds the Redis password to the KEDA redis scaler WITHOUT putting it in the
+# ScaledObject. Pulls the existing `sermon-secrets` key — no new secret value.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-redis-auth
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: sermon-secrets
+      key: SERMON_REDIS_PASSWORD

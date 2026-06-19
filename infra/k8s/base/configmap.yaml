@@ -1,0 +1,62 @@
+# Non-secret runtime configuration for the api and worker tiers.
+#
+# NO secrets here — credentials live in the `sermon-secrets` Secret
+# (see secret.example.yaml). Hostnames/ports point at EXTERNAL/managed
+# data stores by default (Postgres/Redis/Milvus); the prod overlay's
+# configMapGenerator patch replaces them with the real endpoints.
+#
+# The placeholder *.sermon.svc.cluster.local names below assume the
+# in-cluster StatefulSet alternative (README §"Data stores"); for managed
+# stores, the overlay overrides each *_HOST with the provider endpoint.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sermon-config
+data:
+  # Phase 18/19 fail-closed posture. NEVER "dev" — the api boot guard keys
+  # the JWT-secret and CORS checks off this. Pinned so it cannot drift.
+  SERMON_API_ENV: "prod"
+
+  # Postgres (external/managed in prod; override host in the overlay).
+  SERMON_POSTGRES_HOST: "sermon-postgres.sermon.svc.cluster.local"
+  SERMON_POSTGRES_PORT: "5432"
+
+  # Redis — also the Celery broker (db 0). Override host in the overlay.
+  SERMON_REDIS_HOST: "sermon-redis.sermon.svc.cluster.local"
+  SERMON_REDIS_PORT: "6379"
+
+  # Milvus vector store. Override host in the overlay (Zilliz/managed).
+  SERMON_MILVUS_HOST: "sermon-milvus.sermon.svc.cluster.local"
+  SERMON_MILVUS_PORT: "19530"
+
+  # Filesystem upload handoff. api writes, the Celery task reads the same
+  # path. In k8s this MUST be a ReadWriteMany PVC shared across api+worker
+  # OR moved to object storage — a node-local emptyDir/hostPath is NOT
+  # visible across pods on different nodes (README §"Shared upload dir").
+  SERMON_API_UPLOAD_DIR: "/data/uploads"
+
+  # api sits behind the web proxy / Ingress and keys rate-limits on the
+  # RIGHTMOST X-Forwarded-For entry. SAFE only because the api has no public
+  # Ingress (ClusterIP-only) — never enable where clients reach :8000.
+  SERMON_API_TRUST_PROXY_HEADERS: "true"
+
+  # Phase 19 guard refuses empty/wildcard/localhost in prod. Set the EXACT
+  # public web origin(s) — overridden in the overlay with the real host.
+  SERMON_API_CORS_ORIGINS: '["https://web.example.com"]'
+
+  # CRITICAL — pinned to `deepinfra`, NOT the compose-prod `google` default.
+  # The compose path (docker-compose.prod.yml) defaults LLM_PROVIDER to
+  # `google`, which 503s /search-summary when GOOGLE_API_KEY is unset. The
+  # k8s deploy reuses DEEPINFRA_API_KEY by pinning deepinfra here so the bug
+  # cannot ride along.
+  SERMON_API_LLM_PROVIDER: "deepinfra"
+
+  # "none" disables the DeepInfra Gemini 2.5 Flash <think> block that would
+  # otherwise inline reasoning into the summary output.
+  SERMON_API_LLM_REASONING_EFFORT: "none"
+
+  # api-layer rate limiting (second layer; Redis db 2). Kill switch + zones.
+  SERMON_API_RATELIMIT_ENABLED: "true"
+  SERMON_API_RATELIMIT_SIGNUP_IP: "5/60"
+  SERMON_API_RATELIMIT_LOGIN_IP: "10/60"
+  SERMON_API_RATELIMIT_SUMMARY_USER: "5/60"

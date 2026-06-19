@@ -1,0 +1,65 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sermon
+
+resources:
+  - ../../base
+
+# Pin to the IMMUTABLE :sha-<full-commit-sha> tag produced by
+# .github/workflows/images.yml (docker/metadata-action type=sha format=long),
+# NOT :latest — reproducible rollouts. Bump these to the deployed commit.
+# Owner is lowercase `sovitxyz` (GHCR rejects mixed case).
+images:
+  - name: ghcr.io/sovitxyz/sermon-api
+    newTag: sha-0000000000000000000000000000000000000000
+  - name: ghcr.io/sovitxyz/sermon-worker
+    newTag: sha-0000000000000000000000000000000000000000
+  - name: ghcr.io/sovitxyz/sermon-web
+    newTag: sha-0000000000000000000000000000000000000000
+
+# Replica counts (worker is OMITTED — KEDA owns it).
+replicas:
+  - name: api
+    count: 3
+  - name: web
+    count: 3
+
+# Patch the non-secret config with the REAL external/managed endpoints and
+# the public web origin. Merges over the base ConfigMap by name.
+patches:
+  - target:
+      kind: ConfigMap
+      name: sermon-config
+    patch: |-
+      - op: replace
+        path: /data/SERMON_POSTGRES_HOST
+        value: "REPLACE_ME.rds.amazonaws.com"
+      - op: replace
+        path: /data/SERMON_REDIS_HOST
+        value: "REPLACE_ME.cache.amazonaws.com"
+      - op: replace
+        path: /data/SERMON_MILVUS_HOST
+        value: "REPLACE_ME.zillizcloud.com"
+      - op: replace
+        path: /data/SERMON_API_CORS_ORIGINS
+        value: '["https://web.example.com"]'
+  # Point the KEDA redis scaler at the same managed Redis endpoint.
+  - target:
+      kind: ScaledObject
+      name: worker
+    patch: |-
+      - op: replace
+        path: /spec/triggers/0/metadata/host
+        value: "REPLACE_ME.cache.amazonaws.com"
+  # Real public host + cluster ingress class / issuer.
+  - target:
+      kind: Ingress
+      name: web
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: "web.example.com"
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: "web.example.com"

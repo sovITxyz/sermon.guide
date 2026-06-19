@@ -216,7 +216,7 @@ services:
       SERMON_API_RATELIMIT_SIGNUP_IP: ${SERMON_API_RATELIMIT_SIGNUP_IP:-5/60}
       SERMON_API_RATELIMIT_LOGIN_IP: ${SERMON_API_RATELIMIT_LOGIN_IP:-10/60}
       SERMON_API_RATELIMIT_SUMMARY_USER: ${SERMON_API_RATELIMIT_SUMMARY_USER:-5/60}
-      SERMON_API_LLM_PROVIDER: ${SERMON_API_LLM_PROVIDER:-google}
+      SERMON_API_LLM_PROVIDER: ${SERMON_API_LLM_PROVIDER:-deepinfra}
       SERMON_API_LLM_MODEL: ${SERMON_API_LLM_MODEL:-}
       # Phase 16b latency lever: "none" disables Gemini 2.5 Flash thinking on
       # Google's OpenAI-compat endpoint (~60s LLM leg → seconds). Empty → not

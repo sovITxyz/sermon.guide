@@ -1,8 +1,9 @@
 # infra/ — agent instructions
 
 Local-development AND v0 single-box production infrastructure for
-sermon.guide. The k8s/KEDA shape stays post-v0
-(see [docs/PHASES.md](../docs/PHASES.md), Beyond Phase 16).
+sermon.guide, plus the provider-portable k8s/KEDA deploy direction in
+`k8s/` (Phase 30). The `docker-compose` files stay the local-dev + single-box
+paths; k8s is additive, not a replacement.
 
 ## What lives here
 
@@ -34,7 +35,17 @@ sermon.guide. The k8s/KEDA shape stays post-v0
 - `env.prod.template` — documents `/opt/sermon/.env.prod` (generated on-box
   by `aws/deploy.sh`). Deliberately NOT dot-env-named so repo tooling can
   read it.
-- Future: `k8s/` Helm values + KEDA scaler config (post-v0).
+- `k8s/` — provider-portable Kubernetes manifests (Phase 30). **Raw manifests
+  + kustomize**, NOT Helm: `base/` holds the workload shapes (api/web/worker
+  Deployments on the Phase 29 GHCR images, Services, web Ingress, the KEDA
+  `ScaledObject` + `TriggerAuthentication`, ConfigMap, secret template), and
+  `overlays/prod/` patches image tags + replica counts + external store
+  endpoints. Apply with `kubectl apply -k` (kustomize is built into kubectl).
+  Data stores (Postgres/Redis/Milvus) are modelled as **external/managed**
+  (endpoints from the ConfigMap, creds from the Secret); in-cluster
+  StatefulSets are the documented self-hosted alternative. See
+  [`k8s/README.md`](./k8s/README.md) for secret creation, the KEDA install
+  command, and the live kind+KEDA scale test (operator/CI step).
 
 ## Conventions
 
@@ -77,3 +88,37 @@ warns if present. Schema docs:
 3. If anything depends on it, add `depends_on: { <svc>: { condition:
    service_healthy } }`.
 4. Run `make down && make up` to confirm the stack is still idempotent.
+
+### k8s manifests (`k8s/`)
+
+- **Raw manifests + kustomize, never Helm.** Layout is `base/` (workload
+  shapes) + `overlays/<env>/` (env patches). The prod overlay owns image-tag
+  pinning, replica counts, and external-store endpoints; `base/` stays
+  cluster-portable (EKS/GKE/AKS/kind).
+- **No committed Secrets, ever.** `base/` ships only a
+  `secret.example.yaml` template (placeholder values, real one gitignored);
+  the real Secret is created out-of-band (`kubectl create secret` /
+  sealed-secrets / SOPS, documented in `k8s/README.md`). Secret values never
+  go in a ConfigMap and are never baked into an image. Non-secret
+  hosts/ports/flags live in the `sermon-config` ConfigMap; all credentials
+  live in the `sermon-secrets` Opaque Secret.
+- **Pin images to the immutable `:sha-<commit>` tag in the prod overlay**, not
+  `:latest`, for reproducible rollouts. The Phase 29 GHCR packages are
+  **private by default** → every app Deployment needs the `regcred`
+  docker-registry `imagePullSecret` or pods `ImagePullBackOff`.
+- **KEDA trigger = Redis scaler, `listName: celery`, `databaseIndex: 0`**
+  (the default Celery queue on the broker DB; matches `api/metrics.py`'s
+  `_CELERY_QUEUE_KEY`). `minReplicaCount: 0` (the §2 scale-to-zero decision),
+  and `cooldownPeriod` MUST be `>=` the 300s broker `visibility_timeout`
+  (`celery_app.py`) with worker `terminationGracePeriodSeconds ~120` (compose
+  parity) so a long `acks_late` ingest is not killed mid-flight.
+- **`SERMON_API_LLM_PROVIDER=deepinfra` is mandatory in the ConfigMap.** The
+  compose prod path defaults this to `google` (the known `/search-summary` 503
+  bug when `GOOGLE_API_KEY` is unset) — the k8s ConfigMap hardcodes
+  `deepinfra` so the bug cannot ride along.
+- **`api` is ClusterIP-only, never an Ingress path browsers hit.** Only `web`
+  is public (Service + Ingress, TLS via cert-manager — replacing compose's
+  Caddy). `worker` has no Service. This preserves the compose invariant that
+  browsers only reach the Next route handlers, which talk to `api` over the
+  cluster network. `api` trusts XFF (`SERMON_API_TRUST_PROXY_HEADERS=true`)
+  only because it has no public Ingress.

@@ -16,7 +16,7 @@ and progress.
 - **worker/** — Python 3.12, uv, ruff (E,F,W,I,B,BLE,TRY,ASYNC,S,ARG,ERA,UP,TID), pyright strict. Ingestion pipeline + Celery workers.
 - **api/** — Python 3.12, FastAPI. Imports `worker.db` (shared models). Same lint/type stack as worker.
 - **web/** — Next.js 15 (app router), TypeScript strict (`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`), Tailwind, Biome, pnpm.
-- **infra/** — docker-compose for v0 (Milvus + etcd + MinIO + Redis + Postgres). K8s/KEDA later.
+- **infra/** — docker-compose for v0 (Milvus + etcd + MinIO + Redis + Postgres); provider-portable k8s manifests + KEDA in `infra/k8s/` (Phase 30).
 
 ## Repo layout & dependency direction
 
@@ -24,7 +24,7 @@ and progress.
 api/    → imports worker.db (shared schema/session)
 worker/ → no upward deps
 web/    → fully independent; talks to api/ over HTTP only
-infra/  → no code; compose files, env templates, future k8s manifests
+infra/  → no code; compose files, env templates, k8s manifests (infra/k8s/, Phase 30)
 ```
 
 `web/` must NEVER import Python packages. `worker/` must NEVER import `api/`.

@@ -38,7 +38,7 @@ either an [Open Question](#7-open-questions) or out of scope for v0.
 | Vector DB             | Milvus, **flat** index                                  | 100% recall and predictable latency once filtered to one tenant's slice |
 | Embedding model       | BGE-Large (1024d), served remotely (DeepInfra, exact weights — ADR 0006) | Best open-weight retrieval quality at the size; identical weights keep every stored vector valid |
 | Inference transport   | Remote APIs for ALL inference (embeddings/rerank/highlight via DeepInfra, LLM via ADR 0005); no in-process weights | Kills ~3.7GB api RSS + ~75s/query CPU + the ~40min/book ingest wall; env-portable (ADR 0006) |
-| Ingestion runtime     | Celery + Redis on Kubernetes with KEDA autoscaling      | Decouples bursty uploads from the API; scales workers to zero           |
+| Ingestion runtime     | Celery + Redis on Kubernetes with KEDA autoscaling      | Decouples bursty uploads from the API; scales workers to zero (realized in `infra/k8s/keda-scaledobject.yaml` — `min=0` on the Celery queue, Phase 30) |
 | EPUB extraction       | EbookLib → pandoc → markdown                            | Avoids Tika's alt-text pollution / metadata leakage                     |
 | PDF extraction        | pymupdf4llm                                             | Markdown-aware, page-structure preserving                               |
 | Format detection      | python-magic                                            | MIME sniff, not extension trust                                         |
@@ -170,7 +170,16 @@ Listed so they aren't accidentally drag-built into earlier phases.
 - Highlight / note import from Kindle, Logos, etc.
 - Per-tenant rate limits and quotas.
 - Hierarchical / parent-document retrieval beyond what semantic chunking gives.
-- KEDA + production k8s manifests. Phase 1 ships `docker-compose` only.
+
+> **Realized in Phase 30 (no longer out of scope):** KEDA + production k8s
+> manifests now live in [`infra/k8s/`](./infra/k8s/) — provider-portable raw
+> manifests + kustomize (`base/` + `overlays/prod/`), running the Phase 29 GHCR
+> images. `api`/`web`/`worker` are Deployments; the `worker` Deployment is
+> autoscaled to zero on Redis Celery-queue depth by a KEDA `ScaledObject`, and
+> the `api` rollout is gated on `/readyz` (held while Postgres/Milvus/Redis are
+> down). The `docker-compose` stack stays the **local-dev** path and
+> `docker-compose.prod.yml` stays the single-box deploy path; k8s is the
+> additive provider-portable direction, not a replacement.
 
 ## 7. Open Questions
 

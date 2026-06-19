@@ -12,6 +12,11 @@ web
 **/.pytest_cache
 **/.ruff_cache
 **/.mypy_cache
+# INTENTIONAL: strip host node_modules (incl. worker/convert_node/node_modules)
+# so the api/worker images rebuild a clean tree via `npm ci` from the committed
+# worker/convert_node/{package.json,package-lock.json}, which sit BESIDE
+# node_modules and are NOT stripped — they arrive via `COPY worker/`. Removing
+# this glob would ship the host's platform-specific node_modules into the image.
 **/node_modules
 **/tests/samples
 .env

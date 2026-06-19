@@ -44,7 +44,9 @@ FROM python:3.12-slim
 #            preinstalled on -slim images.
 # ca-certificates: HTTPS to the remote inference endpoint (api.deepinfra.com)
 #            AND to NodeSource for the Node 22 install below.
-# curl + gnupg: only needed to fetch + verify the NodeSource setup script.
+# curl + gnupg: pull and trust the NodeSource signing key so we can install a
+#            current Node 22 via a signed-by= apt source (no curl-pipe-bash) —
+#            same recipe as api/Dockerfile.
 # Node 22: the DOCX round-trip's Node leg (convert_node/cli.mjs) needs
 #            @tiptap/html to (de)serialize ProseMirror JSON <-> HTML with the
 #            same extension set as the editor (worker/AGENTS.md "System
@@ -53,8 +55,15 @@ FROM python:3.12-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         pandoc libmagic1 ca-certificates curl gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
+    # curl + gnupg were only needed to add the repo; drop them to keep the
+    # runtime surface small. pandoc/libmagic1/nodejs/ca-certificates stay.
     && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/worker/.venv /app/worker/.venv

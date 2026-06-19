@@ -68,6 +68,9 @@ dependencies = [
   # `worker/convert_node/` bundle become api+worker image deps for Phase 29 to
   # bake (Dockerfiles untouched this phase; the dev box already has them).
   "pypandoc>=1.17,<2",
+  "structlog>=24,<26",
+  "prometheus-client>=0.20,<1",
+  "sentry-sdk[fastapi]>=2,<3",
 ]
 
 [dependency-groups]
@@ -109,6 +112,6 @@ pythonVersion = "3.12"
 # `db` and friends live in `../worker`; same rationale as the pytest
 # pythonpath above.
 extraPaths = ["../worker"]
-include = ["main.py", "auth.py", "documents.py", "library.py", "reader.py", "uploads.py", "search.py", "summary.py", "rerank.py", "highlight.py", "readyz.py", "ratelimit.py", "settings.py", "tasks_client.py", "tests"]
+include = ["main.py", "auth.py", "documents.py", "library.py", "reader.py", "uploads.py", "search.py", "summary.py", "rerank.py", "highlight.py", "readyz.py", "ratelimit.py", "metrics.py", "observability.py", "settings.py", "tasks_client.py", "tests"]
 venvPath = "."
 venv = ".venv"

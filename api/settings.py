@@ -178,12 +178,35 @@ class ApiSettings(BaseSettings):
         """
         return None if value == "" else value
 
+    @field_validator("sentry_dsn", mode="before")
+    @classmethod
+    def _empty_sentry_dsn_is_unset(cls, value: object) -> object:
+        """Compose's ``${VAR:-}`` pattern delivers ``""`` for unset — treat as None.
+
+        Without this, an empty SERMON_API_SENTRY_DSN would be a truthy-empty
+        string only by accident; coercing to ``None`` keeps Sentry strictly
+        off-by-default (``init_sentry`` no-ops on falsy DSN) — the Phase 27
+        env-posture risk (never send dev/test traffic upstream).
+        """
+        return None if value == "" else value
+
     # Both keys are read *unprefixed* via an explicit ``validation_alias`` that
     # bypasses the ``SERMON_API_`` prefix above: GOOGLE_API_KEY is the name
     # Google's docs and SDKs use, PPQ_API_KEY is the literal name ppq.ai's docs
     # use (and both match infra/.env.example). ``None`` until configured — the
     # /search-summary route raises a clear 503 naming the missing var rather
     # than letting an unconfigured key surface as an opaque SDK error.
+    # Phase 27 — Sentry DSN (SERMON_API_SENTRY_DSN). OFF BY DEFAULT in dev:
+    # ``None``/empty → ``observability.init_sentry`` is a total no-op (zero
+    # network). The empty-string-is-None validator below means compose's
+    # ``${VAR:-}`` (which delivers ``""``) keeps Sentry off, never accidentally
+    # initializing with an empty DSN. The DSN is a deny-listed log key (it can
+    # embed a project secret), so it never reaches a log line.
+    sentry_dsn: str | None = None
+    # Tracing sampler for Sentry performance (Phase 27). 0.0 = errors only, no
+    # performance traffic — the conservative default; raise per environment.
+    sentry_traces_sample_rate: float = 0.0
+
     google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY")
     ppq_api_key: str | None = Field(default=None, validation_alias="PPQ_API_KEY")
     # Phase 16b: the same key the embeddings/rerank/highlight legs use

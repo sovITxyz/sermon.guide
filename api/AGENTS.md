@@ -591,6 +591,73 @@ same PR, same rule as the `_sanitize_filename` mirror. Runtime needs
 the `libmagic` system library (`api/Dockerfile` installs `libmagic1`;
 GitHub's ubuntu runners ship it).
 
+## Observability — logging, metrics, Sentry (`observability.py` + `metrics.py`, Phase 27)
+
+Three deps, all py.typed (the minio-py rationale): `structlog` (JSON logs +
+contextvars correlation), `prometheus-client` (`/metrics`), `sentry-sdk[fastapi]`
+(env-gated error reporting). The worker mirrors `structlog` + `sentry-sdk[celery]`
+but carries NO `prometheus-client` (no pushgateway, short-lived prefork → not
+scrapable; it emits ingest timings as correlated JSON logs instead).
+
+- **Structured JSON logging.** `observability.configure_logging()` (called at
+  `main.py` import, idempotent) wires `structlog` as a
+  `ProcessorFormatter` on the stdlib ROOT handler with a `foreign_pre_chain`,
+  so EVERY existing `logging.getLogger(__name__).warning(..., exc_info=...)`
+  call (search/readyz/ratelimit/…) renders as one-line JSON AND gets redacted
+  — no call-site change. A structlog-only config would let those lines bypass
+  the deny-list (a leak); the stdlib-bridge test pins it. `ExtraAdder` runs
+  BEFORE `redact_event` in the pre-chain so an `extra={"dsn": ...}` is scrubbed.
+- **Correlation id.** `CorrelationMiddleware` (pure-ASGI, added OUTERMOST in
+  `main.py` so even CORS-rejected/4xx responses get an id) reads inbound
+  `X-Correlation-ID` (or mints `uuid4().hex` when absent/garbage), binds it via
+  `structlog.contextvars` so every log line on the request carries it, echoes it
+  on the response, times the request into `REQUEST_DURATION`, and clears
+  contextvars in a `finally`. It NEVER logs the request body or headers — only
+  the correlation header by name. It propagates into Celery via
+  `tasks_client.enqueue_ingest` (`send_task(headers={CELERY_CORRELATION_KEY: ...})`
+  — task signature unchanged); the worker's `task_prerun` rebinds it.
+- **Redaction deny-list.** `observability.redact_event` (a structlog processor
+  reused as Sentry `before_send`) replaces any value whose KEY contains a
+  deny-listed substring (`authorization`, `token`, `password`, `secret`,
+  `api_key`/`apikey`, `dsn`, `jwt`, `cookie`, …) with `[REDACTED]`. HARD RULES
+  (key-substring matching is belt-and-suspenders, not the primary defense): (1)
+  request bodies are NEVER logged; (2) request headers are never dumped
+  wholesale; (3) JWT claims / the bearer token never enter a log call; (4)
+  Redis/Postgres URLs (password-bearing) are never interpolated into a message;
+  (5) Sentry `send_default_pii=False`. A reviewer MUST verify no new log call
+  interpolates a secret into the MESSAGE text (key matching can't catch that).
+- **`/metrics` (public + unlimited).** Same posture as `/healthz`//`/readyz` —
+  no auth, no rate-limit dependency. `prometheus_client.generate_latest` over
+  the default `REGISTRY`. Collectors (declared ONCE at `metrics.py` scope —
+  re-import must not `Duplicated timeseries`): `REQUEST_DURATION`
+  Histogram{route,method,status} (route = matched APIRoute path TEMPLATE, never
+  the raw path — a UUID-per-label would explode Prometheus memory),
+  `RETRIEVAL_STAGE` Histogram{stage} (embed/dense/sparse/rerank/highlight/llm,
+  timed at the seams in `search.py`/`summary.py`), `RETRIEVAL_DEGRADED`
+  Counter{stage} (incremented at each `run_search` degraded site — the Phase 22
+  trust-gap tell: non-zero under healthy deps = an in-our-code bug), and
+  `CELERY_QUEUE_DEPTH` Gauge{queue} (refreshed on scrape via Redis `LLEN` on the
+  BROKER db 0, fail-soft like `/readyz` — never 500 the scrape). The gauge is a
+  backlog APPROXIMATION: `LLEN` undercounts in-flight `acks_late` messages and
+  ignores non-default queues (documented on the metric).
+- **Sentry.** OFF BY DEFAULT in dev: `init_sentry()` is a total no-op (zero
+  network) when `SERMON_API_SENTRY_DSN` is unset/empty (the empty-string-is-None
+  validator means compose's `${VAR:-}` keeps it off). When set, init runs in the
+  lifespan with `FastApiIntegration`, `send_default_pii=False`, `traces_sample_rate`
+  default 0, `environment=settings.env`, and the `before_send` scrubber.
+- **Mirrored, not imported (dep-direction rule).** `CELERY_CORRELATION_KEY ==
+  "correlation_id"` and the redaction deny-list each have ONE copy in
+  `api/observability.py` and ONE in `worker/obs.py`, each doc-commented as the
+  other's lockstep mirror (the `tasks_client.RedisSettings` /
+  `uploads._ALLOWED_UPLOAD_MIMES` precedent). `worker/obs.py` MUST NOT import
+  from `api/`; `api/observability.py` MUST NOT import `worker.celery_app` or
+  `worker.tasks.*`. Propagation rides Celery MESSAGE HEADERS, so no import
+  boundary or task signature changes. If you change the header/key string or the
+  deny-list on one side, change BOTH — `test_observability_unit.py` asserts the
+  key equality to catch drift. Note: `metrics.py` imports `tasks_client.RedisSettings`
+  LAZILY (inside `_refresh_queue_depth`) to break the `tasks_client → observability
+  → metrics → tasks_client` import cycle.
+
 ## Graceful degradation (Phase 22)
 
 A single dependency blip must not 500 the retrieval path. The contract

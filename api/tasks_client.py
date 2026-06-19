@@ -17,9 +17,14 @@ queue than the worker reads — silent failure mode.
 
 from __future__ import annotations
 
+import uuid
+
+import structlog
 from celery import Celery
 from celery.result import AsyncResult
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from observability import CELERY_CORRELATION_KEY
 
 INGEST_TASK_NAME = "tasks.ingest.ingest_book"
 
@@ -68,10 +73,22 @@ def enqueue_ingest(*, path: str, user_id: str, task_id: str) -> str:
     Celery sees the message. Letting Celery mint it here would reopen
     the crash window where a task runs without an owner row.
     """
+    # Phase 27: propagate the request's correlation id into the Celery message
+    # headers so the worker's ``task_prerun`` signal (``worker/obs.py``) can
+    # bind it and every ingest-stage log line is greppable by the same id the
+    # HTTP request echoed. Read from the structlog contextvars the correlation
+    # middleware bound; a non-HTTP caller (a CLI ``make enqueue``, a manual
+    # run) has nothing bound, so mint a fresh uuid — the worker side ALSO falls
+    # back to a minted id, so a dropped header is never fatal. The task
+    # SIGNATURE (``ingest_book(path, user_id)``) is unchanged: this is a
+    # transport header only.
+    bound = structlog.contextvars.get_contextvars().get("correlation_id")
+    correlation_id = bound if isinstance(bound, str) and bound else uuid.uuid4().hex
     async_result = celery_client.send_task(
         INGEST_TASK_NAME,
         args=[path, user_id],
         task_id=task_id,
+        headers={CELERY_CORRELATION_KEY: correlation_id},
     )
     return async_result.id
 

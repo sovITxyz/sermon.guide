@@ -130,6 +130,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import ratelimit
 from auth import CurrentUserDep, SessionDep
+from metrics import RETRIEVAL_STAGE
 from search import SearchHit, run_search
 from settings import settings
 
@@ -648,11 +649,16 @@ async def search_summary(
     titles = await _resolve_titles(session, [h.book_id for h in hits])
     sources = _build_sources(hits, titles)
 
-    summary_text = await asyncio.to_thread(
-        _generate_summary,
-        query=payload.query,
-        sources=sources,
-    )
+    # Phase 27: time the LLM leg (the 4th sequential inference leg per summary)
+    # into the retrieval-stage histogram as ``stage="llm"``. The ``degraded``
+    # list is copied verbatim from ``run_search`` and its stages are already
+    # counted in ``search.py`` — do NOT double-count here.
+    with RETRIEVAL_STAGE.labels(stage="llm").time():
+        summary_text = await asyncio.to_thread(
+            _generate_summary,
+            query=payload.query,
+            sources=sources,
+        )
     citations = _extract_citations(summary_text, sources)
     # Proceed-with-flag (Phase 22, module docstring): a degraded retrieval
     # still produced tenant-scoped context, so summarize it and let the

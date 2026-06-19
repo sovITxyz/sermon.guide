@@ -29,12 +29,21 @@ import auth
 import calendar_routes
 import documents
 import library
+import metrics
+import observability
 import reader
 import readyz
 import search
 import summary
 import uploads
 from settings import DEV_JWT_SECRET, settings
+
+# Structured JSON logging is configured at import so EVERY module's
+# ``logging.getLogger(__name__)`` (and the redaction deny-list) is live the
+# moment anything logs — before the first request, before the lifespan runs.
+# Idempotent (``configure_logging`` guards re-entry), so test collection that
+# imports ``main`` repeatedly is harmless.
+observability.configure_logging()
 
 
 def _guard_jwt_secret() -> None:
@@ -112,6 +121,12 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """
     _guard_jwt_secret()
     _guard_cors_origins()
+    # Phase 27: env-driven Sentry. No-op when SERMON_API_SENTRY_DSN is unset
+    # (dev default — zero network). Initialized here (after the guards, before
+    # the first request) so the SDK's FastAPI integration captures handler
+    # exceptions; ``send_default_pii=False`` + the redaction ``before_send``
+    # keep tokens/PII/DSNs out of any event.
+    observability.init_sentry()
     yield
 
 
@@ -155,6 +170,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Phase 27 — correlation id + per-route latency. Added AFTER the CORS
+# middleware so it wraps it (Starlette applies the last-added middleware
+# OUTERMOST): even a CORS-rejected / 4xx response still gets an
+# ``X-Correlation-ID`` and is timed into the request-duration histogram. It
+# binds the id via structlog contextvars so every log line on the request
+# carries it, and clears them in a finally. Never logs the body or headers.
+app.add_middleware(observability.CorrelationMiddleware)
+
 app.include_router(auth.router)
 app.include_router(calendar_routes.router)
 app.include_router(documents.router)
@@ -164,6 +187,7 @@ app.include_router(uploads.router)
 app.include_router(search.router)
 app.include_router(summary.router)
 app.include_router(readyz.router)
+app.include_router(metrics.router)
 
 
 @app.get("/healthz", tags=["meta"])

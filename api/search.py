@@ -169,6 +169,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import CurrentUserDep, SessionDep
 from highlight import highlight
+from metrics import RETRIEVAL_DEGRADED, RETRIEVAL_STAGE
 from rerank import RERANK_FANOUT, rerank
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -330,11 +331,40 @@ async def _dense_arm(query: str, book_ids: list[uuid.UUID]) -> list[RetrievalHit
     cancellation re-raises ``CancelledError`` through ``wait_for`` and stays
     flow control (pinned in tests).
     """
-    query_vec = await asyncio.to_thread(_embed_query, query)
-    return await asyncio.wait_for(
-        asyncio.to_thread(_dense_milvus_leg, query_vec, book_ids),
-        timeout=DENSE_ARM_BUDGET_SECONDS,
-    )
+    # Phase 27: per-stage retrieval timing. ``Histogram.time()`` is a sync
+    # context manager that records the wall-clock span on exit — wrapping the
+    # ``await`` measures the leg's real latency (embed remote call; the
+    # budget-bounded Milvus leg) without changing query shape or control flow.
+    with RETRIEVAL_STAGE.labels(stage="embed").time():
+        query_vec = await asyncio.to_thread(_embed_query, query)
+    with RETRIEVAL_STAGE.labels(stage="dense").time():
+        return await asyncio.wait_for(
+            asyncio.to_thread(_dense_milvus_leg, query_vec, book_ids),
+            timeout=DENSE_ARM_BUDGET_SECONDS,
+        )
+
+
+async def _sparse_arm(
+    *,
+    session: AsyncSession,
+    query: str,
+    book_ids: list[uuid.UUID],
+) -> list[RetrievalHit]:
+    """Time the BM25 (sparse) leg into the retrieval-stage histogram (Phase 27).
+
+    A thin timing wrapper around ``bm25_search`` — same tenant-scoped call
+    (``book_id = ANY(book_ids)``), same ``SPARSE_FANOUT`` limit, no query-shape
+    change. ``bm25_search`` is referenced via the module global so the existing
+    ``run_search`` degradation tests (which monkeypatch ``search.bm25_search``)
+    keep working unchanged.
+    """
+    with RETRIEVAL_STAGE.labels(stage="sparse").time():
+        return await bm25_search(
+            session=session,
+            query=query,
+            book_ids=book_ids,
+            limit=SPARSE_FANOUT,
+        )
 
 
 def _to_search_hit(hit: RetrievalHit) -> SearchHit:
@@ -394,6 +424,10 @@ def _surviving_arm_hits(
             exc_info=result,
         )
         degraded.append(arm)
+        # Phase 27: a non-zero counter under healthy deps is the in-our-code-bug
+        # tell (the Phase 22 trust-gap mitigation; api/AGENTS.md "Open trust
+        # gaps"). Incremented at the SAME site that appends to ``degraded``.
+        RETRIEVAL_DEGRADED.labels(stage=arm).inc()
         return []
     return result
 
@@ -441,12 +475,7 @@ async def run_search(
     # one-arm-down failure mode).
     dense_result, sparse_result = await asyncio.gather(
         _dense_arm(query, book_ids),
-        bm25_search(
-            session=session,
-            query=query,
-            book_ids=book_ids,
-            limit=SPARSE_FANOUT,
-        ),
+        _sparse_arm(session=session, query=query, book_ids=book_ids),
         return_exceptions=True,
     )
     degraded: list[str] = []
@@ -483,15 +512,17 @@ async def run_search(
     # nothing thresholds the rerank score (ADR 0006) — ``score`` simply
     # carries RRF semantics, same as ``rerank=false``.
     try:
-        ranked = await asyncio.to_thread(
-            rerank,
-            query=query,
-            hits=fused,
-            top_n=limit,
-        )
+        with RETRIEVAL_STAGE.labels(stage="rerank").time():
+            ranked = await asyncio.to_thread(
+                rerank,
+                query=query,
+                hits=fused,
+                top_n=limit,
+            )
     except RemoteInferenceError:
         logger.warning("rerank failed; falling back to raw RRF top-%d", limit, exc_info=True)
         degraded.append("rerank")
+        RETRIEVAL_DEGRADED.labels(stage="rerank").inc()
         ranked = list(fused[:limit])
 
     # A rerank failure does NOT skip highlight: highlight needs only the
@@ -499,14 +530,16 @@ async def run_search(
     # well. If the rerank failure was a provider outage, this call simply
     # degrades too (same provider) and both flags appear.
     try:
-        pruned = await asyncio.to_thread(
-            highlight,
-            query=query,
-            hits=ranked,
-        )
+        with RETRIEVAL_STAGE.labels(stage="highlight").time():
+            pruned = await asyncio.to_thread(
+                highlight,
+                query=query,
+                hits=ranked,
+            )
     except RemoteInferenceError:
         logger.warning("highlight failed; returning unpruned hits", exc_info=True)
         degraded.append("highlight")
+        RETRIEVAL_DEGRADED.labels(stage="highlight").inc()
         pruned = ranked
 
     return SearchOutcome(hits=[_to_search_hit(h) for h in pruned], degraded=degraded)

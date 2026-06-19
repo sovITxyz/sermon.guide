@@ -418,6 +418,63 @@ claim on the `upload_tasks` row (the row `POST /upload` commits before
   while the first attempt is alive; the claim is task-id-keyed, not
   leased, so attempts can interleave. Same exposure as before Phase 20.
 
+## Observability (Phase 27)
+
+`worker/obs.py` is the worker logging + correlation-id + Sentry foundation.
+It is imported (and its `configure_logging()` + `init_sentry()` called) at the
+top of `worker/celery_app.py` — the Celery entrypoint — so the signal handlers
+register and JSON logging is live the moment `celery -A celery_app worker`
+boots. **`obs.py` MUST NOT import anything from `api/`** (the dep-direction
+rule). The only knowledge shared with the api edge is mirrored, not imported.
+
+**Structured JSON logs.** `configure_logging()` (idempotent) attaches a
+`structlog.stdlib.ProcessorFormatter` to the stdlib root handler with the
+redaction processor in its `foreign_pre_chain`, so the existing
+`logging.getLogger(__name__)` call sites (e.g. `ingest.py`'s
+`logger.warning(..., exc_info=...)`) render as one-line JSON **and** get
+scrubbed without touching any call site.
+
+**Correlation id (mirrored constant).** `CELERY_CORRELATION_KEY =
+"correlation_id"` is the Celery **message-header** key the api enqueues the id
+under (`api/tasks_client.enqueue_ingest` → `send_task(headers=...)`). It is a
+**lockstep mirror** of `api/observability.py` (whose HTTP header is
+`X-Correlation-ID`) — the `tasks_client.RedisSettings` / `storage.sanitize_filename`
+↔ `api/uploads.py` precedent. **Change both sides in the same PR**, or the api
+enqueues a header the worker never reads and correlation silently breaks; a
+unit test (`tests/test_obs_unit.py::test_celery_correlation_key_literal_is_pinned`)
+pins the literal. The `task_prerun` signal reads the header and binds it (plus
+`task_id` + `task_name`) via `structlog.contextvars`; a missing header
+(eager mode, `make enqueue`, manual CLI) **mints a fallback uuid — never
+crashes**; `task_postrun` clears the context.
+
+**Ingest stage timings — the worker metrics surface.** Infra has no
+pushgateway and the prefork child is short-lived, so the worker runs **no**
+Prometheus server and pushes nothing (no `prometheus-client` dep). Each ingest
+stage in `ingest.py` is wrapped in `obs.log_stage(<stage>)`, which emits one
+`{event:"ingest_stage", stage, duration_ms, outcome, ...}` JSON line carrying
+the bound `correlation_id`/`task_id`. Stages: `extract`, `dedup`,
+`originals_put`, `chunk`, `embed`, `milvus_insert`, `db_commit`. Queue depth
+is **not** a worker concern — the api `/metrics` reads Redis `LLEN` on scrape.
+
+**Redaction (mirrored deny-list).** A case-insensitive key-substring deny-list
+(`authorization`, `token`, `password`, `secret`, `api_key`, `dsn`, `jwt`,
+`cookie`, `url`, `uri`, …) replaces matching values with `[REDACTED]` in both
+the log chain and the Sentry `before_send`. **`url`/`uri` are included so a
+Redis/Postgres connection string can never leak its password** — the Phase 18
+invariant that readyz doesn't leak the broker password, extended to all logs.
+Hard rule (convention, not just the deny-list): request bodies/headers, JWTs,
+and connection strings are never passed to a log call in the first place. Keep
+the deny-list in lockstep with `api/observability.py`.
+
+**Sentry — off by default in dev.** `init_sentry()` reads
+`SERMON_WORKER_SENTRY_DSN` via a small `_SentrySettings` (`SERMON_WORKER_`
+prefix; empty-string → `None`) and is a **strict no-op (zero network) when the
+DSN is unset/empty**. When set, it inits with `CeleryIntegration`,
+`send_default_pii=False`, the deny-list `before_send`, and `traces_sample_rate=0`,
+wired per prefork child via `worker_process_init`. The DSN lives on its own
+settings object — `celery_app.RedisSettings` stays byte-identical to the api
+mirror (no new fields).
+
 ## Dedup
 
 `worker/dedup.py` is the MinHash LSH gate that sits between extract and

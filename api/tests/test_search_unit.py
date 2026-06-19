@@ -605,6 +605,41 @@ async def test_run_search_flags_accumulate_in_pipeline_order(
     assert len(outcome.hits) == 1
 
 
+# --- Phase 27: degraded-arm counter increments at the degraded site ----------
+
+
+async def test_run_search_dense_down_increments_degraded_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded dense arm bumps ``RETRIEVAL_DEGRADED{stage="dense"}`` exactly
+    once — the Phase 22 trust-gap tell (a non-zero counter under healthy deps
+    signals an in-our-code bug). Instrumentation is additive: no tenant/
+    query-shape change (the surviving sparse arm still runs with the exact
+    JWT-derived library set, pinned by the sibling degradation tests)."""
+    from metrics import RETRIEVAL_DEGRADED
+
+    before = RETRIEVAL_DEGRADED.labels(stage="dense")._value.get()
+
+    async def _dense(_query: str, _book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        raise MilvusException(message="connection refused: milvus:19530")
+
+    captured: dict[str, Any] = {}
+
+    async def _sparse(**kwargs: Any) -> list[RetrievalHit]:
+        captured["book_ids"] = list(kwargs["book_ids"])
+        return [_hit(uuid.UUID(int=1), 3, score=0.4)]
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+
+    outcome = await _run()
+    assert outcome.degraded == ["dense"]
+    after = RETRIEVAL_DEGRADED.labels(stage="dense")._value.get()
+    assert after == before + 1
+    # Tenant pin: degradation never widened scope — same JWT-derived library.
+    assert captured["book_ids"] == _LIBRARY
+
+
 def test_search_response_degraded_defaults_to_empty() -> None:
     """The Phase 22 field is additive: always present, ``[]`` when healthy."""
     resp = search_module.SearchResponse(hits=[])

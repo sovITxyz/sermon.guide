@@ -58,6 +58,19 @@ from __future__ import annotations
 from celery import Celery
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+import obs
+
+# Phase 27 observability: this module is the Celery entrypoint loaded by
+# `celery -A celery_app worker`, so importing obs here registers its
+# task_prerun/postrun + worker_process_init signal handlers and configures
+# structured JSON logging the moment the worker boots. configure_logging is
+# idempotent; init_sentry is a no-op unless SERMON_WORKER_SENTRY_DSN is set
+# (the per-fork worker_process_init signal also calls it). RedisSettings below
+# stays byte-identical to the api mirror — the Sentry DSN lives on a SEPARATE
+# settings object in obs.py, never on the broker settings.
+obs.configure_logging()
+obs.init_sentry()
+
 
 class RedisSettings(BaseSettings):
     """Broker / backend connection settings from ``SERMON_REDIS_*``."""

@@ -11,6 +11,11 @@ import Python packages (root `CLAUDE.md` dep-direction rule).
   committed and CI runs `--frozen-lockfile`; regenerate with pnpm 9 (CI pins
   pnpm 9 via `pnpm/action-setup` — do **not** add a `packageManager` field to
   `package.json`, it conflicts with that pin).
+- **Dev-server port — :3000 is occupied on the dev box.** `pnpm dev` defaults
+  to :3000, which conflicts with another long-running service there; run
+  `pnpm dev --port 3001` instead. (E2E uses its own :3100 — see the E2E
+  section below.) **Never `pkill -f 'next dev'` unqualified** — it can kill
+  unrelated dev servers; stop the dev server by its specific PID/port.
 - `pnpm typecheck` → `tsc --noEmit`. `pnpm lint` → `biome check`.
   `pnpm format` → `biome check --write` (formats + safe fixes + import sort).
 - `tsconfig.json` is strict plus `noUncheckedIndexedAccess`,

@@ -41,6 +41,9 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
                 <Link href="/upload" className="hover:underline">
                   Upload
                 </Link>
+                <Link href="/settings/integrations" className="hover:underline">
+                  Settings
+                </Link>
                 <LogoutButton />
               </div>
             ) : null}

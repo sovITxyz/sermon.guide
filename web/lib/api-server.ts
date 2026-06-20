@@ -7,6 +7,8 @@ import type {
   DocumentFull,
   DocumentListItem,
   DocumentListResponse,
+  IntegrationConnection,
+  IntegrationsResponse,
   LibraryBook,
   LibraryResponse,
 } from "./types";
@@ -110,4 +112,33 @@ export async function getDocument(documentId: string): Promise<DocumentFull> {
     throw new Error(`Document fetch failed (${res.status}).`);
   }
   return (await res.json()) as DocumentFull;
+}
+
+/**
+ * Fetch the authenticated user's OAuth connections (Phase 44), server-side,
+ * attaching the bearer from the HttpOnly cookie. The token never reaches the
+ * browser. The response carries NO token material — only `provider`,
+ * `provider_account_email`, `scopes`, and timestamps (api/integrations.py).
+ * Returns `[]` when nothing is connected; raises `UnauthenticatedError` on a
+ * 401 so the /settings/integrations server component can redirect to /login.
+ * Mirrors getDocuments().
+ */
+export async function getIntegrations(): Promise<IntegrationConnection[]> {
+  const token = await getSessionToken();
+  if (!token) {
+    throw new UnauthenticatedError();
+  }
+  const res = await fetch(`${apiBaseUrl()}/integrations`, {
+    headers: { authorization: `Bearer ${token}` },
+    // Per-user data — never cache across requests.
+    cache: "no-store",
+  });
+  if (res.status === 401) {
+    throw new UnauthenticatedError();
+  }
+  if (!res.ok) {
+    throw new Error(`Integrations fetch failed (${res.status}).`);
+  }
+  const data = (await res.json()) as IntegrationsResponse;
+  return data.connections;
 }

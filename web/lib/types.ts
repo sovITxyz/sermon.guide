@@ -294,3 +294,38 @@ export interface CalendarEventPatch {
   series?: string | null;
   document_id?: string | null;
 }
+
+/**
+ * One OAuth connection (api/integrations.py — GET /integrations list item).
+ * Field names/casing match the FastAPI JSON verbatim. This is the ONLY
+ * connection projection that ever crosses the wire: it carries `provider`, the
+ * `provider_account_email` fetched from the provider's userinfo endpoint (the
+ * single token-derived value the API ever returns), the granted `scopes`, and
+ * two timestamps. There are NO token fields — neither the refresh nor the
+ * access token, nor any ciphertext, ever leaves the API. `connected_at` is the
+ * row's `created_at`; `token_expiry` is the stored access token's expiry (null
+ * when none is stored). There is NO `user_id` — the response is tenant-scoped
+ * server-side via the JWT.
+ */
+export interface IntegrationConnection {
+  provider: string;
+  provider_account_email: string;
+  scopes: string;
+  connected_at: string;
+  token_expiry: string | null;
+}
+
+/** GET /integrations response (api/integrations.py list wrapper). */
+export interface IntegrationsResponse {
+  connections: IntegrationConnection[];
+}
+
+/**
+ * POST /integrations/{provider}/authorize response (api/integrations.py). The
+ * API mints the state HMAC + PKCE challenge and stores the verifier server-side
+ * (Redis), then returns the provider auth URL the browser is sent to. No token
+ * material is involved — this is the kickoff before any consent.
+ */
+export interface AuthorizeResponse {
+  authorize_url: string;
+}

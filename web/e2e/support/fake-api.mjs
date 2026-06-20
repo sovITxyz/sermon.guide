@@ -41,6 +41,13 @@ import { createServer } from "node:http";
 const PORT = Number(process.env.PORT ?? process.env.FAKE_API_PORT ?? 8081);
 const HOST = process.env.HOST ?? "127.0.0.1";
 
+// The WEB origin this fake api drives the OAuth callback back to (Phase 44). In
+// the real flow Google top-level-redirects the browser to the operator-
+// registered web redirect URI; the stub `/oauth/consent` below stands in for
+// Google's consent screen and 302s straight back to that callback with a
+// deterministic code+state. Playwright sets this to the dev-server origin.
+const WEB_ORIGIN = process.env.E2E_WEB_ORIGIN ?? "http://127.0.0.1:3100";
+
 /** email -> { userId, password } */
 const users = new Map();
 /** token -> userId */
@@ -55,8 +62,34 @@ const tasks = new Map();
  */
 const documents = new Map();
 
+/**
+ * OAuth connections store (Phase 44 — backs /integrations). Keyed
+ * `${userId}:${provider}` so a reconnect overwrites in place (the real api's
+ * ON CONFLICT(user_id, provider) upsert). The wire shape carries NO token
+ * material — only the provider, the account email fetched from the stubbed
+ * userinfo, the scopes, and timestamps. The stub never stores or returns a
+ * refresh/access token (the real vault encrypts those; the web layer never sees
+ * them), so there is nothing token-shaped here to leak.
+ *
+ * `${userId}:${provider}` -> { provider, provider_account_email, scopes,
+ *                              connected_at, token_expiry }.
+ */
+const oauthConnections = new Map();
+
+/**
+ * One-shot PKCE/state surrogates the stub mints at authorize and pops at
+ * callback. The real api stores the PKCE verifier in Redis keyed by the state
+ * nonce and validates the state HMAC + account binding before any token
+ * exchange; the stub models only the SINGLE-USE, account-bound behavior the
+ * E2E can observe: `state` -> { userId } popped on first callback. A second
+ * redemption (or a state minted for a different user) 400s. `state` -> { userId,
+ * provider }.
+ */
+const oauthStates = new Map();
+
 const PREVIEW_CHARS = 280;
 const SCHEMA_VERSION = 1;
+const OAUTH_SCOPES = "openid email profile https://www.googleapis.com/auth/drive.file";
 
 /**
  * Trivial plain-text projection of a ProseMirror/TipTap content tree — the
@@ -815,6 +848,121 @@ const server = createServer(async (req, res) => {
     record.content_text = deriveContentText(importedContent);
     record.updated_at = nextTimestamp();
     return send(res, 200, fullDoc(id, record));
+  }
+
+  // --- integrations / OAuth vault (Phase 44) --------------------------------
+  // GET /integrations — the JWT user's connections, NO token material. POST
+  // /integrations/{provider}/authorize — mint a one-shot state and return an
+  // authorize_url pointing at the stub consent screen below. DELETE
+  // /integrations/{provider} — revoke (delete the row); uniform 404 when the
+  // user has no such connection.
+  if (req.method === "GET" && path === "/integrations") {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const connections = [];
+    for (const [key, record] of oauthConnections) {
+      if (key.startsWith(`${userId}:`)) {
+        connections.push(record);
+      }
+    }
+    return send(res, 200, { connections });
+  }
+
+  const authorizeMatch = path.match(/^\/integrations\/([^/]+)\/authorize$/);
+  if (req.method === "POST" && authorizeMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const provider = decodeURIComponent(authorizeMatch[1]);
+    // The real api 503s when the provider/enc-key is unconfigured and 404s an
+    // unknown provider; the web proxy already 404s a non-allow-set provider, so
+    // here we only model the happy path for `google`.
+    if (provider !== "google") {
+      return detail(res, 404, "Unknown provider.");
+    }
+    // Mint a single-use, account-bound state surrogate. The authorize_url points
+    // at the stub consent screen, which 302s back to the WEB callback with this
+    // code+state (standing in for Google's top-level redirect).
+    const state = randomUUID();
+    oauthStates.set(state, { userId, provider });
+    const consent = new URL(`http://${HOST}:${PORT}/oauth/consent`);
+    consent.searchParams.set("state", state);
+    consent.searchParams.set("provider", provider);
+    return send(res, 200, { authorize_url: consent.toString() });
+  }
+
+  // Stub consent screen — stands in for Google's accounts.google.com top-level
+  // redirect. It immediately 302s the BROWSER back to the operator-registered
+  // web callback (WEB_ORIGIN) with a deterministic code + the minted state, so
+  // the E2E never needs a real Google round-trip.
+  if (req.method === "GET" && path === "/oauth/consent") {
+    const state = url.searchParams.get("state");
+    const provider = url.searchParams.get("provider") ?? "google";
+    const callback = new URL(`${WEB_ORIGIN}/api/integrations/${provider}/callback`);
+    callback.searchParams.set("code", `stub-code-${randomUUID()}`);
+    if (state) {
+      callback.searchParams.set("state", state);
+    }
+    res.writeHead(302, { location: callback.toString() });
+    return res.end();
+  }
+
+  const callbackMatch = path.match(/^\/integrations\/([^/]+)\/callback$/);
+  if (req.method === "GET" && callbackMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const provider = decodeURIComponent(callbackMatch[1]);
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    if (!code || !state) {
+      return detail(res, 400, "Missing code or state.");
+    }
+    // SINGLE-USE + ACCOUNT-BINDING (the phase's whole point): pop the state and
+    // require it was minted for THIS user. A replayed state (already popped) or
+    // a cross-user state both 400 — BEFORE any "token exchange". The real api
+    // does the HMAC + exp + PKCE + user_id compare; the stub models the
+    // observable single-use + binding rejection.
+    const minted = oauthStates.get(state);
+    oauthStates.delete(state);
+    if (!minted || minted.userId !== userId || minted.provider !== provider) {
+      return detail(res, 400, "Invalid or expired state.");
+    }
+    // "Exchange" the code + "fetch userinfo": a deterministic account email
+    // derived from the user so reconnect overwrites in place. NO token is ever
+    // surfaced — the row stores only the email/scopes/timestamps.
+    const now = nextTimestamp();
+    const email = `oauth-${userId.slice(0, 8)}@example.com`;
+    oauthConnections.set(`${userId}:${provider}`, {
+      provider,
+      provider_account_email: email,
+      scopes: OAUTH_SCOPES,
+      connected_at: now,
+      token_expiry: null,
+    });
+    return send(res, 200, { provider, provider_account_email: email });
+  }
+
+  const revokeMatch = path.match(/^\/integrations\/([^/]+)$/);
+  if (req.method === "DELETE" && revokeMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const provider = decodeURIComponent(revokeMatch[1]);
+    const key = `${userId}:${provider}`;
+    // No connection for this user/provider collapses to the uniform 404 (no
+    // existence oracle — same as a cross-tenant id).
+    if (!oauthConnections.has(key)) {
+      return detail(res, 404, "Integration not found.");
+    }
+    oauthConnections.delete(key);
+    res.writeHead(204);
+    return res.end();
   }
 
   // Health / fallthrough.

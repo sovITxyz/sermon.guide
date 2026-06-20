@@ -28,6 +28,7 @@ from inference import MissingInferenceKeyError, RemoteInferenceError
 import auth
 import calendar_routes
 import documents
+import integrations
 import library
 import metrics
 import observability
@@ -36,6 +37,7 @@ import readyz
 import search
 import summary
 import uploads
+from crypto_vault import OAuthUnconfiguredError
 from settings import DEV_JWT_SECRET, settings
 
 # Structured JSON logging is configured at import so EVERY module's
@@ -150,6 +152,24 @@ async def missing_inference_key_handler(
     )
 
 
+@app.exception_handler(OAuthUnconfiguredError)
+async def oauth_unconfigured_handler(
+    _request: Request,
+    exc: OAuthUnconfiguredError,
+) -> JSONResponse:
+    """Unset Google client id/secret or token-enc key → 503: unconfigured, not broken.
+
+    Mirrors the ``MissingInferenceKeyError`` -> 503 posture: the OAuth surface
+    validates its env vars ON USE (never at boot, so the app starts without
+    Google), and an OAuth route hit while unconfigured returns a 503 whose
+    detail names the missing env var but never a value.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": str(exc)},
+    )
+
+
 @app.exception_handler(RemoteInferenceError)
 async def remote_inference_failed_handler(
     _request: Request,
@@ -181,6 +201,7 @@ app.add_middleware(observability.CorrelationMiddleware)
 app.include_router(auth.router)
 app.include_router(calendar_routes.router)
 app.include_router(documents.router)
+app.include_router(integrations.router)
 app.include_router(library.router)
 app.include_router(reader.router)
 app.include_router(uploads.router)

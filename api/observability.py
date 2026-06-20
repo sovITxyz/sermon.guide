@@ -94,6 +94,16 @@ _DENY_SUBSTRINGS = (
     "jwt",
     "cookie",
     "set-cookie",
+    # Phase 44 — OAuth vault belt-and-suspenders. The first three are already
+    # caught by ``token``/``secret``; spelling them out is documentation-as-code
+    # (and a guard if ``token`` is ever narrowed). ``code_verifier`` is the one
+    # genuinely-new addition — the PKCE secret is not caught by any substring
+    # above (``code`` alone is too generic for the global list — it would redact
+    # status_code/error_code). Keep BYTE-IDENTICAL with worker/obs.py.
+    "refresh_token",
+    "access_token",
+    "code_verifier",
+    "client_secret",
 )
 
 _REDACTED = "[REDACTED]"

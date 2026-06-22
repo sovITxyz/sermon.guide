@@ -83,7 +83,7 @@ test("link locks the editor read-only, pull updates content, unlink restores edi
 
   // Open is an anchor to the Drive web_url, opened safely.
   const openLink = page.getByRole("link", { name: "Open in Google Docs" });
-  await expect(openLink).toHaveAttribute("href", /docs\.google\.com\/document\/d\//);
+  await expect(openLink).toHaveAttribute("href", /^https:\/\/docs\.google\.com\/document\/d\//);
   await expect(openLink).toHaveAttribute("rel", "noopener noreferrer");
   await expect(openLink).toHaveAttribute("target", "_blank");
 

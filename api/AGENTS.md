@@ -645,6 +645,67 @@ userinfo). `POST /integrations/{provider}/authorize`, `GET
   `_ALLOWED_PROVIDERS` allow-set stay generic; an unconfigured/unknown provider
   is a 404 (never a 500), so adding `microsoft` is config-only.
 
+## Editor links — Google Docs round-trip (`editor_links.py` + `drive_client.py`, Phase 45)
+
+The B4 live link between a sermon document and a NATIVE Google Doc, mounted on
+the `documents` resource: `POST /documents/{document_id}/editor-link` (link),
+`GET .../editor-link/status`, `POST .../editor-link/pull`, `POST
+.../editor-link/unlink`. Storage is `editor_links` (migration 0010); the row is
+the live-editor state machine (`linked` / `error` / `unlinked`).
+
+- **`drive_client.py` is a THIN httpx Drive client (NO google SDK)** beside
+  `crypto_vault.py` (api-only — the worker never touches OAuth/Drive). It mirrors
+  `integrations._exchange_code`: fixed Google endpoints, `_HTTP_TIMEOUT_SECONDS`,
+  non-200 -> `DriveError` -> the route's **502** (never an upstream-body oracle).
+- **`get_access_token(connection, session)` is the cache-or-refresh provider.**
+  A still-valid cached access token (the Phase 44 `access_token_ciphertext` +
+  `token_expiry`, minus a ~60s skew) is decrypted and returned with NO network
+  call. On expiry it refreshes via the stored refresh token, RE-ENCRYPTS the new
+  access token, and persists it back on the SAME `oauth_connections` row
+  (tenant-scoped UPDATE by `id` + `user_id`). Google `invalid_grant` (the
+  Testing-mode 7-day refresh-token expiry) raises `DriveAuthError` so the route
+  flips the link to `state='error'` and surfaces a re-connect prompt — NOT a 500.
+- **NEVER log/return a token.** Log only `provider` / `user_id` / outcome (the
+  Phase 27 doctrine; the `token`/`access_token`/`refresh_token` deny-list entries
+  already cover any new structured key). Tokens are in-memory only.
+- **The pull leg is markdown ONLY — do NOT add a docx fallback.** Google's docx
+  conversion turns the relative `/read` citation href into `about:blank`
+  (unrecoverable). `files.export?mimeType=text/markdown` is the primary AND only
+  pull leg. The export returns the citation deep-link as `http:///read/{id}?...`
+  (literal `http://` + EMPTY authority); `worker.convert.normalize_read_hrefs`
+  rewrites that (and loopback/dummy hosts) back to `/read/` BEFORE
+  `convert_node`'s `parseReadHref` (which requires a leading `/read/`), else the
+  citation node is silently dropped. The new `worker.convert.convert_from_markdown`
+  owns this (pandoc md->html + the existing Node html->TipTap leg).
+- **Pull is snapshot-first + atomic.** ONE transaction: INSERT the CURRENT
+  content into `sermon_doc_revisions` with `source='pull'` FIRST, THEN overwrite
+  `documents.content` (`content_text` SERVER-re-derived, never trusted from the
+  conversion), THEN bump `editor_links.last_remote_version` to the fresh
+  `files.version` — mirrors `documents.import_document_docx`. A pull is never
+  destructive.
+- **`provider_file_id` is UNTRUSTED.** It is echoed/stored but the routes ONLY
+  ever use the file id fetched from the user's OWN `editor_links` row (tenant +
+  document scoped), into FIXED Google endpoints (`drive_client._file_path`
+  percent-encodes the single segment) — never a body-supplied id, never an
+  attacker-assembled URL (the SSRF guard).
+- **Tenant gate:** every route runs `documents._require_owned_document` FIRST
+  (non-owned / nonexistent / non-UUID / soft-deleted `document_id` -> byte-
+  identical 404 `"Document not found."`), then fetches the link via
+  `_linked_row_stmt` (scoped `user_id` + `document_id` + `state='linked'`). A
+  doc with no live link is the same 404 (no oracle). Statement builders
+  (`_connection_stmt`, `_linked_row_stmt`, `_link_insert_stmt`,
+  `_set_version_stmt`, `_set_state_stmt`) are the compile-pin seam in
+  `tests/test_editor_links_unit.py`.
+- **One live link per document** is enforced by the partial-unique index
+  `uq_editor_links_one_linked_per_document … WHERE state='linked'` (a Postgres
+  partial INDEX, NOT a `UniqueConstraint` — a plain unique would forbid
+  unlinked/error rows and break re-linking). A second link is a 409 (route
+  pre-check + the 23505 backstop). `unlink` requires the settled
+  `{mode: 'pull-final'|'keep-app'}` choice (`extra="forbid"`).
+- **No new settings/deps** — reuses Phase 44 `google_client_id/secret` (the
+  `drive.file` scope was granted at connect time) + `token_enc_key`, and `httpx`
+  + pandoc/Node already baked into the api image. `microsoft` is Phase 46.
+
 ## Content-type posture (Phase 20 — early sniff, decided)
 
 `POST /upload` libmagic-sniffs the FIRST BYTES of the body and 415s

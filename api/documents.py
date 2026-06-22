@@ -105,8 +105,12 @@ _FILENAME_SANITIZE = re.compile(r"[^A-Za-z0-9._-]")
 
 # What the snapshot row records as having triggered it. The migration's
 # column DEFAULT is ``'import'``; the route sets it explicitly so the value
-# is authoritative regardless of the DB default.
+# is authoritative regardless of the DB default. ``_REVISION_SOURCE_PULL`` tags
+# the snapshot taken before a Google-Docs pull overwrite (Phase 45,
+# ``editor_links.py``) so the revision history distinguishes a docx import from
+# an external-editor pull.
 _REVISION_SOURCE_IMPORT = "import"
+_REVISION_SOURCE_PULL = "pull"
 
 # Server-managed ProseMirror schema version stamped on every write. A
 # module constant (the authoritative source per the Phase 34 pre-made
@@ -733,15 +737,17 @@ def _revision_insert_stmt(
     content: dict[str, object],
     content_text: str,
     schema_version: int,
+    source: str = _REVISION_SOURCE_IMPORT,
 ) -> ReturningInsert[tuple[uuid.UUID]]:
     """Build the snapshot INSERT — the prior content row, scoped to the JWT user.
 
     Factored out so the tenant column (``user_id`` is ALWAYS the JWT-derived
     value, NEVER a body/path value) and the snapshot's content/content_text
     can be compile-pinned in ``tests/test_documents_unit.py`` (the
-    ``_xxx_stmt`` seam). ``source`` is set explicitly to the import sentinel.
-    ``RETURNING revision_id`` lets the route assert exactly one snapshot
-    landed.
+    ``_xxx_stmt`` seam). ``source`` defaults to the import sentinel but is
+    parameterized so the Phase 45 Google-Docs pull (``editor_links.py``) can
+    tag its snapshot ``'pull'`` distinctly. ``RETURNING revision_id`` lets the
+    route assert exactly one snapshot landed.
     """
     return (
         insert(SermonDocRevision)
@@ -751,7 +757,7 @@ def _revision_insert_stmt(
             content=content,
             content_text=content_text,
             schema_version=schema_version,
-            source=_REVISION_SOURCE_IMPORT,
+            source=source,
         )
         .returning(SermonDocRevision.revision_id)
     )

@@ -63,6 +63,21 @@ const tasks = new Map();
 const documents = new Map();
 
 /**
+ * External-editor links (Phase 45 — backs /documents/{id}/editor-link/*). Keyed
+ * by documentId; at most one ACTIVE (state='linked') link per document (the real
+ * api's partial-unique index). The stub models only the observable surface the
+ * E2E asserts: link creates a row + a fake Drive `web_url`; status reports
+ * remote_changed by comparing a stored cursor to a stub "remote" version the
+ * spec can bump; pull overwrites content from a deterministic "pulled" doc
+ * (snapshot-first is the real api's job, not observable here); unlink clears the
+ * row, optionally pulling final. NO token/file-id material ever crosses the wire
+ * — the status/link/unlink payloads carry only {state, web_url, remote_changed}.
+ *
+ * documentId -> { userId, web_url, lastVersion, remoteVersion, state }.
+ */
+const editorLinks = new Map();
+
+/**
  * OAuth connections store (Phase 44 — backs /integrations). Keyed
  * `${userId}:${provider}` so a reconnect overwrites in place (the real api's
  * ON CONFLICT(user_id, provider) upsert). The wire shape carries NO token
@@ -848,6 +863,147 @@ const server = createServer(async (req, res) => {
     record.content_text = deriveContentText(importedContent);
     record.updated_at = nextTimestamp();
     return send(res, 200, fullDoc(id, record));
+  }
+
+  // --- editor links / Google Docs (Phase 45) --------------------------------
+  // All bearer-scoped on the JWT user's OWN document with the SAME uniform 404
+  // for non-owned / unknown / soft-deleted ids (no existence oracle). NO token
+  // or Drive file id ever crosses the wire — only {state, web_url,
+  // remote_changed}. The web proxies forward no client file id; the stub owns the
+  // (fake) Drive doc id internally and never echoes it.
+
+  // POST /documents/{id}/editor-link — link. 409 if already linked.
+  const linkMatch = path.match(/^\/documents\/([^/]+)\/editor-link$/);
+  if (req.method === "POST" && linkMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(linkMatch[1]);
+    const record = documents.get(id);
+    const visible = record && record.userId === userId && record.deleted_at === null;
+    if (!visible) {
+      return detail(res, 404, "Document not found.");
+    }
+    const existing = editorLinks.get(id);
+    if (existing && existing.userId === userId && existing.state === "linked") {
+      return detail(res, 409, "Document is already linked to an external editor.");
+    }
+    // A deterministic fake Drive webViewLink (no real Drive round-trip). The
+    // file id stays internal — never surfaced.
+    const link = {
+      userId,
+      web_url: `https://docs.google.com/document/d/stub-${id}/edit`,
+      lastVersion: "1",
+      remoteVersion: "1",
+      state: "linked",
+    };
+    editorLinks.set(id, link);
+    return send(res, 200, { state: "linked", web_url: link.web_url, remote_changed: false });
+  }
+
+  // GET /documents/{id}/editor-link/status — remote_changed = remoteVersion !=
+  // lastVersion. A test bumps remoteVersion via the X-Stub-Remote-Edit header on
+  // any status GET to simulate an external edit landing in the Doc.
+  const statusMatch = path.match(/^\/documents\/([^/]+)\/editor-link\/status$/);
+  if (req.method === "GET" && statusMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(statusMatch[1]);
+    const record = documents.get(id);
+    const visible = record && record.userId === userId && record.deleted_at === null;
+    if (!visible) {
+      return detail(res, 404, "Document not found.");
+    }
+    const link = editorLinks.get(id);
+    if (!link || link.userId !== userId || link.state !== "linked") {
+      return send(res, 200, { state: "unlinked", web_url: null, remote_changed: false });
+    }
+    // The spec triggers an external edit by sending this header on a status poll.
+    if (req.headers["x-stub-remote-edit"] === "1") {
+      link.remoteVersion = String(Number(link.remoteVersion) + 1);
+    }
+    return send(res, 200, {
+      state: "linked",
+      web_url: link.web_url,
+      remote_changed: link.remoteVersion !== link.lastVersion,
+    });
+  }
+
+  // POST /documents/{id}/editor-link/pull — overwrite content from the Doc.
+  const pullMatch = path.match(/^\/documents\/([^/]+)\/editor-link\/pull$/);
+  if (req.method === "POST" && pullMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(pullMatch[1]);
+    const record = documents.get(id);
+    const visible = record && record.userId === userId && record.deleted_at === null;
+    if (!visible) {
+      return detail(res, 404, "Document not found.");
+    }
+    const link = editorLinks.get(id);
+    if (!link || link.userId !== userId || link.state !== "linked") {
+      return detail(res, 404, "Document not found.");
+    }
+    // Deterministic "pulled from Google Docs" content (the real api runs the
+    // markdown->TipTap pipeline; the stub models only the visible result + the
+    // cursor bump that clears remote_changed).
+    const pulledContent = {
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "Pulled from Google Docs." }] },
+      ],
+    };
+    record.content = pulledContent;
+    record.content_text = deriveContentText(pulledContent);
+    record.updated_at = nextTimestamp();
+    link.lastVersion = link.remoteVersion;
+    return send(res, 200, fullDoc(id, record));
+  }
+
+  // POST /documents/{id}/editor-link/unlink — body {mode}. pull-final overwrites
+  // first; keep-app leaves content untouched. Then clears the link.
+  const unlinkMatch = path.match(/^\/documents\/([^/]+)\/editor-link\/unlink$/);
+  if (req.method === "POST" && unlinkMatch) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(unlinkMatch[1]);
+    const record = documents.get(id);
+    const visible = record && record.userId === userId && record.deleted_at === null;
+    if (!visible) {
+      return detail(res, 404, "Document not found.");
+    }
+    const link = editorLinks.get(id);
+    if (!link || link.userId !== userId || link.state !== "linked") {
+      return detail(res, 404, "Document not found.");
+    }
+    const body = await readJson(req);
+    const mode = body?.mode;
+    if (mode !== "pull-final" && mode !== "keep-app") {
+      return detail(res, 422, "mode must be 'pull-final' or 'keep-app'.");
+    }
+    if (mode === "pull-final") {
+      const finalContent = {
+        type: "doc",
+        content: [
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Final pulled from Google Docs." }],
+          },
+        ],
+      };
+      record.content = finalContent;
+      record.content_text = deriveContentText(finalContent);
+      record.updated_at = nextTimestamp();
+    }
+    editorLinks.delete(id);
+    return send(res, 200, { state: "unlinked", web_url: null, remote_changed: false });
   }
 
   // --- integrations / OAuth vault (Phase 44) --------------------------------

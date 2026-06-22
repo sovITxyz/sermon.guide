@@ -46,6 +46,7 @@ api+worker image deps for Phase 29 to bake.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess  # noqa: S404 — fixed argv to the bundled Node CLI; never shell=True, never user-controlled.
 import sys
@@ -65,6 +66,30 @@ _REFERENCE_DOCX = _WORKER_ROOT / "assets" / "reference.docx"
 # hang a request thread. Generous — generateHTML/generateJSON on a sermon-sized
 # doc is milliseconds.
 _NODE_TIMEOUT_S = 60
+
+# The relative reader deep-link prefix the citation node serializes to (kept in
+# lockstep with convert_node/citation-extension.mjs ``READ_PREFIX``). On import
+# ``parseReadHref`` REQUIRES the href to start with exactly this string, or the
+# citation node is dropped and the deep-link is lost.
+_READ_PREFIX = "/read/"
+
+# Google Docs' ``text/markdown`` export rewrites the relative citation
+# deep-link ``/read/{bookId}?chunk={N}`` into ``http:///read/...`` — a literal
+# ``http://`` scheme with an EMPTY authority (the spike-observed shape), and
+# defensively could emit ``http://localhost/read/...`` or another loopback
+# host. We MUST rewrite any such absolute form back to the bare ``/read/...``
+# BEFORE the markdown reaches pandoc/convert_node, else ``parseReadHref``
+# (which requires ``href.startsWith("/read/")``) drops the citation node and
+# the deep-link is silently lost. The match is deliberately tight: an
+# ``http://`` (or ``https://``) scheme whose host is EMPTY or one of the
+# loopback / dummy hosts, immediately followed by ``/read/``. A real external
+# authority is NOT rewritten (it was never one of our citations).
+_GOOGLE_EXPORT_READ_HOSTS = ("", "localhost", "127.0.0.1", "[::1]", "sermon.invalid")
+_NORMALIZE_READ_HREF_RE = re.compile(
+    r"https?://(?:"
+    + "|".join(re.escape(host) for host in _GOOGLE_EXPORT_READ_HOSTS)
+    + r")(?=/read/)",
+)
 
 
 class ConversionError(RuntimeError):
@@ -172,6 +197,61 @@ def convert_from_docx(docx_bytes: bytes) -> dict[str, Any]:
             raise ConversionError(msg) from exc
     finally:
         in_path.unlink(missing_ok=True)
+
+    raw = _run_node("import", stdin_data=html)
+    try:
+        parsed: Any = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        msg = "convert_node import returned invalid JSON"
+        raise ConversionError(msg) from exc
+    if not isinstance(parsed, dict):
+        msg = "convert_node import did not return a ProseMirror document object"
+        raise ConversionError(msg)
+    return parsed
+
+
+def normalize_read_hrefs(markdown: str) -> str:
+    """Rewrite Google's ``http:///read/...`` export form back to bare ``/read/...``.
+
+    Google Docs' ``text/markdown`` export turns the relative citation deep-link
+    ``/read/{bookId}?chunk={N}`` into ``http:///read/...`` (a literal scheme
+    with an EMPTY authority — the spike-observed shape), and defensively could
+    emit a loopback / dummy host (``http://localhost/read/...`` etc.). This
+    strips that synthetic ``scheme://host`` prefix so the href is again
+    ``/read/...`` — the ONLY form ``convert_node``'s ``parseReadHref`` accepts
+    (it requires ``href.startsWith("/read/")``). Without this, every citation
+    node is silently dropped on the pull re-import. A real external authority
+    is left untouched (it was never one of our citations). Pure string helper,
+    unit-tested directly — the make-or-break of the markdown pull leg.
+    """
+    return _NORMALIZE_READ_HREF_RE.sub("", markdown)
+
+
+def convert_from_markdown(markdown: str) -> dict[str, Any]:
+    """Import markdown text to a ProseMirror ``content`` document (Phase 45 pull).
+
+    The markdown pull leg of the Google-Docs round-trip — mirrors
+    :func:`convert_from_docx` but swaps the pandoc INPUT leg (docx -> markdown)
+    and FIRST normalizes Google's ``http:///read/`` export form back to the
+    bare ``/read/`` citation deep-link (see :func:`normalize_read_hrefs`). The
+    docx export leg is deliberately NOT used for pull: Google's docx conversion
+    turns the relative ``/read`` href into ``about:blank`` (unrecoverable), so
+    markdown is the primary AND only pull leg (the settled spike result).
+
+    Pipeline: normalize the citation hrefs -> ``pypandoc`` markdown -> HTML ->
+    the EXISTING Node leg (``convert_node import``, the same html -> ProseMirror
+    path docx import uses, with the citation extension). Returns the TipTap
+    document JSON. The caller snapshots the prior content and re-derives
+    ``content_text`` itself — this only does the format conversion, never trusts
+    or persists anything. A pandoc / Node failure or non-object result raises
+    :class:`ConversionError` (the route maps it to a 502).
+    """
+    normalized = normalize_read_hrefs(markdown)
+    try:
+        html = pypandoc.convert_text(normalized, to="html", format="markdown")
+    except (RuntimeError, OSError) as exc:
+        msg = f"pandoc markdown->html failed: {exc}"
+        raise ConversionError(msg) from exc
 
     raw = _run_node("import", stdin_data=html)
     try:

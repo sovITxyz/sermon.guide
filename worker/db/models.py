@@ -613,6 +613,110 @@ class OAuthConnection(Base):
     )
 
 
+class EditorLink(Base):
+    """A live link from a sermon document to an external editor (Phase 45 — B4).
+
+    The storage half of the B4 Google-Docs round-trip. ``POST
+    /documents/{document_id}/editor-link`` exports the canonical
+    ``documents.content`` to a NATIVE Google Doc (upload-with-conversion) and
+    records one row here; the link makes the in-app editor HARD read-only while
+    the user edits the native Doc, and ``.../pull`` re-imports the Doc's
+    markdown export back into ``content`` (snapshot-first, never destructive).
+
+    ``provider`` is generic text ('google' now; 'microsoft' in Phase 46).
+    ``provider_file_id`` is the Drive file id — an UNTRUSTED echo: it is stored
+    and returned, but the routes ONLY ever use the id fetched from the user's
+    OWN row (tenant + document scoped) into FIXED Google endpoints, NEVER to
+    assemble an attacker-controlled URL (the SSRF guard). ``web_url`` is the
+    Drive ``webViewLink`` opened in the browser with ``rel=noopener``.
+    ``last_remote_version`` is the Drive ``files.version`` cursor — COMPARED
+    for equality to detect remote edits, NEVER parsed or ordered. ``state`` is
+    ``linked`` (the live editor), ``error`` (a refresh-token / Drive failure
+    surfaced as a re-connect prompt), or ``unlinked`` (detached).
+
+    ``user_id`` is DENORMALIZED — duplicated from the owning ``documents`` row
+    (like ``sermon_doc_revisions``) — so the tenant gate filters links by the
+    JWT-derived ``user_id`` WITHOUT a join back to ``documents`` (which may be
+    soft-deleted). Like every user-owned table it MUST be queried scoped to the
+    JWT ``user_id`` (CLAUDE.md), never from request input. Both FKs are ON
+    DELETE CASCADE — a link is meaningless once its document or user is gone.
+
+    The load-bearing constraint is the PARTIAL UNIQUE index
+    ``uq_editor_links_one_linked_per_document`` ON ``(document_id) WHERE
+    state = 'linked'`` — at most ONE live external editor per document at a
+    time, so a second POST link while linked hits 23505 and the route maps it
+    to 409. It MUST be a Postgres partial INDEX (``postgresql_where``), NOT a
+    table ``UniqueConstraint`` — a plain unique on ``document_id`` would forbid
+    even ``unlinked`` / ``error`` rows and break re-linking after unlink.
+    ``ix_editor_links_user_id`` serves the per-user scan.
+
+    ``updated_at`` carries ``server_default=func.now()`` for the insert but has
+    NO ``onupdate`` (the schema-wide convention): a state change / version bump
+    sets it EXPLICITLY via ``func.now()`` (the ``Document`` / ``OAuthConnection``
+    precedent).
+    """
+
+    __tablename__ = "editor_links"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.document_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # DENORMALIZED owner — duplicated from the documents row so the tenant gate
+    # filters here without a join back to documents (which may be soft-deleted).
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Generic provider key — 'google' now, 'microsoft' in Phase 46.
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    # Drive file id — UNTRUSTED echo only; never used to build attacker URLs
+    # (fixed Google endpoints only). See class docstring (the SSRF guard).
+    provider_file_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Drive webViewLink — opened in the browser with rel=noopener.
+    web_url: Mapped[str] = mapped_column(Text, nullable=False)
+    # linked | error | unlinked. Server-managed; never client-supplied.
+    state: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'linked'"),
+    )
+    # Drive files.version cursor — COMPARED for equality, NEVER parsed/ordered.
+    last_remote_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # PARTIAL UNIQUE: at most one LIVE external editor per document. MUST be
+        # a partial index (postgresql_where), not a UniqueConstraint — a plain
+        # unique on document_id would forbid unlinked/error rows and break
+        # re-linking after unlink. A second concurrent link -> 23505 -> 409.
+        Index(
+            "uq_editor_links_one_linked_per_document",
+            "document_id",
+            unique=True,
+            postgresql_where=text("state = 'linked'"),
+        ),
+        # Per-user scan (the denormalized tenant gate's hot path).
+        Index("ix_editor_links_user_id", "user_id"),
+    )
+
+
 class SermonEvent(Base):
     """A dated entry on a user's preaching calendar (Phase 38 — B3 slice).
 

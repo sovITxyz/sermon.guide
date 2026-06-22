@@ -1,6 +1,6 @@
 "use client";
 
-import type { DocumentFull, LibraryBookRef } from "@/lib/types";
+import type { DocumentFull, EditorLinkStatus, LibraryBookRef } from "@/lib/types";
 import dynamic from "next/dynamic";
 
 /**
@@ -35,11 +35,29 @@ const SermonEditor = dynamic(
 export function SermonEditorShell({
   document,
   libraryBooks,
+  linkStatus,
+  googleConnected,
 }: {
   document: DocumentFull;
   libraryBooks: readonly LibraryBookRef[];
+  // The external-editor link state (Phase 45), fetched server-side on doc open.
+  // When `state === "linked"` the editor opens HARD read-only with the "Editing
+  // externally" banner; otherwise editable. `web_url` is the only external
+  // string and is opened with rel="noopener noreferrer" — NO token/file-id.
+  linkStatus: EditorLinkStatus;
+  // Whether the user has a Google connection — drives the unlinked editor's
+  // "Link to Google Docs" button vs the "Connect Google in Settings" hint.
+  googleConnected: boolean;
 }) {
   const ownedBookIds = new Set(libraryBooks.map((book) => book.book_id));
   const bookTitles = new Map(libraryBooks.map((book) => [book.book_id, book.title]));
-  return <SermonEditor document={document} ownedBookIds={ownedBookIds} bookTitles={bookTitles} />;
+  return (
+    <SermonEditor
+      document={document}
+      ownedBookIds={ownedBookIds}
+      bookTitles={bookTitles}
+      linkStatus={linkStatus}
+      googleConnected={googleConnected}
+    />
+  );
 }

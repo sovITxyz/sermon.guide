@@ -264,3 +264,84 @@ def test_import_strips_dangerous_and_external_links() -> None:
         book_id = c["attrs"]["bookId"]
         assert "javascript" not in book_id
         assert "evil" not in book_id
+
+
+# === Phase 45: markdown pull leg (Google Docs round-trip) ====================
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # The spike-observed shape: literal http:// + EMPTY authority.
+        ("[c](http:///read/book-1?chunk=3)", "[c](/read/book-1?chunk=3)"),
+        # Defensive loopback / dummy hosts.
+        ("[c](http://localhost/read/book-1?chunk=3)", "[c](/read/book-1?chunk=3)"),
+        ("[c](http://127.0.0.1/read/book-1?chunk=3)", "[c](/read/book-1?chunk=3)"),
+        ("[c](http://sermon.invalid/read/book-1?chunk=3)", "[c](/read/book-1?chunk=3)"),
+        ("[c](https:///read/book-1?chunk=3)", "[c](/read/book-1?chunk=3)"),
+        # Already-relative href is untouched.
+        ("[c](/read/book-1?chunk=3)", "[c](/read/book-1?chunk=3)"),
+        # A REAL external authority is NOT rewritten (never one of our citations).
+        ("[c](https://evil.test/read/x?chunk=1)", "[c](https://evil.test/read/x?chunk=1)"),
+        # A non-/read URL on a loopback host is untouched (only /read/ is matched).
+        ("[c](http://localhost/other)", "[c](http://localhost/other)"),
+    ],
+)
+def test_normalize_read_hrefs(source: str, expected: str) -> None:
+    """The make-or-break: Google's http:///read/ export form -> bare /read/.
+
+    Pure string helper — needs no host deps, runs unconditionally (this test is
+    above the module-level skipif because it imports lazily).
+    """
+    from convert import normalize_read_hrefs
+
+    assert normalize_read_hrefs(source) == expected
+
+
+def test_convert_from_markdown_recovers_citation_deep_link() -> None:
+    """Google's http:///read markdown -> a TipTap citation node with the right id.
+
+    The end-to-end pull gate: a markdown citation link in Google's exported
+    ``http:///read/{bookId}?chunk={N}`` form must normalize and survive
+    pandoc md->html + the Node html->TipTap import leg as a citation node with
+    the recovered bookId + chunkIndex. Without ``normalize_read_hrefs`` the
+    citation is silently dropped (parseReadHref requires a leading ``/read/``).
+    """
+    from convert import convert_from_markdown
+
+    markdown = (
+        "## On Grace\n\n"
+        "Grace is **unmerited** favor.\n\n"
+        "[All of Grace](http:///read/11111111-2222-3333-4444-555555555555?chunk=42)\n"
+    )
+    restored = convert_from_markdown(markdown)
+    assert restored.get("type") == "doc"
+
+    types = _node_types(restored)
+    assert "heading" in types
+    assert "citation" in types
+
+    cites = _citations(restored)
+    assert len(cites) == 1, f"citation dropped: {cites}"
+    attrs = cites[0]["attrs"]
+    assert attrs["bookId"] == "11111111-2222-3333-4444-555555555555"
+    assert attrs["chunkIndex"] == 42
+
+    # Body + bold survive the markdown round-trip too.
+    text = _all_text(restored)
+    assert "unmerited" in text
+
+
+def test_convert_from_markdown_non_citation_parity() -> None:
+    """Plain markdown (no citations) imports to the expected TipTap structure."""
+    from convert import convert_from_markdown
+
+    restored = convert_from_markdown("# Title\n\nA paragraph.\n\n- one\n- two\n")
+    types = _node_types(restored)
+    assert "heading" in types
+    assert "paragraph" in types
+    assert "bulletList" in types
+    text = _all_text(restored)
+    assert "A paragraph." in text
+    assert "one" in text
+    assert "two" in text

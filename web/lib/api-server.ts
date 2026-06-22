@@ -7,6 +7,7 @@ import type {
   DocumentFull,
   DocumentListItem,
   DocumentListResponse,
+  EditorLinkStatus,
   IntegrationConnection,
   IntegrationsResponse,
   LibraryBook,
@@ -141,4 +142,47 @@ export async function getIntegrations(): Promise<IntegrationConnection[]> {
   }
   const data = (await res.json()) as IntegrationsResponse;
   return data.connections;
+}
+
+/**
+ * Fetch the external-editor link status for one sermon (Phase 45), server-side
+ * on doc open, attaching the bearer from the HttpOnly cookie. The token never
+ * reaches the browser. This drives the editor's read-only lock: when the
+ * returned `state` is `linked` the editor opens HARD read-only with the
+ * "Editing externally" banner; otherwise it opens editable.
+ *
+ * The API returns the link status for the JWT user's OWN document only (the
+ * owned-document gate is the API's; a non-owned / nonexistent / soft-deleted id
+ * is the uniform no-oracle 404). When the document has NO active link the API
+ * returns `state: "unlinked"` with a 200 — so a 404 here is the document-gate
+ * 404, not a "no link" signal, and the page treats it as "render unlinked"
+ * (the document fetch already established the doc exists for this user). Any
+ * other failure is non-fatal: the editor opens unlinked (editable) rather than
+ * blocking on a transient status error. NO token/file-id material is in the
+ * payload — only `{state, web_url, remote_changed}` (lib/types.ts).
+ */
+export async function getEditorLinkStatus(documentId: string): Promise<EditorLinkStatus> {
+  const unlinked: EditorLinkStatus = { state: "unlinked", web_url: null, remote_changed: false };
+  const token = await getSessionToken();
+  if (!token) {
+    throw new UnauthenticatedError();
+  }
+  const res = await fetch(
+    `${apiBaseUrl()}/documents/${encodeURIComponent(documentId)}/editor-link/status`,
+    {
+      headers: { authorization: `Bearer ${token}` },
+      // Per-user data — never cache across requests.
+      cache: "no-store",
+    },
+  );
+  if (res.status === 401) {
+    throw new UnauthenticatedError();
+  }
+  // No active link (or the no-oracle 404 / any transient failure) -> treat as
+  // unlinked so the editor opens editable; the document fetch already proved
+  // the doc is the user's, so this never hides a real not-found.
+  if (!res.ok) {
+    return unlinked;
+  }
+  return (await res.json()) as EditorLinkStatus;
 }

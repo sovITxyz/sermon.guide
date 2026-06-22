@@ -71,6 +71,11 @@ dependencies = [
   "structlog>=24,<26",
   "prometheus-client>=0.20,<1",
   "sentry-sdk[fastapi]>=2,<3",
+  # Phase 44: AES-256-GCM token vault (`crypto_vault.py`) — encrypts OAuth
+  # refresh/access tokens before they hit Postgres. Promoted from a TRANSITIVE
+  # dep (it arrived via `python-jose[cryptography]`) to an EXPLICIT top-level
+  # pin so the vault does not rely on jose's transitive resolution.
+  "cryptography>=43,<49",
 ]
 
 [dependency-groups]
@@ -112,6 +117,6 @@ pythonVersion = "3.12"
 # `db` and friends live in `../worker`; same rationale as the pytest
 # pythonpath above.
 extraPaths = ["../worker"]
-include = ["main.py", "auth.py", "documents.py", "library.py", "reader.py", "uploads.py", "search.py", "summary.py", "rerank.py", "highlight.py", "readyz.py", "ratelimit.py", "metrics.py", "observability.py", "settings.py", "tasks_client.py", "tests"]
+include = ["main.py", "auth.py", "crypto_vault.py", "documents.py", "integrations.py", "library.py", "reader.py", "uploads.py", "search.py", "summary.py", "rerank.py", "highlight.py", "readyz.py", "ratelimit.py", "metrics.py", "observability.py", "settings.py", "tasks_client.py", "tests"]
 venvPath = "."
 venv = ".venv"

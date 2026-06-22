@@ -253,6 +253,75 @@ down. Locked decisions:
 - All ids are `encodeURIComponent`'d into the proxy URLs; previews stay PLAIN
   TEXT (`preview` field) — **zero `dangerouslySetInnerHTML`** (repo invariant).
 
+## Integrations — the OAuth vault web surface (Phase 44, B3)
+
+`/settings/integrations` lets a user connect a Google account so finished
+sermons can later be pushed into Drive (the pull/push itself is Phase 45). The
+web layer is **purely HTTP** — it never sees a token. Locked decisions:
+
+- **The JWT/bearer NEVER reaches the browser, and NO token material ever does.**
+  Only `provider`, `provider_account_email` (the one token-derived value the API
+  returns), `scopes`, and timestamps cross the wire
+  (`lib/types.ts:IntegrationConnection` — there are **no** token/ciphertext
+  fields). The refresh/access tokens are encrypted at rest on the API and never
+  leave it.
+- **Provider allow-set is the gate.** `lib/integrations.ts:ALLOWED_PROVIDERS`
+  (`google` now; `microsoft` is Phase 46, config-only there). Every proxy
+  validates the `{provider}` path param against it and **404s an unknown
+  provider BEFORE attaching the bearer / calling the API** — a probe for
+  `/api/integrations/evil/...` never reaches the API.
+- **Four same-origin route handlers** (the Phase 15/16 proxy pattern, bearer
+  from the HttpOnly cookie server-side):
+  - `GET /api/integrations` — list (`app/api/integrations/route.ts`).
+  - `POST /api/integrations/[provider]/authorize` — kickoff. Asks the API to
+    mint the state HMAC + PKCE challenge (the verifier is stored server-side in
+    Redis, **never** in the browser) and returns `{authorize_url}`. **Nothing is
+    read from the request body** — provider comes from the path allow-set only.
+  - `GET /api/integrations/[provider]/callback` — the **PUBLIC, operator-
+    registered redirect URI** (`/api/integrations/google/callback` on the web
+    origin, ports 3000 AND 3001). The provider top-level-redirects the browser
+    here with `?code&state`; the SameSite=Lax `sg_session` cookie rides along on
+    that top-level GET, so `getSessionToken()` works. The handler forwards
+    `code`+`state` to the API callback **server-side** with the bearer (the full
+    state-HMAC + PKCE + account-binding CSRF validation runs on the API before
+    any token exchange), then **302s the browser to a FIXED same-origin path**:
+    `/settings/integrations?connected={provider}` on success or `?error={code}`
+    on failure. The redirect target is a constant path with only a vetted
+    provider / short generic error code interpolated — **no open redirect**, and
+    the API's error detail is **never echoed verbatim** (the API stays the only
+    oracle). `code`/`state` are **never logged**.
+  - `DELETE /api/integrations/[provider]` — revoke. The uniform 404
+    (not-connected / cross-tenant) passes through byte-for-byte (no existence
+    oracle).
+- **`sameOriginUrl(req, path)` in the callback** derives the redirect base from
+  the forwarded `host` header, **not `req.url`**. The dev server normalizes
+  `req.url`'s host to `localhost`, which would land the redirect on a *different*
+  cookie origin than `127.0.0.1` (distinct origins) and silently bounce the user
+  to `/login`. The host header only ever builds a same-origin redirect to a
+  fixed path — never reflected into a body — so it is not an injection vector.
+- **Page** (`app/settings/integrations/page.tsx`) is a **server component**:
+  fetches the connections via `lib/api-server.ts:getIntegrations()` (mirrors
+  `getDocuments` — bearer stays on the server) and renders the `IntegrationsPanel`
+  **client island** (Connect/Disconnect — a server component can't mutate or set
+  `window.location`). Connect POSTs the authorize proxy then
+  `window.location.assign(authorize_url)` (a TOP-LEVEL nav so the Lax cookie
+  survives). Disconnect is **confirm-gated** (re-consent is needed to reconnect).
+  The `?connected`/`?error` banner inputs are re-validated/mapped against fixed
+  sets — never echoed as free text.
+- **`middleware.ts` matcher** gained `/settings/:path*` (auth-gated). The
+  callback under `/api/*` is **not** matched by the page matcher (which lists
+  page paths) and relies on the cookie it carries.
+- **E2E** (`e2e/integrations.spec.ts`): the fake api (`e2e/support/fake-api.mjs`)
+  gained `/integrations` (list), `/integrations/{provider}/authorize` (mints a
+  one-shot account-bound state, returns an authorize_url at a stub
+  `/oauth/consent`), the stub consent screen (302s the browser back to the web
+  callback at `E2E_WEB_ORIGIN` with a deterministic `code`+`state` — standing in
+  for Google's top-level redirect, so **no real Google round-trip**),
+  `/integrations/{provider}/callback` (single-use + account-binding state check
+  before "exchange", then stores only the account email/scopes — **never a
+  token**), and `DELETE /integrations/{provider}` (uniform 404). The spec drives
+  Connect → consent → callback → connected, then Disconnect.
+
 ## Tests
 
 Vitest runs **two projects in one `pnpm test`** (`vitest.workspace.ts`,

@@ -571,6 +571,80 @@ cross-tenant-404 rule above). Migration 0007 (`worker/db`).
   limiter automatically; add one (per "Rate limiting") only if a web surface
   drives abusive volume.
 
+## Integrations — OAuth token vault (`integrations.py` + `crypto_vault.py`, Phase 44)
+
+The B4 OAuth vault. A user connects their Google account so a later phase
+(45) can pull/push sermons to Drive; this phase mints + stores the encrypted
+refresh token and surfaces only the connection's identity (email).
+`oauth_connections` is user-owned (migration 0009, `worker/db`); every query
+filters by the JWT `user_id`, a cross-tenant / never-connected provider is a
+byte-identical 404. NO google SDK — two thin `httpx` calls (token exchange +
+userinfo). `POST /integrations/{provider}/authorize`, `GET
+/integrations/{provider}/callback`, `GET /integrations`, `DELETE
+/integrations/{provider}`.
+
+- **Tokens are NEVER stored in plaintext.** `crypto_vault.encrypt(str)->bytes`
+  / `decrypt(bytes)->str` is AES-256-GCM (`SERMON_API_TOKEN_ENC_KEY`, 64 hex =
+  32 bytes). Layout is `nonce(12 random bytes) || ciphertext+tag` — a fresh
+  random 96-bit nonce per call (the GCM invariant; never reuse a nonce with a
+  key). A tampered/truncated blob raises `InvalidTag` (the route lets it
+  surface as a 500 — never a detail oracle). The DB holds `BYTEA` ciphertext
+  only; the ONLY token-derived value ever returned to the browser is
+  `provider_account_email`. The list endpoint selects NO ciphertext column.
+- **Validate-on-use, not at boot.** Empty/malformed Google client id/secret or
+  vault key raises `crypto_vault.OAuthUnconfiguredError` -> **503** naming the
+  env var (the `MissingInferenceKeyError` -> 503 posture; mapped in
+  `main.py`). The app STILL BOOTS with Google unconfigured — none of the new
+  settings arm a boot guard.
+- **`state` is account-bound, HMAC-signed, expiring.** `state =
+  b64url(payload) + '.' + b64url(HMAC-SHA256(payload))`, payload `{user_id,
+  nonce, provider, exp}`, key `SERMON_API_OAUTH_STATE_SECRET` (falls back to
+  `jwt_secret`). The HMAC key decouples OAuth-state forgery from session JWTs.
+- **THE phase deliverable: the callback validates EVERYTHING before the token
+  exchange.** Strict order in `callback`, all BEFORE the httpx token POST:
+  (a) HMAC constant-time compare, (b) `exp` not past, (c) `provider` matches
+  the path, (d) **`state.user_id == current_user.user_id`** — the
+  account-binding CSRF defense (without it an attacker binds a victim's
+  session to the attacker's Google account), (e) atomic GETDEL of the
+  single-use PKCE verifier from Redis. Any failure is a generic 400 (no
+  oracle). The compile-pin test mocks httpx and asserts it is NOT called on a
+  bad-state / missing-verifier request.
+- **PKCE verifier lives in Redis (db 2), keyed by the state nonce — NOT a
+  cookie.** The web `/api/integrations/{provider}/callback` route forwards the
+  user's bearer to this api callback; the web->api hop does not carry the
+  browser cookie to the api origin, so a web-origin cookie is unreadable here.
+  Redis-keyed-by-nonce is the cross-hop store with free TTL (`oauth:pkce:` ==
+  the state lifetime, ~10 min). `SET` at authorize, `GETDEL` (single-use) at
+  callback — a second redeem fails.
+- **`access_type=offline` + `prompt=consent` are REQUIRED** to receive a
+  refresh token, and a FRESH one on every reconnect; the callback rejects a
+  token response with no refresh token. The UPSERT is ON CONFLICT(user_id,
+  provider) DO UPDATE — reconnect overwrites in place (`uq_oauth_connections_
+  user_provider`), bumping `updated_at` EXPLICITLY via `func.now()` (no
+  `onupdate` — schema-wide convention).
+- **`redirect_uri` is derived from ONE settings source** (`settings.web_origin`
+  + `/api/integrations/{provider}/callback`) so authorize and the token
+  exchange use a byte-identical value; any drift is `redirect_uri_mismatch`
+  from Google. It is the WEB origin (operator-registered, ports 3000/3001),
+  not the api origin.
+- **DELETE is a hard delete** scoped to (user_id, provider), with a best-effort
+  POST to Google's revoke endpoint using the decrypted refresh token (failure
+  swallowed/logged WITHOUT the token — the local delete is authoritative). A
+  cross-tenant / never-connected / unknown provider is the same 404.
+- **NEVER log the `code`, `code_verifier`, `code_challenge`, refresh/access
+  tokens, `client_secret`, or ciphertext.** `code` is too generic to add to
+  the global deny-list (it would scrub `status_code`), so the discipline of
+  never passing the value to a log call is the primary defense — log only
+  `provider`, `user_id`, outcome. `refresh_token`/`access_token`/
+  `code_verifier`/`client_secret` ARE explicit deny-list entries
+  (`observability.py` + `worker/obs.py`, kept in lockstep).
+- **Statement builders are the tenant seam** (`_list_stmt`, `_connection_stmt`,
+  `_upsert_stmt`, `_delete_stmt`) — `user_id` compile-pinned in
+  `tests/test_integrations_unit.py` (the `library._library_stmt` pattern).
+- **`microsoft` is Phase 46** — the `{provider}` path param + the
+  `_ALLOWED_PROVIDERS` allow-set stay generic; an unconfigured/unknown provider
+  is a 404 (never a 500), so adding `microsoft` is config-only.
+
 ## Content-type posture (Phase 20 — early sniff, decided)
 
 `POST /upload` libmagic-sniffs the FIRST BYTES of the body and 415s

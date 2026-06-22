@@ -87,6 +87,15 @@ _DENY_SUBSTRINGS: tuple[str, ...] = (
     "dsn",
     "jwt",
     "cookie",  # also matches set-cookie
+    # Phase 44 — OAuth vault belt-and-suspenders, kept in lockstep with the
+    # api/observability.py mirror. The first three are already caught by
+    # ``token``/``secret``; ``code_verifier`` (the PKCE secret) is the one
+    # genuinely-new addition (``code`` alone is too generic for the global
+    # list). The worker never handles OAuth, but the two copies stay aligned.
+    "refresh_token",
+    "access_token",
+    "code_verifier",
+    "client_secret",
     # Redis/Postgres connection strings embed a password (celery_app.RedisSettings.url,
     # db settings); any *_url / *_uri / broker_url key is scrubbed so a stray
     # connection string can never leak its password into a log line. This is a

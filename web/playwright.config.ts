@@ -30,7 +30,10 @@ const fakeApiServer = {
   reuseExistingServer: !process.env.CI,
   stdout: "pipe" as const,
   stderr: "pipe" as const,
-  env: { PORT: String(FAKE_API_PORT) },
+  // E2E_WEB_ORIGIN: the OAuth callback target (Phase 44). The stub consent
+  // screen 302s the browser back here after "consent", standing in for Google's
+  // top-level redirect to the operator-registered web redirect URI.
+  env: { PORT: String(FAKE_API_PORT), E2E_WEB_ORIGIN: `http://127.0.0.1:${WEB_PORT}` },
 };
 
 const webServer = {

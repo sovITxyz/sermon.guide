@@ -525,6 +525,94 @@ class SermonDocRevision(Base):
     )
 
 
+class OAuthConnection(Base):
+    """An encrypted OAuth refresh-token vault row — one per (user, provider).
+
+    The storage half of the B4 OAuth vault (Phase 44). The
+    ``/integrations/{provider}/callback`` route exchanges a Google
+    authorization code for tokens, then UPSERTs one row here keyed by
+    ``(user_id, provider)``. The refresh token (and the optional short-lived
+    access token) are stored ONLY as AES-256-GCM ciphertext — the api-side
+    ``crypto_vault`` module encrypts before write and decrypts on use; the
+    database never holds plaintext token material. The ONLY token-derived
+    value ever returned to the browser is ``provider_account_email``.
+
+    ``refresh_token_ciphertext`` / ``access_token_ciphertext`` are ``BYTEA``
+    (mapped via ``LargeBinary``, the same type ``GlobalBook.minhash_signature``
+    uses) holding the AESGCM layout ``nonce(12 bytes) || ciphertext+tag`` — a
+    per-encryption random 96-bit nonce PREPENDED to the library's
+    ciphertext+tag. ``access_token_ciphertext`` is NULLABLE (the vault strictly
+    needs only the refresh token; storing the access token avoids a refresh
+    round-trip on the first Phase 45 call). ``token_expiry`` is the stored
+    access token's expiry (NULLABLE). ``provider`` is generic text ('google'
+    now; 'microsoft' in Phase 46). ``scopes`` is the space-delimited granted
+    scope string Google returns.
+
+    User-owned like every other table here: every query MUST filter by
+    ``user_id`` derived from the JWT (CLAUDE.md), never from request input.
+    The FK -> ``users.user_id`` is ON DELETE CASCADE — a connection is
+    meaningless once its user is gone.
+
+    ``UniqueConstraint(user_id, provider)`` backs the callback's
+    ``ON CONFLICT(user_id, provider) DO UPDATE`` (reconnect overwrites the row
+    in place) AND serves the per-user list scan.
+
+    ``updated_at`` carries ``server_default=func.now()`` for the insert but
+    has NO ``onupdate`` (the schema-wide convention): the upsert bumps it
+    EXPLICITLY via ``func.now()`` (the ``Document`` / ``SermonEvent``
+    precedent).
+    """
+
+    __tablename__ = "oauth_connections"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Generic provider key — 'google' now, 'microsoft' in Phase 46.
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    # The ONLY token-derived value ever returned to the browser.
+    provider_account_email: Mapped[str] = mapped_column(Text, nullable=False)
+    # AESGCM ciphertext: 12-byte nonce PREPENDED to ciphertext+tag. Never
+    # plaintext. ``LargeBinary`` maps to BYTEA on Postgres.
+    refresh_token_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Optional short-lived access token (same nonce-prepended layout).
+    access_token_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # Expiry of the stored access token (NULLABLE).
+    token_expiry: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # Space-delimited granted scope string returned by Google.
+    scopes: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Backs ON CONFLICT(user_id, provider) DO UPDATE (reconnect overwrites
+        # in place) AND serves the per-user list scan.
+        UniqueConstraint(
+            "user_id",
+            "provider",
+            name="uq_oauth_connections_user_provider",
+        ),
+    )
+
+
 class SermonEvent(Base):
     """A dated entry on a user's preaching calendar (Phase 38 — B3 slice).
 

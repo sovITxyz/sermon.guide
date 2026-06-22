@@ -207,6 +207,36 @@ class ApiSettings(BaseSettings):
     # performance traffic — the conservative default; raise per environment.
     sentry_traces_sample_rate: float = 0.0
 
+    # Phase 44 — Google OAuth + the token vault (the B4 integrations surface).
+    # ALL empty-default + validated ON USE: the app must still boot with Google
+    # unconfigured. An OAuth route hit while any of these is empty/malformed
+    # raises ``crypto_vault.OAuthUnconfiguredError`` -> 503 naming the env var
+    # (the ``/search-summary`` MissingInferenceKeyError -> 503 posture); NONE of
+    # these arm a boot guard (Phase 18 JWT / Phase 19 CORS guards untouched).
+    # These are read through the ``SERMON_API_`` prefix above.
+    #
+    # ``google_client_secret`` / ``oauth_state_secret`` are deny-listed in logs
+    # via the ``secret`` substring; ``token_enc_key`` via the ``token`` substring
+    # (api/observability.py + worker/obs.py redactors).
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    # 64 hex chars (`openssl rand -hex 32`) = 32 raw bytes = the AES-256-GCM
+    # vault key. ``crypto_vault._load_key`` hex-decodes + validates ON USE.
+    token_enc_key: str = ""
+    # OPTIONAL dedicated HMAC secret for the OAuth ``state`` parameter; empty
+    # falls back to ``jwt_secret`` so OAuth state forgery is decoupled from
+    # session JWTs when set.
+    oauth_state_secret: str = ""
+    # Microsoft OAuth — empty now (Phase 46); the fields keep the settings
+    # shape provider-generic.
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    # The WEB origin used to build the operator-registered redirect URI
+    # ``/api/integrations/{provider}/callback``. MUST match what is registered
+    # in the Google project (ports 3000/3001 in dev). Defaults to the
+    # local-dev web origin; set ``SERMON_API_WEB_ORIGIN`` per deployment.
+    web_origin: str = "http://localhost:3000"
+
     google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY")
     ppq_api_key: str | None = Field(default=None, validation_alias="PPQ_API_KEY")
     # Phase 16b: the same key the embeddings/rerank/highlight legs use

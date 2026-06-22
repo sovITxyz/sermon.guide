@@ -636,9 +636,9 @@ async def unlink_document(
         except DriveError as exc:
             await session.rollback()
             raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Document unlink pull failed.",
-        ) from exc
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Document unlink pull failed.",
+            ) from exc
         # The pull bumped the cursor to the fresh Drive version; reflect it in
         # the response (the link row in memory is stale).
         last_version = await drive_client.get_version(access_token, file_id)

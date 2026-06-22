@@ -224,6 +224,18 @@ services:
       SERMON_API_LLM_REASONING_EFFORT: ${SERMON_API_LLM_REASONING_EFFORT:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       PPQ_API_KEY: ${PPQ_API_KEY:-}
+      # Phase 44 OAuth vault + Phase 45 Google Docs editor links. Empty-default
+      # like the LLM keys: the api boots fine unconfigured (settings.py defaults
+      # these empty; the integrations/editor-link routes validate on use and
+      # 503 naming the missing var). Values live in /opt/sermon/.env.prod on the
+      # box, never in git. WEB_ORIGIN builds the operator-registered redirect
+      # URI (must match the Google console); OAUTH_STATE_SECRET falls back to
+      # the JWT secret when empty.
+      SERMON_API_GOOGLE_CLIENT_ID: ${SERMON_API_GOOGLE_CLIENT_ID:-}
+      SERMON_API_GOOGLE_CLIENT_SECRET: ${SERMON_API_GOOGLE_CLIENT_SECRET:-}
+      SERMON_API_TOKEN_ENC_KEY: ${SERMON_API_TOKEN_ENC_KEY:-}
+      SERMON_API_OAUTH_STATE_SECRET: ${SERMON_API_OAUTH_STATE_SECRET:-}
+      SERMON_API_WEB_ORIGIN: ${SERMON_API_WEB_ORIGIN:-}
     volumes:
       - sermon-uploads:/data/uploads
     healthcheck:

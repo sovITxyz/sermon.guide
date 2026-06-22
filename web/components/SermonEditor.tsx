@@ -12,7 +12,13 @@ import {
   onFlightSettled,
   onSaveRequested,
 } from "@/lib/sermon-autosave";
-import type { DocumentFull, ProseMirrorDoc } from "@/lib/types";
+import type {
+  DocumentFull,
+  EditorLinkState,
+  EditorLinkStatus,
+  ProseMirrorDoc,
+  UnlinkMode,
+} from "@/lib/types";
 import Placeholder from "@tiptap/extension-placeholder";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -85,6 +91,44 @@ function filenameFromDisposition(disposition: string | null): string {
   return trimmed.length > 0 ? trimmed : DEFAULT_EXPORT_FILENAME;
 }
 
+/**
+ * Pull a human-readable message out of a non-OK JSON response without leaking
+ * internals — reads FastAPI's `{detail}` (or a proxy `{error}`) and falls back
+ * to a generic string on a non-JSON body. Used by the Phase 45 link/pull/unlink
+ * handlers so the API's canonical 409/400/502 detail surfaces in the link
+ * banner exactly like the docx round-trip does.
+ */
+async function readErrorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = (await res.json()) as { detail?: unknown; error?: unknown };
+    const detail = typeof data.detail === "string" ? data.detail : null;
+    const error = typeof data.error === "string" ? data.error : null;
+    return detail ?? error ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Defense-in-depth on the Drive `web_url` before it becomes an `href`. The API
+ * returns the Drive `webViewLink` (always an `https://docs.google.com/...` URL),
+ * but the editor never trusts a stored string blindly: only an absolute
+ * `https:` URL is rendered as a link, so a tampered/`javascript:`/`data:` value
+ * can never become a clickable XSS vector. Returns null for anything else, which
+ * simply hides the Open affordance.
+ */
+function safeWebUrl(value: string | null): string | null {
+  if (value === null) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 const CONFLICT_MESSAGE =
   "This sermon was changed in another tab or device since you opened it. " +
   "Autosave is paused so neither side is clobbered. Your edits here are safe — " +
@@ -107,6 +151,8 @@ export function SermonEditor({
   document: initialDocument,
   ownedBookIds,
   bookTitles,
+  linkStatus,
+  googleConnected = false,
 }: {
   document: DocumentFull;
   // The user's owned-`book_id` set, resolved ONCE by the shell's single
@@ -118,9 +164,34 @@ export function SermonEditor({
   // source of a citation's title (a raw /search hit carries none). Used by the
   // in-editor LibraryDrawer to cache `bookTitle` at insert. Empty by default.
   bookTitles?: ReadonlyMap<string, string>;
+  // The external-editor link state (Phase 45), fetched server-side on doc open.
+  // When `state === "linked"` the editor is HARD read-only with the "Editing
+  // externally" banner; otherwise editable. Defaults to unlinked when omitted.
+  linkStatus?: EditorLinkStatus;
+  // Whether the user has a Google connection — drives the unlinked editor's
+  // "Link to Google Docs" button vs the "Connect Google in Settings" hint.
+  googleConnected?: boolean;
 }) {
   const [title, setTitle] = useState(initialDocument.title);
   const [status, setStatus] = useState<SaveStatus>("saved");
+  // --- external-editor link (Phase 45) -------------------------------------
+  // The live link state. Starts from the server-fetched status and is advanced
+  // by link/pull/unlink. While `linked` the editor is HARD read-only and
+  // autosave is suppressed (linkedRef below gates the loop just like conflict).
+  const [linkState, setLinkState] = useState<EditorLinkState>(linkStatus?.state ?? "unlinked");
+  const [webUrl, setWebUrl] = useState<string | null>(linkStatus?.web_url ?? null);
+  const [remoteChanged, setRemoteChanged] = useState<boolean>(linkStatus?.remote_changed ?? false);
+  // A visible, dismissable message for a link/pull/unlink failure (the API's
+  // 4xx/409/502 surfaces here), distinct from the save status and the docx
+  // banner. A busy flag disables the link affordances during a round-trip.
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const [linkBusy, setLinkBusy] = useState(false);
+  // The unlink choice dialog (the settled pull-final-vs-keep-app mandatory
+  // choice). Closed by default; opened by the banner's Unlink button.
+  const [unlinkDialogOpen, setUnlinkDialogOpen] = useState(false);
+  const isLinked = linkState === "linked";
+  // Only an https URL is ever rendered as the Open href (defense-in-depth).
+  const safeUrl = safeWebUrl(webUrl);
   // The LibraryDrawer is opened from a toolbar affordance; closed by default so
   // the editor opens uncluttered.
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -164,6 +235,11 @@ export function SermonEditor({
   // scheduler entry point (debounce, max-interval, trailing) so a conflicted
   // tab never silently re-PATCHes over the other side.
   const conflicted = useRef(false);
+  // While a doc is LINKED to an external editor the autosave loop is hard-
+  // suppressed (a stale PATCH would clobber the linked source-of-truth). The ref
+  // mirrors `isLinked` so the loop — which reads refs, not render state — and the
+  // non-React pagehide flush both see the current value without a stale closure.
+  const linked = useRef(linkStatus?.state === "linked");
   const debounceTimer = useRef<number | null>(null);
   const maxIntervalTimer = useRef<number | null>(null);
   const mounted = useRef(true);
@@ -256,7 +332,7 @@ export function SermonEditor({
   // that arrived while a PATCH was in flight. Coalesced edits become exactly
   // ONE more save — never parallel requests.
   const runSave = useCallback((): void => {
-    if (conflicted.current) {
+    if (conflicted.current || linked.current) {
       return;
     }
     const snapshot = readSnapshot();
@@ -284,7 +360,7 @@ export function SermonEditor({
   // debounce and, on the first dirty edit since the last save, arms the 15 s
   // max-interval ceiling so continuous typing still saves.
   const scheduleAutosave = useCallback((): void => {
-    if (conflicted.current) {
+    if (conflicted.current || linked.current) {
       return;
     }
     setStatus("unsaved");
@@ -326,13 +402,34 @@ export function SermonEditor({
     };
   }, [editor, scheduleAutosave]);
 
+  // The read-only lock (Phase 45). While LINKED the editor is HARD read-only —
+  // setEditable(false) disables the contenteditable AND the linked ref gates the
+  // autosave loop so NO PATCH ever fires while the native Doc is the source of
+  // truth. When the link is cleared (unlink / keep-app) editability + autosave
+  // resume. The ref is kept in sync here (not only at construction) so a runtime
+  // link/unlink flips the lock immediately. Clearing any pending unsaved timers
+  // on lock prevents a queued save from firing after the lock engages.
+  useEffect(() => {
+    linked.current = isLinked;
+    if (!editor) {
+      return;
+    }
+    editor.setEditable(!isLinked);
+    if (isLinked) {
+      clearTimers();
+      // A buffer that was mid-edit when the lock engaged settles visually to
+      // "saved" — the linked Doc owns the content now, no local save is pending.
+      setStatus("saved");
+    }
+  }, [editor, isLinked, clearTimers]);
+
   // pagehide flush via fetch keepalive: only when dirty AND within the ~64 KB
   // keepalive ceiling. Oversize -> SKIP silently (next-open save covers it).
   // Also flushes on unmount (SPA navigations never fire pagehide).
   useEffect(() => {
     mounted.current = true;
     const flush = (): void => {
-      if (conflicted.current) {
+      if (conflicted.current || linked.current) {
         return;
       }
       const snapshot = readSnapshot();
@@ -489,6 +586,131 @@ export function SermonEditor({
     [editor, documentId],
   );
 
+  // --- external-editor link actions (Phase 45) -----------------------------
+  // Adopt a freshly-pulled document into the editor (mirrors the import/conflict
+  // reload: setContent + title + base_updated_at + dirty baseline). The pull
+  // ran while LINKED, so the editor stays read-only after — this only refreshes
+  // the displayed buffer with the latest Doc content.
+  const adoptPulledDoc = useCallback(
+    (doc: DocumentFull): void => {
+      if (!editor) {
+        return;
+      }
+      editor.commands.setContent(doc.content);
+      setTitle(doc.title);
+      titleRef.current = doc.title;
+      baseUpdatedAt.current = doc.updated_at;
+      lastSaved.current = { title: doc.title, content: doc.content };
+      flight.current = idleFlight();
+    },
+    [editor],
+  );
+
+  // Link: POST the link proxy. On success the API created the Drive Doc and
+  // returns {state, web_url, remote_changed} — flip to read-only linked mode.
+  // A 409 (already linked) / 400 (connect Google first) / 502 surfaces in the
+  // link banner. Read-only mode is engaged purely from the returned state via
+  // the useEffect lock above.
+  const onLink = useCallback(async (): Promise<void> => {
+    setLinkError(null);
+    setLinkBusy(true);
+    try {
+      const res = await fetch(`/api/documents/${encodeURIComponent(documentId)}/editor-link`, {
+        method: "POST",
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        setLinkError(await readErrorMessage(res, "Could not link to Google Docs."));
+        return;
+      }
+      const data = (await res.json()) as EditorLinkStatus;
+      setLinkState(data.state);
+      setWebUrl(data.web_url);
+      setRemoteChanged(data.remote_changed);
+    } catch {
+      setLinkError("Could not link to Google Docs.");
+    } finally {
+      setLinkBusy(false);
+    }
+  }, [documentId]);
+
+  // Pull changes: POST the pull proxy. The API snapshots-then-overwrites in one
+  // transaction and returns the full updated document; adopt it into the editor
+  // buffer (it reloads as TipTap JSON, ZERO dangerouslySetInnerHTML). Clears the
+  // remote-changed hint on success.
+  const onPull = useCallback(async (): Promise<void> => {
+    setLinkError(null);
+    setLinkBusy(true);
+    try {
+      const res = await fetch(`/api/documents/${encodeURIComponent(documentId)}/editor-link/pull`, {
+        method: "POST",
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        setLinkError(await readErrorMessage(res, "Could not pull changes from Google Docs."));
+        return;
+      }
+      const data = (await res.json()) as DocumentFull;
+      adoptPulledDoc(data);
+      setRemoteChanged(false);
+    } catch {
+      setLinkError("Could not pull changes from Google Docs.");
+    } finally {
+      setLinkBusy(false);
+    }
+  }, [documentId, adoptPulledDoc]);
+
+  // Unlink with the settled mandatory choice. `pull-final` runs the pull pipeline
+  // once (snapshot+overwrite) THEN unlinks — so the app keeps the latest Doc
+  // content; `keep-app` leaves the app content untouched and unlinks. On success
+  // the doc returns to editable mode (the useEffect lock releases on state
+  // change). The proxy whitelists ONLY {mode}.
+  const onUnlink = useCallback(
+    async (mode: UnlinkMode): Promise<void> => {
+      setLinkError(null);
+      setLinkBusy(true);
+      try {
+        const res = await fetch(
+          `/api/documents/${encodeURIComponent(documentId)}/editor-link/unlink`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ mode }),
+            cache: "no-store",
+          },
+        );
+        if (!res.ok) {
+          setLinkError(await readErrorMessage(res, "Could not unlink from Google Docs."));
+          return;
+        }
+        const data = (await res.json()) as EditorLinkStatus;
+        setLinkState(data.state);
+        setWebUrl(data.web_url);
+        setRemoteChanged(data.remote_changed);
+        setUnlinkDialogOpen(false);
+        // pull-final overwrote the content server-side; reload the buffer so the
+        // now-editable editor shows the final pulled version, not the stale one.
+        if (mode === "pull-final") {
+          try {
+            const fresh = await fetch(`/api/documents/${encodeURIComponent(documentId)}`, {
+              cache: "no-store",
+            });
+            if (fresh.ok) {
+              adoptPulledDoc((await fresh.json()) as DocumentFull);
+            }
+          } catch {
+            // Non-fatal: the next reload picks up the pulled content.
+          }
+        }
+      } catch {
+        setLinkError("Could not unlink from Google Docs.");
+      } finally {
+        setLinkBusy(false);
+      }
+    },
+    [documentId, adoptPulledDoc],
+  );
+
   // Toolbar active-states. useEditorState re-runs the selector on every editor
   // transaction and only re-renders the toolbar when a boolean actually flips —
   // cheaper than re-rendering on every keystroke.
@@ -524,118 +746,259 @@ export function SermonEditor({
           value={title}
           onChange={(e) => onTitleChange(e.target.value)}
           placeholder="Untitled sermon"
-          className="min-w-0 flex-1 border-0 border-gray-200 border-b bg-transparent pb-1 font-semibold text-xl focus:border-black focus:outline-none"
+          // The title is part of the read-only lock while linked — the native
+          // Doc owns the manuscript, so the title input is disabled too.
+          disabled={isLinked}
+          readOnly={isLinked}
+          className="min-w-0 flex-1 border-0 border-gray-200 border-b bg-transparent pb-1 font-semibold text-xl focus:border-black focus:outline-none disabled:text-gray-500"
         />
         <Link href="/sermons" className="shrink-0 text-blue-600 text-sm hover:underline">
           ← Sermons
         </Link>
       </div>
 
-      <div className="mb-3 flex flex-wrap items-center gap-1">
-        <ToolbarButton
-          label="Bold"
-          active={marks?.bold ?? false}
-          disabled={!editor}
-          onClick={() => editor?.chain().focus().toggleBold().run()}
+      {/* Editing-externally banner (Phase 45). While LINKED the editor is HARD
+          read-only: the formatting toolbar/citation/docx affordances are gone and
+          this banner sits above the read-only editor offering Open / Pull / Unlink.
+          role="status" (a polite live region — NOT role="alert", which the App
+          Router route announcer already owns). web_url is the only external string,
+          opened with rel="noopener noreferrer". */}
+      {isLinked ? (
+        <output
+          data-testid="editing-externally-banner"
+          className="mb-3 block rounded-lg border border-blue-300 bg-blue-50 p-3"
         >
-          <span className="font-bold">B</span>
-        </ToolbarButton>
-        <ToolbarButton
-          label="Italic"
-          active={marks?.italic ?? false}
-          disabled={!editor}
-          onClick={() => editor?.chain().focus().toggleItalic().run()}
-        >
-          <span className="italic">I</span>
-        </ToolbarButton>
-        <ToolbarButton
-          label="Heading 2"
-          active={marks?.h2 ?? false}
-          disabled={!editor}
-          onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
-        >
-          H2
-        </ToolbarButton>
-        <ToolbarButton
-          label="Heading 3"
-          active={marks?.h3 ?? false}
-          disabled={!editor}
-          onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
-        >
-          H3
-        </ToolbarButton>
-        <ToolbarButton
-          label="Bullet list"
-          active={marks?.bulletList ?? false}
-          disabled={!editor}
-          onClick={() => editor?.chain().focus().toggleBulletList().run()}
-        >
-          • List
-        </ToolbarButton>
-        <ToolbarButton
-          label="Numbered list"
-          active={marks?.orderedList ?? false}
-          disabled={!editor}
-          onClick={() => editor?.chain().focus().toggleOrderedList().run()}
-        >
-          1. List
-        </ToolbarButton>
+          <p className="font-medium text-blue-900 text-sm">Editing externally in Google Docs</p>
+          <p className="mt-1 text-blue-800 text-sm">
+            This sermon is open in Google Docs and is read-only here. Make your edits there, then
+            pull the changes back.
+            {remoteChanged ? " Changes available in Google — Pull to update." : null}
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {safeUrl !== null ? (
+              <a
+                href={safeUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="rounded bg-blue-700 px-3 py-1.5 font-medium text-sm text-white hover:bg-blue-800"
+              >
+                Open in Google Docs
+              </a>
+            ) : null}
+            <button
+              type="button"
+              disabled={linkBusy}
+              onClick={() => void onPull()}
+              className="rounded border border-blue-300 bg-white px-3 py-1.5 font-medium text-blue-800 text-sm hover:bg-blue-100 disabled:opacity-50"
+            >
+              Pull changes
+            </button>
+            <button
+              type="button"
+              disabled={linkBusy}
+              onClick={() => setUnlinkDialogOpen(true)}
+              className="rounded border border-blue-300 bg-white px-3 py-1.5 font-medium text-blue-800 text-sm hover:bg-blue-100 disabled:opacity-50"
+            >
+              Unlink
+            </button>
+          </div>
+        </output>
+      ) : null}
 
-        <button
-          type="button"
-          aria-label="Cite from your library"
-          aria-expanded={drawerOpen}
-          disabled={!editor}
-          onClick={() => setDrawerOpen((open) => !open)}
-          className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+      {/* The unlink choice dialog — the settled mandatory pull-final-vs-keep-app
+          choice. Inline (not a portal) so the component-test can assert it without
+          a dialog harness; role="dialog" + aria-modal for assistive tech. */}
+      {unlinkDialogOpen ? (
+        <dialog
+          open
+          aria-label="Unlink from Google Docs"
+          data-testid="unlink-dialog"
+          className="relative z-10 mb-3 block w-full rounded-lg border border-gray-300 bg-white p-3"
         >
-          + Citation
-        </button>
+          <p className="font-medium text-gray-900 text-sm">Unlink from Google Docs</p>
+          <p className="mt-1 text-gray-700 text-sm">
+            Keep the latest Google Docs version in this sermon, or keep the version stored here?
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={linkBusy}
+              onClick={() => void onUnlink("pull-final")}
+              className="rounded bg-black px-3 py-1.5 font-medium text-sm text-white hover:bg-gray-800 disabled:opacity-50"
+            >
+              Pull final copy &amp; unlink
+            </button>
+            <button
+              type="button"
+              disabled={linkBusy}
+              onClick={() => void onUnlink("keep-app")}
+              className="rounded border border-gray-300 bg-white px-3 py-1.5 font-medium text-gray-700 text-sm hover:bg-gray-50 disabled:opacity-50"
+            >
+              Keep this version &amp; unlink
+            </button>
+            <button
+              type="button"
+              disabled={linkBusy}
+              onClick={() => setUnlinkDialogOpen(false)}
+              className="ml-auto text-gray-600 text-sm hover:underline disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        </dialog>
+      ) : null}
 
-        {/* DOCX round-trip (Phase 43). Download streams the export proxy as a
+      {isLinked ? null : (
+        <div className="mb-3 flex flex-wrap items-center gap-1">
+          <ToolbarButton
+            label="Bold"
+            active={marks?.bold ?? false}
+            disabled={!editor}
+            onClick={() => editor?.chain().focus().toggleBold().run()}
+          >
+            <span className="font-bold">B</span>
+          </ToolbarButton>
+          <ToolbarButton
+            label="Italic"
+            active={marks?.italic ?? false}
+            disabled={!editor}
+            onClick={() => editor?.chain().focus().toggleItalic().run()}
+          >
+            <span className="italic">I</span>
+          </ToolbarButton>
+          <ToolbarButton
+            label="Heading 2"
+            active={marks?.h2 ?? false}
+            disabled={!editor}
+            onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
+          >
+            H2
+          </ToolbarButton>
+          <ToolbarButton
+            label="Heading 3"
+            active={marks?.h3 ?? false}
+            disabled={!editor}
+            onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
+          >
+            H3
+          </ToolbarButton>
+          <ToolbarButton
+            label="Bullet list"
+            active={marks?.bulletList ?? false}
+            disabled={!editor}
+            onClick={() => editor?.chain().focus().toggleBulletList().run()}
+          >
+            • List
+          </ToolbarButton>
+          <ToolbarButton
+            label="Numbered list"
+            active={marks?.orderedList ?? false}
+            disabled={!editor}
+            onClick={() => editor?.chain().focus().toggleOrderedList().run()}
+          >
+            1. List
+          </ToolbarButton>
+
+          <button
+            type="button"
+            aria-label="Cite from your library"
+            aria-expanded={drawerOpen}
+            disabled={!editor}
+            onClick={() => setDrawerOpen((open) => !open)}
+            className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+          >
+            + Citation
+          </button>
+
+          {/* DOCX round-trip (Phase 43). Download streams the export proxy as a
             blob and triggers a browser download; Import proxies its click to the
             hidden file input below, then POSTs the chosen .docx and reloads the
             editor with the returned TipTap JSON. Both disable while busy. */}
-        <button
-          type="button"
-          aria-label="Download as Word document"
-          disabled={!editor || docxBusy}
-          onClick={() => void onExport()}
-          className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
-        >
-          Download .docx
-        </button>
-        <button
-          type="button"
-          aria-label="Import a Word document"
-          disabled={!editor || docxBusy}
-          onClick={() => importInputRef.current?.click()}
-          className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
-        >
-          Import .docx
-        </button>
-        <input
-          ref={importInputRef}
-          type="file"
-          aria-label="Word document to import"
-          accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-          className="sr-only"
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            // Reset first so re-choosing the same file re-fires onChange.
-            e.target.value = "";
-            if (file) {
-              void onImportFile(file);
-            }
-          }}
-        />
+          <button
+            type="button"
+            aria-label="Download as Word document"
+            disabled={!editor || docxBusy}
+            onClick={() => void onExport()}
+            className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+          >
+            Download .docx
+          </button>
+          <button
+            type="button"
+            aria-label="Import a Word document"
+            disabled={!editor || docxBusy}
+            onClick={() => importInputRef.current?.click()}
+            className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+          >
+            Import .docx
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            aria-label="Word document to import"
+            accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            className="sr-only"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              // Reset first so re-choosing the same file re-fires onChange.
+              e.target.value = "";
+              if (file) {
+                void onImportFile(file);
+              }
+            }}
+          />
 
-        <div className="ml-auto flex items-center gap-3">
-          <SaveIndicator status={status} />
+          {/* Link to Google Docs (Phase 45). Only when a Google connection exists;
+            otherwise a hint pointing at Settings. Linking converts the sermon to a
+            Doc, creates it in Drive, and flips the editor into read-only linked
+            mode on success. */}
+          {googleConnected ? (
+            <button
+              type="button"
+              aria-label="Link to Google Docs"
+              disabled={!editor || linkBusy}
+              onClick={() => void onLink()}
+              className="rounded border border-blue-300 bg-white px-2 py-1 text-blue-700 text-sm disabled:opacity-50"
+            >
+              Link to Google Docs
+            </button>
+          ) : (
+            <Link
+              href="/settings/integrations"
+              data-testid="connect-google-hint"
+              className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm hover:bg-gray-50"
+            >
+              Connect Google in Settings
+            </Link>
+          )}
+
+          <div className="ml-auto flex items-center gap-3">
+            <SaveIndicator status={status} />
+          </div>
         </div>
-      </div>
+      )}
 
-      {drawerOpen ? (
+      {/* Link/pull/unlink failure (Phase 45) — the API's 409/400/502 detail in a
+          visible, dismissable banner, distinct from the save + docx errors. */}
+      {linkError !== null ? (
+        <div
+          role="alert"
+          data-testid="link-error"
+          className="mb-3 flex items-start justify-between gap-3 rounded-lg border border-red-300 bg-red-50 p-3"
+        >
+          <p className="text-red-700 text-sm">{linkError}</p>
+          <button
+            type="button"
+            aria-label="Dismiss link error"
+            onClick={() => setLinkError(null)}
+            className="shrink-0 text-red-700 text-sm hover:underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+
+      {drawerOpen && !isLinked ? (
         <LibraryDrawer editor={editor} bookTitles={titleMap} onClose={() => setDrawerOpen(false)} />
       ) : null}
 

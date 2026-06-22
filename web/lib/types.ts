@@ -321,6 +321,41 @@ export interface IntegrationsResponse {
 }
 
 /**
+ * The external-editor link state (Phase 45, B4) — the only editor-link payload
+ * that crosses the wire to the browser. Field names/casing match the FastAPI
+ * JSON verbatim (api/editor_links.py). `state` is the link lifecycle
+ * (`linked` | `error` | `unlinked`); the editor is HARD read-only while
+ * `linked`. `web_url` is the Drive `webViewLink` — the ONLY external string ever
+ * shown, opened with `rel="noopener noreferrer"`; NO token, file id, or other
+ * provider material ever reaches the browser. `remote_changed` is true when the
+ * native Doc has edits not yet pulled (status compares the stored cursor, which
+ * never crosses the wire). There is NO `provider_file_id` here — the API owns
+ * the file id as a server-side capability fetched from the user's own row; the
+ * client never sees it and never forwards one as authoritative.
+ */
+export type EditorLinkState = "linked" | "error" | "unlinked";
+
+export interface EditorLinkStatus {
+  state: EditorLinkState;
+  web_url: string | null;
+  remote_changed: boolean;
+}
+
+/**
+ * POST /documents/{id}/editor-link/unlink body (api/editor_links.py
+ * UnlinkRequest, extra="forbid"). The settled mandatory user choice: `mode`
+ * is REQUIRED and exactly one of `pull-final` (run the pull pipeline once —
+ * snapshot + overwrite — THEN unlink) or `keep-app` (leave the app content
+ * untouched, just unlink). The unlink proxy whitelists ONLY this field; a
+ * smuggled key never reaches the API's `extra="forbid"` gate.
+ */
+export type UnlinkMode = "pull-final" | "keep-app";
+
+export interface UnlinkRequest {
+  mode: UnlinkMode;
+}
+
+/**
  * POST /integrations/{provider}/authorize response (api/integrations.py). The
  * API mints the state HMAC + PKCE challenge and stores the verifier server-side
  * (Redis), then returns the provider auth URL the browser is sent to. No token

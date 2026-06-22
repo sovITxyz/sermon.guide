@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AUTOSAVE_DEBOUNCE_MS, AUTOSAVE_MAX_INTERVAL_MS } from "../../lib/sermon-autosave";
-import type { DocumentFull } from "../../lib/types";
+import type { DocumentFull, EditorLinkStatus } from "../../lib/types";
 import { installFetch, jsonResponse } from "./helpers";
 
 /**
@@ -30,6 +30,8 @@ interface FakeEditor {
   on: (event: string, handler: () => void) => void;
   off: (event: string, handler: () => void) => void;
   commands: { setContent: (content: unknown) => void };
+  setEditable: (editable: boolean) => void;
+  isEditable: boolean;
   lastCommand: string | null;
   content: unknown;
   setContentCalls: unknown[];
@@ -53,6 +55,10 @@ function makeFakeEditor(): FakeEditor {
     content: { type: "doc", content: [{ type: "paragraph" }] },
     getJSON: () => editor.content,
     isActive: () => false,
+    isEditable: true,
+    setEditable: (editable) => {
+      editor.isEditable = editable;
+    },
     lastCommand: null,
     setContentCalls: [],
     on: (event, handler) => {
@@ -529,5 +535,215 @@ describe("SermonEditor — pagehide keepalive flush", () => {
       window.dispatchEvent(new Event("pagehide"));
     });
     expect(stub).not.toHaveBeenCalled();
+  });
+});
+
+describe("SermonEditor — external-editor link (Phase 45)", () => {
+  const LINKED: EditorLinkStatus = {
+    state: "linked",
+    web_url: "https://docs.google.com/document/d/abc/edit",
+    remote_changed: false,
+  };
+
+  it("UNLINKED: editor is editable, no banner, and shows the Link button when Google is connected", () => {
+    installFetch(() => Promise.reject(new Error("no fetch expected")));
+    render(<SermonEditor document={makeDoc()} googleConnected={true} />);
+
+    expect(fakeEditor.isEditable).toBe(true);
+    expect(screen.queryByTestId("editing-externally-banner")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Link to Google Docs" })).toBeInTheDocument();
+    // The full formatting toolbar is present when unlinked.
+    expect(screen.getByRole("button", { name: "Bold" })).toBeInTheDocument();
+  });
+
+  it("UNLINKED + no connection: shows the Connect-Google hint instead of the Link button", () => {
+    installFetch(() => Promise.reject(new Error("no fetch expected")));
+    render(<SermonEditor document={makeDoc()} googleConnected={false} />);
+
+    expect(screen.queryByRole("button", { name: "Link to Google Docs" })).not.toBeInTheDocument();
+    const hint = screen.getByTestId("connect-google-hint");
+    expect(hint).toHaveAttribute("href", "/settings/integrations");
+  });
+
+  it("LINKED: editor is read-only, banner shows Open/Pull/Unlink, toolbar is hidden", () => {
+    installFetch(() => Promise.reject(new Error("no fetch expected")));
+    render(<SermonEditor document={makeDoc()} linkStatus={LINKED} googleConnected={true} />);
+
+    // Hard read-only: setEditable(false) ran.
+    expect(fakeEditor.isEditable).toBe(false);
+
+    const banner = screen.getByTestId("editing-externally-banner");
+    expect(banner).toHaveTextContent("Editing externally in Google Docs");
+
+    // Open is an anchor to web_url with rel="noopener noreferrer" (no token).
+    const open = screen.getByRole("link", { name: "Open in Google Docs" });
+    expect(open).toHaveAttribute("href", LINKED.web_url);
+    expect(open).toHaveAttribute("target", "_blank");
+    expect(open).toHaveAttribute("rel", "noopener noreferrer");
+
+    expect(screen.getByRole("button", { name: "Pull changes" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unlink" })).toBeInTheDocument();
+
+    // The formatting toolbar + citation/docx affordances are gone while linked.
+    expect(screen.queryByRole("button", { name: "Bold" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Cite from your library" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Download as Word document" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("LINKED: a remote change surfaces the Pull-to-update hint", () => {
+    installFetch(() => Promise.reject(new Error("no fetch expected")));
+    render(
+      <SermonEditor
+        document={makeDoc()}
+        linkStatus={{ ...LINKED, remote_changed: true }}
+        googleConnected={true}
+      />,
+    );
+    expect(screen.getByTestId("editing-externally-banner")).toHaveTextContent(
+      "Changes available in Google",
+    );
+  });
+
+  it("LINKED: autosave is hard-suppressed — typing fires no PATCH", async () => {
+    vi.useFakeTimers();
+    const stub = installFetch(() => Promise.resolve(jsonResponse(makeDoc())));
+    render(<SermonEditor document={makeDoc()} linkStatus={LINKED} googleConnected={true} />);
+
+    // Even a content update + the full max-interval window fires NO save while
+    // linked (the linked ref gates every scheduler entry point).
+    act(() => type("an external edit leaking in"));
+    await act(() => vi.advanceTimersByTimeAsync(AUTOSAVE_MAX_INTERVAL_MS));
+    const patches = stub.mock.calls.filter(
+      (c) => (c[1] as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(patches.length).toBe(0);
+  });
+
+  it("Link POST flips the editor into read-only linked mode", async () => {
+    const stub = installFetch(() => Promise.resolve(jsonResponse(LINKED)));
+    render(<SermonEditor document={makeDoc()} googleConnected={true} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Link to Google Docs" }));
+      await Promise.resolve();
+    });
+
+    const call = stub.mock.calls.at(-1);
+    expect(call?.[0]).toBe("/api/documents/doc-1/editor-link");
+    expect((call?.[1] as RequestInit).method).toBe("POST");
+
+    expect(fakeEditor.isEditable).toBe(false);
+    expect(screen.getByTestId("editing-externally-banner")).toBeInTheDocument();
+  });
+
+  it("Pull adopts the returned document into the read-only buffer", async () => {
+    const pulled = makeDoc({ title: "Pulled title", updated_at: "2026-06-22T02:00:00Z" });
+    const stub = installFetch(() => Promise.resolve(jsonResponse(pulled)));
+    render(<SermonEditor document={makeDoc()} linkStatus={LINKED} googleConnected={true} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Pull changes" }));
+      await Promise.resolve();
+    });
+
+    const call = stub.mock.calls.at(-1);
+    expect(call?.[0]).toBe("/api/documents/doc-1/editor-link/pull");
+    expect((call?.[1] as RequestInit).method).toBe("POST");
+    expect(fakeEditor.setContentCalls.length).toBe(1);
+    expect(screen.getByLabelText("Sermon title")).toHaveValue("Pulled title");
+    // Still linked + read-only after a pull.
+    expect(fakeEditor.isEditable).toBe(false);
+  });
+
+  it("Unlink offers BOTH choices; keep-app POSTs {mode:'keep-app'} and returns to editable", async () => {
+    const stub = installFetch(() =>
+      Promise.resolve(jsonResponse({ state: "unlinked", web_url: null, remote_changed: false })),
+    );
+    render(<SermonEditor document={makeDoc()} linkStatus={LINKED} googleConnected={true} />);
+
+    // Open the choice dialog.
+    fireEvent.click(screen.getByRole("button", { name: "Unlink" }));
+    const dialog = screen.getByTestId("unlink-dialog");
+    expect(dialog).toBeInTheDocument();
+    // Both settled choices are offered.
+    expect(screen.getByRole("button", { name: "Pull final copy & unlink" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Keep this version & unlink" })).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Keep this version & unlink" }));
+      await Promise.resolve();
+    });
+
+    const call = stub.mock.calls.at(-1);
+    expect(call?.[0]).toBe("/api/documents/doc-1/editor-link/unlink");
+    const body = JSON.parse((call?.[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body).toEqual({ mode: "keep-app" });
+
+    // Back to editable, banner gone.
+    expect(fakeEditor.isEditable).toBe(true);
+    expect(screen.queryByTestId("editing-externally-banner")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Bold" })).toBeInTheDocument();
+  });
+
+  it("Unlink pull-final POSTs {mode:'pull-final'} then reloads the pulled content", async () => {
+    const stub = installFetch((input, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/editor-link/unlink")) {
+        return Promise.resolve(
+          jsonResponse({ state: "unlinked", web_url: null, remote_changed: false }),
+        );
+      }
+      // The follow-up GET that reloads the final pulled content.
+      return Promise.resolve(jsonResponse(makeDoc({ title: "Final pulled" })));
+    });
+    render(<SermonEditor document={makeDoc()} linkStatus={LINKED} googleConnected={true} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Unlink" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Pull final copy & unlink" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const unlinkCall = stub.mock.calls.find((c) => String(c[0]).endsWith("/editor-link/unlink"));
+    const body = JSON.parse((unlinkCall?.[1] as RequestInit).body as string) as Record<
+      string,
+      unknown
+    >;
+    expect(body).toEqual({ mode: "pull-final" });
+    expect(fakeEditor.isEditable).toBe(true);
+    expect(screen.getByLabelText("Sermon title")).toHaveValue("Final pulled");
+  });
+
+  it("a link failure surfaces the API detail in a dismissable banner", async () => {
+    installFetch(() =>
+      Promise.resolve(
+        jsonResponse(
+          { detail: "Document is already linked to an external editor." },
+          { ok: false, status: 409 },
+        ),
+      ),
+    );
+    render(<SermonEditor document={makeDoc()} googleConnected={true} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Link to Google Docs" }));
+      await Promise.resolve();
+    });
+
+    const banner = screen.getByTestId("link-error");
+    expect(banner).toHaveTextContent("already linked");
+    // Still editable (the link never engaged).
+    expect(fakeEditor.isEditable).toBe(true);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss link error" }));
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId("link-error")).not.toBeInTheDocument();
   });
 });

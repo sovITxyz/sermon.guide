@@ -3,9 +3,11 @@ import {
   DocumentNotFoundError,
   UnauthenticatedError,
   getDocument,
+  getEditorLinkStatus,
+  getIntegrations,
   getLibrary,
 } from "@/lib/api-server";
-import type { DocumentFull, LibraryBookRef } from "@/lib/types";
+import type { DocumentFull, EditorLinkStatus, LibraryBookRef } from "@/lib/types";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
@@ -74,5 +76,37 @@ export default async function SermonEditorPage({ params }: SermonEditorPageProps
     libraryBooks = [];
   }
 
-  return <SermonEditorShell document={document} libraryBooks={libraryBooks} />;
+  // External-editor link state (Phase 45). Fetched server-side on doc open so the
+  // editor opens in the correct mode: when `state === "linked"` the editor is
+  // HARD read-only with the "Editing externally" banner; otherwise editable. A
+  // failed/absent link is `unlinked` (getEditorLinkStatus collapses the
+  // no-oracle 404 and transient errors to unlinked) — never blocks the editor.
+  let linkStatus: EditorLinkStatus = { state: "unlinked", web_url: null, remote_changed: false };
+  try {
+    linkStatus = await getEditorLinkStatus(documentId);
+  } catch {
+    linkStatus = { state: "unlinked", web_url: null, remote_changed: false };
+  }
+
+  // Whether the user has a Google connection — drives whether the editor shows a
+  // "Link to Google Docs" button (connection present) or a "Connect Google in
+  // Settings" hint (no connection). Non-fatal: an empty/failed integrations
+  // fetch just shows the connect hint. No token material crosses the wire —
+  // getIntegrations returns only provider/email/scopes/timestamps.
+  let googleConnected = false;
+  try {
+    const connections = await getIntegrations();
+    googleConnected = connections.some((c) => c.provider === "google");
+  } catch {
+    googleConnected = false;
+  }
+
+  return (
+    <SermonEditorShell
+      document={document}
+      libraryBooks={libraryBooks}
+      linkStatus={linkStatus}
+      googleConnected={googleConnected}
+    />
+  );
 }

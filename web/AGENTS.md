@@ -222,6 +222,78 @@ node lives in `components/editor/`. Locked decisions:
     and `/library` (owned set + titles), bearer-scoped, with `book_id`s that match
     so an inserted citation resolves as OWNED.
 
+## External-editor link — Google Docs read-only lock (Phase 45, B4)
+
+A finished sermon can be linked to a native Google Doc for round-trip editing.
+While linked, the **API is the source of truth** and the in-app editor is HARD
+read-only — the web layer enforces the lock client-side AND surfaces the
+link/pull/unlink affordances, but never holds a token or a Drive file id. Locked
+decisions:
+
+- **The JWT/bearer and ALL provider material NEVER reach the browser.** Only
+  `{state, web_url, remote_changed}` crosses the wire
+  (`lib/types.ts:EditorLinkStatus`). `web_url` (the Drive `webViewLink`) is the
+  **only external string** shown, opened with `rel="noopener noreferrer"
+  target="_blank"`. There is **no** `provider_file_id` in any web payload — the
+  API owns the file id as a server-side capability resolved from the user's OWN
+  editor-link row; the client never sees one and **never forwards one as
+  authoritative** (SSRF/capability guard).
+- **The lock is fetched server-side on doc open.** `app/sermons/[documentId]/page.tsx`
+  fetches `getEditorLinkStatus(documentId)` (`lib/api-server.ts`, bearer stays on
+  the server) alongside the document + library, plus `getIntegrations()` to know
+  whether a Google connection exists. A no-oracle 404 / transient error collapses
+  to `unlinked` (the doc fetch already proved ownership) — the editor never
+  blocks on a link-status error. The status + `googleConnected` thread through
+  `SermonEditorShell` into `SermonEditor`.
+- **HARD read-only when `state === "linked"`** (settled — not warn-and-allow).
+  `SermonEditor` calls `editor.setEditable(false)`, the title input goes
+  `disabled`/`readOnly`, the **entire formatting toolbar + citation drawer +
+  docx round-trip are hidden**, and **autosave is hard-suppressed** via a
+  `linked` ref that gates every scheduler entry point (`runSave`,
+  `scheduleAutosave`, the pagehide flush) — exactly like the `conflicted` ref —
+  so **no PATCH ever fires while linked** and can't clobber the linked
+  source-of-truth. An "Editing externally in Google Docs" banner (`<output>`,
+  implicit `role="status"` — **never `role="alert"`**, the App Router announcer
+  owns that) sits above the read-only editor offering **Open** (anchor to
+  `web_url`), **Pull changes** (POST the pull proxy → reload the buffer with the
+  returned TipTap JSON exactly like the import flow: `setContent` + title +
+  `base_updated_at` + dirty baseline), and **Unlink** (opens the settled
+  **pull-final-vs-keep-app** choice dialog → POSTs the unlink proxy with `{mode}`).
+  `remote_changed` adds a "Changes available in Google — Pull to update" hint.
+- **Unlinked** shows a **"Link to Google Docs"** button (only when a Google
+  connection exists; otherwise a `Connect Google in Settings` hint linking to
+  `/settings/integrations`). Linking POSTs the link proxy and flips the editor to
+  read-only linked mode on the returned `state`.
+- **Four same-origin proxies** under
+  `app/api/documents/[documentId]/editor-link/**` (cookie → bearer server-side,
+  `documentId` URL-encoded into a **FIXED** upstream path, NO client-supplied URL
+  assembly):
+  - `POST /editor-link` — link. **No body forwarded** (the API owns provider +
+    file id). 404 (no-oracle) / 409 (already linked) / 400 (connect Google first)
+    pass through byte-for-byte.
+  - `GET /editor-link/status` — poll. 404 passes through.
+  - `POST /editor-link/pull` — pull. **No body.** Returns the full
+    `DocumentFull` (the editor reloads it as TipTap JSON — **ZERO
+    `dangerouslySetInnerHTML`**). 404 / 413 pass through.
+  - `POST /editor-link/unlink` — body whitelisted to **EXACTLY `{mode}`** (closed
+    set `pull-final` | `keep-app` — `lib/editor-links.ts:whitelistUnlink`); an
+    out-of-set/missing mode 400s **before** the API, and a smuggled
+    `provider_file_id`/`document_id`/`user_id` never reaches the upstream body.
+    404 / 422 pass through.
+- **Tests:** `test/editor-links.test.ts` (the `{mode}` whitelist + drop-smuggled
+  + out-of-set reject), `test/editor-links-routes.test.ts` (cookie→bearer, fixed
+  path, no-body-forward, no token in response, 404/409 passthrough, 400 on a bad
+  mode without an upstream call), `test/components/SermonEditor.test.tsx`
+  (linked→read-only+banner+suppressed autosave; unlinked→editable+Link button vs
+  connect hint; link/pull/unlink-keep-app/unlink-pull-final flows; link-error
+  banner). E2E `e2e/editor-link.spec.ts` (connect Google via the stub consent →
+  link → read-only banner + Open `rel=noopener` + no token in page → pull updates
+  content → unlink keep-app restores editing). The fake api
+  (`e2e/support/fake-api.mjs`) gained the four editor-link endpoints,
+  bearer-scoped with the uniform 404, a deterministic stub `web_url` (file id
+  internal — never echoed), and a `pull`/`unlink pull-final` that overwrites
+  content with a deterministic "pulled" doc.
+
 ## Sermons list — delete + restore (Phase 36, B2 slice C)
 
 `components/SermonList.tsx` is a **client island** (it was a pure server

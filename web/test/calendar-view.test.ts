@@ -70,6 +70,23 @@ describe("parseCalendarState", () => {
     // A structurally-valid YYYY-MM-DD is preserved verbatim.
     expect(parseCalendarState("month", "2024-02-29", NOW).anchor).toBe("2024-02-29");
   });
+
+  it("defaults the year layout to grid and honors layout=planner", () => {
+    expect(parseCalendarState("year", "2026-06-15", NOW).layout).toBe("grid");
+    expect(parseCalendarState("year", "2026-06-15", NOW, "planner").layout).toBe("planner");
+  });
+
+  it("falls back to grid for an unknown/missing layout", () => {
+    expect(parseCalendarState("year", "2026-06-15", NOW, "spreadsheet").layout).toBe("grid");
+    expect(parseCalendarState("year", "2026-06-15", NOW, null).layout).toBe("grid");
+    expect(parseCalendarState("year", "2026-06-15", NOW, "").layout).toBe("grid");
+  });
+
+  it("carries the layout regardless of view (round-trips even on month/week)", () => {
+    // Layout is stored on the state even when the view ignores it, so flipping
+    // view↔layout in the URL never loses the other axis.
+    expect(parseCalendarState("month", "2026-06-15", NOW, "planner").layout).toBe("planner");
+  });
 });
 
 describe("rangeForState", () => {
@@ -140,6 +157,15 @@ describe("seriesColor", () => {
 describe("calendarHref", () => {
   it("builds a normalized linkable href", () => {
     expect(calendarHref("month", "2026-03-15")).toBe("/calendar?view=month&date=2026-03-15");
+    expect(calendarHref("year", "2026-01-01")).toBe("/calendar?view=year&date=2026-01-01");
+  });
+
+  it("serializes only the planner layout, keeping grid/default URLs clean", () => {
+    expect(calendarHref("year", "2026-01-01", "planner")).toBe(
+      "/calendar?view=year&date=2026-01-01&layout=planner",
+    );
+    // The default grid layout omits the param — the canonical clean URL.
+    expect(calendarHref("year", "2026-01-01", "grid")).toBe("/calendar?view=year&date=2026-01-01");
     expect(calendarHref("year", "2026-01-01")).toBe("/calendar?view=year&date=2026-01-01");
   });
 });

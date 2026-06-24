@@ -16,6 +16,7 @@ import {
   weekStart,
   weekdayOf,
   weekdayOfFirst,
+  yearGrid,
   yearRange,
 } from "../lib/dates";
 
@@ -386,5 +387,64 @@ describe("weekRange — half-open [start, end) of exactly 7 days", () => {
 
   it("a Sunday anchor yields the week starting that same day", () => {
     expect(weekRange("2026-06-14")).toEqual({ start: "2026-06-14", end: "2026-06-21" });
+  });
+});
+
+describe("yearGrid — months-down / days-across planner", () => {
+  it("has 12 month-rows in January→December order, each exactly 31 columns wide", () => {
+    const rows = yearGrid(2026);
+    expect(rows).toHaveLength(12);
+    expect(rows.map((r) => r.month)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    for (const row of rows) {
+      expect(row.cells).toHaveLength(31);
+    }
+  });
+
+  it("fills slot i with day i+1 and the canonical YYYY-MM-DD for that day", () => {
+    const rows = yearGrid(2026);
+    // January, day 1 → index 0.
+    expect(rows[0]?.cells[0]).toEqual({ date: "2026-01-01", day: 1, weekend: false });
+    // March (row 2), day 7 → index 6.
+    expect(rows[2]?.cells[6]?.date).toBe("2026-03-07");
+    expect(rows[2]?.cells[6]?.day).toBe(7);
+  });
+
+  it("blocks the trailing slots of a 30-day month (April has no 31st)", () => {
+    const april = yearGrid(2026)[3];
+    expect(april?.month).toBe(4);
+    // Day 30 (index 29) is real; day 31 (index 30) does not exist → null.
+    expect(april?.cells[29]).toEqual({ date: "2026-04-30", day: 30, weekend: false });
+    expect(april?.cells[30]).toBeNull();
+    expect(april?.cells.filter((c) => c === null)).toHaveLength(1);
+  });
+
+  it("blocks Feb 29/30/31 in a common year (2026: 28 days)", () => {
+    const feb = yearGrid(2026)[1];
+    expect(feb?.cells[27]).not.toBeNull(); // day 28 exists
+    expect(feb?.cells[28]).toBeNull(); // day 29
+    expect(feb?.cells[29]).toBeNull(); // day 30
+    expect(feb?.cells[30]).toBeNull(); // day 31
+    expect(feb?.cells.filter((c) => c === null)).toHaveLength(3);
+  });
+
+  it("keeps Feb 29 but blocks 30/31 in a leap year (2024)", () => {
+    const feb = yearGrid(2024)[1];
+    expect(feb?.cells[28]).toEqual({ date: "2024-02-29", day: 29, weekend: false }); // 2024-02-29 is a Thursday
+    expect(feb?.cells[29]).toBeNull(); // day 30
+    expect(feb?.cells.filter((c) => c === null)).toHaveLength(2);
+  });
+
+  it("leaves a 31-day month (January) with no blocked slots", () => {
+    const jan = yearGrid(2026)[0];
+    expect(jan?.cells[30]).toEqual({ date: "2026-01-31", day: 31, weekend: true }); // 2026-01-31 is a Saturday
+    expect(jan?.cells.every((c) => c !== null)).toBe(true);
+  });
+
+  it("flags Saturday/Sunday as weekend and weekdays as not", () => {
+    // June 2026: the 14th is a Sunday (see weekRange tests), so 13=Sat, 15=Mon.
+    const june = yearGrid(2026)[5];
+    expect(june?.cells[12]).toEqual({ date: "2026-06-13", day: 13, weekend: true }); // Saturday
+    expect(june?.cells[13]).toEqual({ date: "2026-06-14", day: 14, weekend: true }); // Sunday
+    expect(june?.cells[14]).toEqual({ date: "2026-06-15", day: 15, weekend: false }); // Monday
   });
 });

@@ -16,8 +16,10 @@ function firstParam(value: string | string[] | undefined): string | null {
 
 /**
  * The sermon calendar (Phase 39 read views + Phase 40 week view & CRUD). All
- * state lives in the URL — `?view=year|month|week&date=YYYY-MM-DD` — so the page
- * is linkable/deep-linkable and a shared link opens the exact view + period. The
+ * state lives in the URL — `?view=year|month|week&date=YYYY-MM-DD` plus an
+ * optional `&layout=grid|planner` for the year view (mini-month grid vs the
+ * horizontal spreadsheet) — so the page is linkable/deep-linkable and a shared
+ * link opens the exact view + period + layout. The
  * server normalizes the (possibly malformed) query into a {@link CalendarState}
  * and computes the single canonical "today" once, then hands both to the client
  * island, which owns the one range fetch (and the create/edit/delete mutations)
@@ -30,7 +32,12 @@ function firstParam(value: string | string[] | undefined): string | null {
  */
 export default async function CalendarPage({ searchParams }: CalendarPageProps) {
   const params = await searchParams;
-  const state = parseCalendarState(firstParam(params.view), firstParam(params.date));
+  const state = parseCalendarState(
+    firstParam(params.view),
+    firstParam(params.date),
+    new Date(),
+    firstParam(params.layout),
+  );
   // Compute "today" on the server so first paint rings the right day without a
   // client/server hydration mismatch.
   const todayStr = today();

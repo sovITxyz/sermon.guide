@@ -32,6 +32,15 @@ export { type SeriesColor, seriesColor } from "@/lib/series-color";
 /** The calendar views: the year wall-planner, a month grid, and a week (Phase 40). */
 export type CalendarViewKind = "year" | "month" | "week";
 
+/**
+ * The two YEAR-view layouts. `grid` is the original twelve-mini-month wall
+ * planner; `planner` is the horizontal "spreadsheet" (months down, days 1–31
+ * across). Orthogonal to {@link CalendarViewKind} and meaningful ONLY when
+ * `view === "year"`; month and week ignore it. `grid` is the default, so a year
+ * URL with no `layout` param stays the canonical clean URL.
+ */
+export type CalendarLayout = "grid" | "planner";
+
 /** The normalized, validated calendar state derived from the URL. */
 export interface CalendarState {
   view: CalendarViewKind;
@@ -41,6 +50,8 @@ export interface CalendarState {
   year: number;
   /** Anchor month, 1-based (1 = January). */
   month: number;
+  /** The year-view layout; `grid` unless view=year & layout=planner (see {@link CalendarLayout}). */
+  layout: CalendarLayout;
 }
 
 /**
@@ -61,9 +72,17 @@ export function parseCalendarState(
   rawView: string | null | undefined,
   rawDate: string | null | undefined,
   now: Date = new Date(),
+  rawLayout: string | null | undefined = null,
 ): CalendarState {
   const view: CalendarViewKind =
     rawView === "month" ? "month" : rawView === "week" ? "week" : "year";
+
+  // The year-view layout. Only "planner" opts into the horizontal spreadsheet;
+  // anything else — a missing/unknown param, or a non-year view — is the default
+  // twelve-mini-month "grid". Stored regardless of view so it round-trips, but
+  // the views ignore it unless `view === "year"`. `rawLayout` is the LAST param
+  // so the established `(…, now)` test seam keeps working unchanged.
+  const layout: CalendarLayout = rawLayout === "planner" ? "planner" : "grid";
 
   let anchor = today(now);
   if (typeof rawDate === "string") {
@@ -81,7 +100,7 @@ export function parseCalendarState(
   }
 
   const { year, month } = parseDate(anchor);
-  return { view, anchor, year, month };
+  return { view, anchor, year, month, layout };
 }
 
 /**
@@ -126,10 +145,22 @@ export function groupByDate(events: readonly CalendarEvent[]): Map<string, Calen
  * the canonical `YYYY-MM-DD`. Used by the prev/next period controls and the
  * year→month / month→week drill-downs. Works unchanged for `"week"` now that
  * {@link CalendarViewKind} widened.
+ *
+ * The optional `layout` serializes ONLY the non-default `"planner"` year layout
+ * (`&layout=planner`); `"grid"` and `undefined` omit it, so every month/week
+ * link and the default grid year stay canonical clean URLs. Pass the current
+ * `state.layout` on year prev/next so paging years stays in the active layout.
  */
-export function calendarHref(view: CalendarViewKind, date: string): string {
+export function calendarHref(
+  view: CalendarViewKind,
+  date: string,
+  layout?: CalendarLayout,
+): string {
   const { year, month, day } = parseDate(date);
   const canonical = formatDate(year, month, day);
   const params = new URLSearchParams({ view, date: canonical });
+  if (layout === "planner") {
+    params.set("layout", "planner");
+  }
   return `/calendar?${params.toString()}`;
 }

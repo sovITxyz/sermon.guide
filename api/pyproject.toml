@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "sermon.guide FastAPI HTTP layer — auth, upload, task status, search."
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "fastapi>=0.115,<0.137",
+  "fastapi>=0.115,<0.139",
   "uvicorn[standard]>=0.32,<0.50",
   # `pydantic[email]` pulls email-validator, required by `EmailStr` fields
   # in the auth schemas. Without it pydantic raises on model definition.
@@ -68,14 +68,14 @@ dependencies = [
   # `worker/convert_node/` bundle become api+worker image deps for Phase 29 to
   # bake (Dockerfiles untouched this phase; the dev box already has them).
   "pypandoc>=1.17,<2",
-  "structlog>=24,<26",
+  "structlog>=24,<27",
   "prometheus-client>=0.20,<1",
   "sentry-sdk[fastapi]>=2,<3",
   # Phase 44: AES-256-GCM token vault (`crypto_vault.py`) — encrypts OAuth
   # refresh/access tokens before they hit Postgres. Promoted from a TRANSITIVE
   # dep (it arrived via `python-jose[cryptography]`) to an EXPLICIT top-level
   # pin so the vault does not rely on jose's transitive resolution.
-  "cryptography>=43,<49",
+  "cryptography>=43,<50",
 ]
 
 [dependency-groups]

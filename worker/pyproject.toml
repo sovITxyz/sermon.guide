@@ -47,7 +47,7 @@ dependencies = [
   # vs botocore's ~80MB, and speaks plain S3 so the future R2/B2 swap stays
   # endpoint+credentials. Rationale recorded in AGENTS.md.
   "minio>=7.2,<8",
-  "structlog>=24,<26",
+  "structlog>=24,<27",
   "sentry-sdk[celery]>=2,<3",
 ]
 

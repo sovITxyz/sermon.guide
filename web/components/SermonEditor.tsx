@@ -1,5 +1,6 @@
 "use client";
 
+import { today } from "@/lib/dates";
 import {
   AUTOSAVE_DEBOUNCE_MS,
   AUTOSAVE_MAX_INTERVAL_MS,
@@ -24,6 +25,7 @@ import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ScheduleSermonPopover } from "./ScheduleSermonPopover";
 import { CitationNode } from "./editor/CitationNode";
 import { LibraryDrawer } from "./editor/LibraryDrawer";
 import { LibraryMembershipProvider } from "./editor/library-membership";
@@ -195,6 +197,12 @@ export function SermonEditor({
   // The LibraryDrawer is opened from a toolbar affordance; closed by default so
   // the editor opens uncluttered.
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Schedule-on-calendar (Phase 47): the popover open flag, and the date of the
+  // most recently scheduled event — non-null shows a confirmation linking to the
+  // calendar. Distinct from the save/link/docx state so a successful schedule
+  // never masquerades as a save.
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduledDate, setScheduledDate] = useState<string | null>(null);
   // DOCX round-trip (Phase 43) UI state: a visible, dismissable message for an
   // export/import failure (the API's 404/413/415/502 surfaces here), and a busy
   // flag that disables both buttons + the file picker during a round-trip so a
@@ -738,6 +746,44 @@ export function SermonEditor({
     [scheduleAutosave],
   );
 
+  // Schedule-on-calendar (Phase 47). The reverse of the calendar-first link
+  // flow: create a calendar event already linked to THIS sermon in one POST (the
+  // create proxy forwards `document_id` since Phase 47; the API ownership-checks
+  // it). The popover owns the date/title/series inputs and we own the fetch,
+  // mirroring the QuickCreatePopover contract. Resolves null on success (show the
+  // confirmation, close the popover) or a human-readable error string shown
+  // inline in the popover.
+  const onScheduleSubmit = useCallback(
+    async (input: {
+      event_date: string;
+      title: string;
+      series: string | null;
+    }): Promise<string | null> => {
+      try {
+        const res = await fetch("/api/sermon-events", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            event_date: input.event_date,
+            title: input.title,
+            series: input.series,
+            document_id: documentId,
+          }),
+          cache: "no-store",
+        });
+        if (!res.ok) {
+          return await readErrorMessage(res, "Could not schedule the sermon.");
+        }
+        setScheduledDate(input.event_date);
+        setScheduleOpen(false);
+        return null;
+      } catch {
+        return "Network error. Please try again.";
+      }
+    },
+    [documentId],
+  );
+
   return (
     <section>
       <div className="mb-4 flex items-baseline justify-between gap-4">
@@ -910,6 +956,20 @@ export function SermonEditor({
             + Citation
           </button>
 
+          {/* Schedule on calendar (Phase 47). Opens a popover that creates a
+            calendar event linked to this sermon. Does NOT depend on the editor
+            instance (it uses the title state + document_id), so it stays usable
+            even before TipTap mounts. */}
+          <button
+            type="button"
+            aria-label="Schedule on calendar"
+            aria-expanded={scheduleOpen}
+            onClick={() => setScheduleOpen((open) => !open)}
+            className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+          >
+            📅 Schedule
+          </button>
+
           {/* DOCX round-trip (Phase 43). Download streams the export proxy as a
             blob and triggers a browser download; Import proxies its click to the
             hidden file input below, then POSTs the chosen .docx and reloads the
@@ -1000,6 +1060,42 @@ export function SermonEditor({
 
       {drawerOpen && !isLinked ? (
         <LibraryDrawer editor={editor} bookTitles={titleMap} onClose={() => setDrawerOpen(false)} />
+      ) : null}
+
+      {scheduleOpen && !isLinked ? (
+        <ScheduleSermonPopover
+          defaultDate={today()}
+          defaultTitle={title}
+          onClose={() => setScheduleOpen(false)}
+          onSubmit={onScheduleSubmit}
+        />
+      ) : null}
+
+      {/* Schedule confirmation (Phase 47). A polite status (NOT an alert) with a
+          deep link to the scheduled day on the calendar; dismissable. */}
+      {scheduledDate !== null ? (
+        <output
+          data-testid="schedule-confirmation"
+          className="mt-3 flex items-start justify-between gap-3 rounded-lg border border-green-300 bg-green-50 p-3"
+        >
+          <p className="text-green-800 text-sm">
+            Scheduled for {scheduledDate}.{" "}
+            <Link
+              href={`/calendar?view=month&date=${scheduledDate}`}
+              className="font-medium underline hover:no-underline"
+            >
+              View on calendar
+            </Link>
+          </p>
+          <button
+            type="button"
+            aria-label="Dismiss schedule confirmation"
+            onClick={() => setScheduledDate(null)}
+            className="shrink-0 text-green-800 text-sm hover:underline"
+          >
+            Dismiss
+          </button>
+        </output>
       ) : null}
 
       <LibraryMembershipProvider ownedBookIds={membership}>

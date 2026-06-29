@@ -10,10 +10,18 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+function makeFile(name: string): File {
+  return new File([new Uint8Array([1, 2, 3])], name, { type: "application/epub+zip" });
+}
+
 function chooseFile(name = "book.epub"): void {
   const input = document.getElementById("file-input") as HTMLInputElement;
-  const file = new File([new Uint8Array([1, 2, 3])], name, { type: "application/epub+zip" });
-  fireEvent.change(input, { target: { files: [file] } });
+  fireEvent.change(input, { target: { files: [makeFile(name)] } });
+}
+
+function chooseFiles(names: string[]): void {
+  const input = document.getElementById("file-input") as HTMLInputElement;
+  fireEvent.change(input, { target: { files: names.map(makeFile) } });
 }
 
 /**
@@ -122,6 +130,114 @@ describe("Uploader", () => {
     await act(() => vi.advanceTimersByTimeAsync(2000));
 
     expect(screen.getByText("Lost track of this upload.")).toBeInTheDocument();
+  });
+
+  it("multi-select shows one row per file, in selection order", async () => {
+    routedFetch({
+      upload: () => new Promise<Response>(() => {}), // never resolves
+      task: () => new Promise<Response>(() => {}),
+    });
+    render(<Uploader />);
+
+    chooseFiles(["genesis.epub", "exodus.epub", "leviticus.epub"]);
+
+    expect(await screen.findByText("genesis.epub")).toBeInTheDocument();
+    const names = screen.getAllByText(/\.epub$/).map((el) => el.textContent);
+    expect(names).toEqual(["genesis.epub", "exodus.epub", "leviticus.epub"]);
+  });
+
+  it("throttles upload POSTs to the concurrency pool, draining the queue", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const pending: Array<() => void> = [];
+    const stub = routedFetch({
+      upload: () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        return new Promise<Response>((resolve) => {
+          pending.push(() => {
+            inFlight -= 1;
+            resolve(jsonResponse(accepted("t")));
+          });
+        });
+      },
+      // Never resolves: we only care about the upload POSTs here, not polling.
+      task: () => new Promise<Response>(() => {}),
+    });
+    render(<Uploader />);
+
+    const postCount = (): number => stub.mock.calls.filter(([url]) => url === "/api/upload").length;
+    const flush = (): Promise<void> =>
+      act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+    // Four files with a cap of three: the fourth must wait. Four (not five) is
+    // deliberate — it's the batch size where an off-by-one in the spawn count
+    // (e.g. re-reading a queue length the workers have already drained) would
+    // start only two workers and this assertion would catch it.
+    chooseFiles(["1.epub", "2.epub", "3.epub", "4.epub"]);
+    await flush();
+
+    // Only the pool's worth of POSTs are in flight; the rest are queued.
+    expect(maxInFlight).toBe(3);
+    expect(postCount()).toBe(3);
+
+    // Each resolution lets exactly one queued file start, never exceeding the cap.
+    while (pending.length > 0) {
+      pending.shift()?.();
+      await flush();
+    }
+
+    expect(postCount()).toBe(4);
+    expect(maxInFlight).toBe(3);
+  });
+
+  it("caps concurrency globally across overlapping selections, not per-selection", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const pending: Array<() => void> = [];
+    const stub = routedFetch({
+      upload: () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        return new Promise<Response>((resolve) => {
+          pending.push(() => {
+            inFlight -= 1;
+            resolve(jsonResponse(accepted("t")));
+          });
+        });
+      },
+      task: () => new Promise<Response>(() => {}),
+    });
+    render(<Uploader />);
+
+    const postCount = (): number => stub.mock.calls.filter(([url]) => url === "/api/upload").length;
+    const flush = (): Promise<void> =>
+      act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+    // Two batches dropped before any upload resolves. A per-selection pool would
+    // run two workers each (four in flight); the shared pool must hold the cap.
+    chooseFiles(["a1.epub", "a2.epub"]);
+    chooseFiles(["b1.epub", "b2.epub"]);
+    await flush();
+
+    expect(maxInFlight).toBe(3);
+
+    // All four still upload exactly once as slots free up.
+    while (pending.length > 0) {
+      pending.shift()?.();
+      await flush();
+    }
+
+    expect(postCount()).toBe(4);
+    expect(maxInFlight).toBe(3);
   });
 
   it("stops polling after unmount (mounted-guard ref)", async () => {

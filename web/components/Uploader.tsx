@@ -14,11 +14,24 @@ interface UploadItem {
 }
 
 const POLL_MS = 2000;
+// Cap simultaneous upload POSTs. Selecting a whole shelf of books shouldn't fire
+// dozens of multipart POSTs at once — that hits the browser's per-host
+// connection limit and piles onto the ingest queue. Polls (cheap GETs) stay
+// unbounded; only the uploads are throttled. The next file starts as soon as an
+// in-flight POST resolves.
+const UPLOAD_CONCURRENCY = 3;
 
 export function Uploader() {
   const [items, setItems] = useState<UploadItem[]>([]);
   const [dragging, setDragging] = useState(false);
   const seq = useRef(0);
+
+  // Component-scoped upload queue + live-worker count. Shared across every
+  // onFiles call so the concurrency cap is GLOBAL: dropping a second batch
+  // while the first is still uploading feeds the same queue and reuses the
+  // running workers instead of spinning up another full pool.
+  const uploadQueue = useRef<{ id: string; file: File }[]>([]);
+  const activeWorkers = useRef(0);
 
   // Tracks whether the component is still mounted so the recursive poll below
   // stops when the user navigates away mid-ingest. Without this, the
@@ -73,16 +86,11 @@ export function Uploader() {
     [updateItem],
   );
 
+  // Send one already-queued file. The optimistic row is created up front in
+  // `onFiles`; this only does the POST + hands off to `poll`. Resolves once the
+  // POST round-trip settles so the worker pool can pull the next file.
   const upload = useCallback(
-    async (file: File): Promise<void> => {
-      seq.current += 1;
-      const id = `u${seq.current}-${file.name}`;
-      // Optimistic row: the file shows up as "Queued…" the instant it's chosen,
-      // before the network round-trip resolves.
-      setItems((prev) => [
-        { id, filename: file.name, status: "PENDING", duplicate: false, error: null },
-        ...prev,
-      ]);
+    async (id: string, file: File): Promise<void> => {
       try {
         const form = new FormData();
         form.append("file", file);
@@ -101,16 +109,56 @@ export function Uploader() {
     [poll, updateItem],
   );
 
+  // One worker of the pool: drain the shared queue one file at a time until it
+  // is empty, then retire (decrementing the live count). The `mounted` check
+  // doubles as the loop guard so a worker stops pulling new files the moment the
+  // user navigates away — abandoned uploads never fire their POST. `upload`
+  // never rejects (it catches its own errors), so the count is always balanced.
+  const runWorker = useCallback(async (): Promise<void> => {
+    while (mounted.current) {
+      const next = uploadQueue.current.shift();
+      if (!next) {
+        break;
+      }
+      await upload(next.id, next.file);
+    }
+    activeWorkers.current -= 1;
+  }, [upload]);
+
   const onFiles = useCallback(
     (files: FileList | null) => {
-      if (!files) {
+      if (!files || files.length === 0) {
         return;
       }
-      for (const file of Array.from(files)) {
-        void upload(file);
+      // Mint a stable id per file and show every row as "Queued…" at once, in
+      // selection order. Appending the whole batch in one setItems keeps the
+      // rows in the order they were picked (prepending each would reverse a
+      // multi-select) and decouples row order from upload-start order.
+      const batch = Array.from(files).map((file) => {
+        seq.current += 1;
+        return { id: `u${seq.current}-${file.name}`, file };
+      });
+      setItems((prev) => [
+        ...prev,
+        ...batch.map(({ id, file }) => ({
+          id,
+          filename: file.name,
+          status: "PENDING",
+          duplicate: false,
+          error: null,
+        })),
+      ]);
+      uploadQueue.current.push(...batch);
+
+      // Top the pool up to the cap. Already-running workers will pick up the
+      // freshly queued files, so we only start as many new workers as there are
+      // free slots AND queued items — never more than UPLOAD_CONCURRENCY total.
+      while (activeWorkers.current < UPLOAD_CONCURRENCY && uploadQueue.current.length > 0) {
+        activeWorkers.current += 1;
+        void runWorker();
       }
     },
-    [upload],
+    [runWorker],
   );
 
   const onDrop = useCallback(
@@ -135,16 +183,17 @@ export function Uploader() {
           dragging ? "border-blue-500 bg-blue-50" : "border-gray-300"
         }`}
       >
-        <p className="mb-3 text-gray-600 text-sm">Drag &amp; drop an EPUB or PDF here</p>
+        <p className="mb-3 text-gray-600 text-sm">Drag &amp; drop EPUBs or PDFs here</p>
         <label
           htmlFor="file-input"
           className="cursor-pointer rounded bg-black px-3 py-2 font-medium text-sm text-white"
         >
-          Choose a file
+          Choose files
         </label>
         <input
           id="file-input"
           type="file"
+          multiple
           accept=".epub,.pdf,application/epub+zip,application/pdf"
           className="sr-only"
           onChange={(e) => {

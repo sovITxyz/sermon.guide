@@ -76,30 +76,43 @@ export function SelectionProvider({
 }) {
   const [bookIds, setBookIds] = useState<string[]>([]);
   const [collectionIds, setCollectionIds] = useState<string[]>([]);
+  // Gates the persist effect below. Until the initial hydration has run, the
+  // empty default selection must NEVER be written back — otherwise a freshly
+  // mounted provider (e.g. on /search, navigated to from /library) would clobber
+  // the value its sibling route persisted before it could read it. Using STATE
+  // (not a ref) is deliberate: the persist effect reads `hydrated` from the
+  // render, so it stays false across the whole initial commit — including React
+  // StrictMode's dev double-invoke — and only writes once the re-render that
+  // carries the hydrated selection lands.
+  const [hydrated, setHydrated] = useState(false);
 
   // Hydrate once from sessionStorage after mount (SSR has no sessionStorage).
   useEffect(() => {
     try {
       const raw = sessionStorage.getItem(SELECTION_STORAGE_KEY);
-      if (raw === null) {
-        return;
+      if (raw !== null) {
+        const parsed = JSON.parse(raw) as { bookIds?: unknown; collectionIds?: unknown };
+        setBookIds(stringArray(parsed.bookIds));
+        setCollectionIds(stringArray(parsed.collectionIds));
       }
-      const parsed = JSON.parse(raw) as { bookIds?: unknown; collectionIds?: unknown };
-      setBookIds(stringArray(parsed.bookIds));
-      setCollectionIds(stringArray(parsed.collectionIds));
     } catch {
       // A malformed/blocked store leaves the empty initial selection in place.
     }
+    setHydrated(true);
   }, []);
 
-  // Persist on every change so the sibling route reads the latest on its mount.
+  // Persist on every change so the sibling route reads the latest on its mount —
+  // but only AFTER hydration, so the empty initial state can't overwrite it.
   useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
     try {
       sessionStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify({ bookIds, collectionIds }));
     } catch {
       // Storage being unavailable degrades to in-memory-only; never throw.
     }
-  }, [bookIds, collectionIds]);
+  }, [hydrated, bookIds, collectionIds]);
 
   const toggleBook = useCallback((bookId: string) => {
     setBookIds((prev) =>

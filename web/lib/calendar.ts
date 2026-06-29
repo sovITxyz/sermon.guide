@@ -8,10 +8,14 @@ import type { CalendarEventCreate, CalendarEventPatch } from "./types";
  * These mirror lib/documents.ts:whitelistCreateDocument /
  * whitelistPatchDocument — a STRUCTURAL whitelist that re-serializes ONLY the
  * allowed fields into a FRESH object so nothing else reaches the API. The
- * CREATE whitelist still DROPS `document_id` (the create-from-date flow POSTs
- * the document first, then PATCHes the event's `document_id` — link is never
- * part of the create body). The PATCH whitelist now FORWARDS `document_id` with
- * the same three-state semantics as `series` (Phase 41 sermon-linking):
+ * CREATE whitelist now FORWARDS `document_id` (Phase 47 schedule-from-sermon):
+ * the editor schedules a sermon by creating an event already linked to it in one
+ * POST (the sermon doc always exists, so the calendar-first POST-then-PATCH
+ * two-step is unnecessary). Forwarding the value verbatim is safe for the same
+ * reason as the PATCH path — the API ownership-checks a non-null `document_id`
+ * and returns a no-oracle 404 on a cross-tenant/nonexistent id. The PATCH
+ * whitelist FORWARDS `document_id` with the same three-state semantics as
+ * `series` (Phase 41 sermon-linking):
  * present-and-string re-links, present-and-null detaches, absent leaves it
  * alone. Forwarding the value verbatim is safe because the API ownership-checks
  * a non-null `document_id` against the JWT user's documents (Phase 38,
@@ -39,12 +43,15 @@ function asRecord(body: unknown): Record<string, unknown> | null {
 
 /**
  * Whitelist for the POST /calendar/events proxy body. Forwards ONLY
- * `event_date` (required string) and `title` (required string), plus `series`
- * and `repeat_weekly_until` when present — each a `string | null` (null is a
- * meaningful "no series" / "no repeat" value the client may send). Every other
- * key — including `document_id` — is dropped by building a fresh object. An
- * absent optional field is OMITTED (not sent as null) so the API's defaults
- * apply. Length/range/cap validation is left to the API (422).
+ * `event_date` (required string) and `title` (required string), plus `series`,
+ * `repeat_weekly_until`, and `document_id` when present — each a `string | null`
+ * (null is a meaningful "no series" / "no repeat" / "no link" value the client
+ * may send). Every other key is dropped by building a fresh object. An absent
+ * optional field is OMITTED (not sent as null) so the API's defaults apply. A
+ * non-null `document_id` (Phase 47) is forwarded as-is: the API ownership-checks
+ * it against the JWT user's documents and returns a no-oracle 404 on a
+ * cross-tenant/nonexistent id, so the proxy must NOT pre-validate it here.
+ * Length/range/cap validation is left to the API (422).
  */
 export function whitelistCreateEvent(body: unknown): CalendarBodyResult<CalendarEventCreate> {
   const record = asRecord(body);
@@ -69,6 +76,12 @@ export function whitelistCreateEvent(body: unknown): CalendarBodyResult<Calendar
       return { ok: false, error: "repeat_weekly_until must be a string or null." };
     }
     out.repeat_weekly_until = record.repeat_weekly_until;
+  }
+  if (record.document_id !== undefined) {
+    if (record.document_id !== null && typeof record.document_id !== "string") {
+      return { ok: false, error: "document_id must be a string or null." };
+    }
+    out.document_id = record.document_id;
   }
   return { ok: true, body: out };
 }

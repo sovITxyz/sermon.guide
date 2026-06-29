@@ -53,9 +53,11 @@ export async function GET(req: Request): Promise<Response> {
 /**
  * Create one or more sermon events (Phase 40). The body goes through a
  * STRUCTURAL whitelist (lib/calendar.ts) — only `event_date`, `title`,
- * `series`, and `repeat_weekly_until` are re-serialized upstream; `document_id`
- * is DROPPED (deferred to Phase 41) before the body reaches the API's
- * `extra="forbid"` gate. Wrong primitive types are a 400 here.
+ * `series`, `repeat_weekly_until`, and `document_id` are re-serialized upstream
+ * before the body reaches the API's `extra="forbid"` gate. `document_id`
+ * (Phase 47 schedule-from-sermon) is forwarded verbatim so the editor can create
+ * an event already linked to a sermon in one POST; the API ownership-checks a
+ * non-null value (no-oracle 404). Wrong primitive types are a 400 here.
  *
  * The 201 response is a LIST (`{ events }`) even for a single create — a
  * `repeat_weekly_until` materializes many independent rows on the API side, so

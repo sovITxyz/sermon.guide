@@ -258,19 +258,24 @@ export interface CalendarEventListResponse {
 
 /**
  * POST /calendar/events body (api/calendar_routes.py CalendarEventCreate,
- * extra="forbid"). The create proxy forwards ONLY these fields: `event_date`
- * and `title` are required; `series` and `repeat_weekly_until` are optional and
- * nullable. `document_id` is DELIBERATELY EXCLUDED here — Phase 40 defers
- * sermon-linking to Phase 41, so a smuggled `document_id` is dropped by the
- * whitelist before it can reach the API. `series: null` is a meaningful value
- * (no series), distinct from omitting the field. Length/range/cap validation
- * (title 1..512, repeat cap, until >= event_date) is the API's 422 to own.
+ * extra="forbid"). The create proxy forwards `event_date` and `title` (required),
+ * plus the optional/nullable `series`, `repeat_weekly_until`, and `document_id`.
+ * `document_id` (Phase 47, schedule-from-sermon) lets the editor create an event
+ * already linked to a sermon in ONE POST — the sermon doc always exists by the
+ * time the editor opens, so the calendar-first POST-then-PATCH two-step is
+ * unnecessary. The API (Phase 38) ownership-checks a non-null `document_id`
+ * against the JWT user's documents and returns a no-oracle 404 on a
+ * cross-tenant/nonexistent id; the proxy forwards it verbatim and never
+ * pre-validates. `series: null` is a meaningful value (no series), distinct from
+ * omitting the field. Length/range/cap validation (title 1..512, repeat cap,
+ * until >= event_date) is the API's 422 to own.
  */
 export interface CalendarEventCreate {
   event_date: string;
   title: string;
   series?: string | null;
   repeat_weekly_until?: string | null;
+  document_id?: string | null;
 }
 
 /**

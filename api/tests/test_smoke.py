@@ -43,3 +43,5 @@ def test_healthz_route_is_registered() -> None:
     assert "/collections/{collection_id}/books" in paths
     assert "/search" in paths
     assert "/search-summary" in paths
+    assert "/search-history" in paths
+    assert "/search-history/{history_id}" in paths

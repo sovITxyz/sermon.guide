@@ -37,6 +37,7 @@ import observability
 import reader
 import readyz
 import search
+import search_history
 import summary
 import uploads
 from crypto_vault import OAuthUnconfiguredError
@@ -210,6 +211,7 @@ app.include_router(library.router)
 app.include_router(reader.router)
 app.include_router(uploads.router)
 app.include_router(search.router)
+app.include_router(search_history.router)
 app.include_router(summary.router)
 app.include_router(readyz.router)
 app.include_router(metrics.router)

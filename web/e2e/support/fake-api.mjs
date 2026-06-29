@@ -78,6 +78,21 @@ const documents = new Map();
 const editorLinks = new Map();
 
 /**
+ * Search-history store (Phase 51 — backs /search-history). Keyed by historyId.
+ * A successful /search-summary INSERTS a row for the JWT user (the real api's
+ * best-effort save-on-summary), so the e2e can run a search, see it appear in
+ * the "Recent" panel, REOPEN it (GET the full row — no second /search-summary
+ * call), and DELETE it. The list endpoint ships a lightweight preview; the
+ * per-id GET ships the whole `result` blob. A non-owned / unknown id is the
+ * uniform no-oracle 404. There is NO retention prune here (the e2e never makes
+ * 100+ rows).
+ *
+ * historyId -> { userId, query, scope_book_ids, scope_collection_ids, result,
+ *                created_at }.
+ */
+const searchHistory = new Map();
+
+/**
  * OAuth connections store (Phase 44 — backs /integrations). Keyed
  * `${userId}:${provider}` so a reconnect overwrites in place (the real api's
  * ON CONFLICT(user_id, provider) upsert). The wire shape carries NO token
@@ -426,11 +441,25 @@ const server = createServer(async (req, res) => {
   // The grounded summary is left whole (its [book:chunk] markers must keep
   // resolving), so the stub does not filter citations.
   if (req.method === "POST" && path === "/search-summary") {
-    if (!userIdFor(req)) {
+    const userId = userIdFor(req);
+    if (!userId) {
       return detail(res, 401, "Not authenticated.");
     }
-    const scope = readScope(await readJson(req));
-    return send(res, 200, { summary: SUMMARY, citations: CITATIONS, degraded: [], scope });
+    const body = await readJson(req);
+    const scope = readScope(body);
+    const result = { summary: SUMMARY, citations: CITATIONS, degraded: [] };
+    // Phase 51 best-effort save-on-summary: persist the whole result so the
+    // "Recent" panel can reopen it without re-running the pipeline.
+    const historyId = randomUUID();
+    searchHistory.set(historyId, {
+      userId,
+      query: typeof body?.query === "string" ? body.query : "",
+      scope_book_ids: scope.book_ids,
+      scope_collection_ids: scope.collection_ids,
+      result,
+      created_at: nextTimestamp(),
+    });
+    return send(res, 200, { ...result, scope });
   }
 
   // --- search (raw hybrid hits, no LLM) -------------------------------------
@@ -472,6 +501,69 @@ const server = createServer(async (req, res) => {
       return detail(res, 401, "Not authenticated.");
     }
     return send(res, 200, { collections: [] });
+  }
+
+  // --- search history (Phase 51) --------------------------------------------
+  // GET /search-history — the caller's saved searches, newest-first, lightweight
+  // (query + scope + summary PREVIEW + created_at, NO full result). Bearer-scoped.
+  if (req.method === "GET" && path === "/search-history") {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const items = [];
+    for (const [id, record] of searchHistory) {
+      if (record.userId !== userId) {
+        continue;
+      }
+      items.push({
+        history_id: id,
+        query: record.query,
+        scope_book_ids: record.scope_book_ids,
+        scope_collection_ids: record.scope_collection_ids,
+        summary_preview: (record.result.summary ?? "").slice(0, PREVIEW_CHARS),
+        created_at: record.created_at,
+      });
+    }
+    // created_at DESC (newest first), matching the real api's list ordering.
+    items.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+    return send(res, 200, { items });
+  }
+
+  // GET full / DELETE one saved search. A non-owned / unknown / non-UUID id
+  // collapses to the SAME uniform 404 (no existence oracle).
+  const historyMatch = path.match(/^\/search-history\/([^/]+)$/);
+  if (historyMatch && (req.method === "GET" || req.method === "DELETE")) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(historyMatch[1]);
+    const record = searchHistory.get(id);
+    const owned = record && record.userId === userId;
+
+    if (req.method === "GET") {
+      if (!owned) {
+        return detail(res, 404, "Search history entry not found.");
+      }
+      return send(res, 200, {
+        history_id: id,
+        query: record.query,
+        scope_book_ids: record.scope_book_ids,
+        scope_collection_ids: record.scope_collection_ids,
+        result: record.result,
+        created_at: record.created_at,
+      });
+    }
+
+    if (req.method === "DELETE") {
+      if (!owned) {
+        return detail(res, 404, "Search history entry not found.");
+      }
+      searchHistory.delete(id);
+      res.writeHead(204);
+      return res.end();
+    }
   }
 
   // --- calendar events collection (Phase 39 GET + Phase 40 POST) ------------

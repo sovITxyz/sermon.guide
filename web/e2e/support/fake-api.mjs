@@ -142,9 +142,17 @@ function fullDoc(id, record) {
     content: record.content,
     content_text: record.content_text,
     schema_version: record.schema_version,
+    // Per-sermon citation scope (Phase 50). Always present; default [].
+    scope_book_ids: record.scope_book_ids,
+    scope_collection_ids: record.scope_collection_ids,
     created_at: record.created_at,
     updated_at: record.updated_at,
   };
+}
+
+/** Keep only the string elements of a value that may be an array (scope clamp). */
+function stringArray(value) {
+  return Array.isArray(value) ? value.filter((el) => typeof el === "string") : [];
 }
 
 /** Preview-only DocumentSummary list item (no `content`). */
@@ -714,6 +722,10 @@ const server = createServer(async (req, res) => {
         content,
         content_text: deriveContentText(content),
         schema_version: SCHEMA_VERSION,
+        // Per-sermon citation scope (Phase 50). The real api clamps to the user's
+        // library / owned collections; the stub just stores the string arrays.
+        scope_book_ids: stringArray(body?.scope_book_ids),
+        scope_collection_ids: stringArray(body?.scope_collection_ids),
         created_at: now,
         updated_at: now,
         deleted_at: null,
@@ -768,8 +780,16 @@ const server = createServer(async (req, res) => {
       const hasTitle = typeof body.title === "string";
       const hasContent =
         typeof body.content === "object" && body.content !== null && !Array.isArray(body.content);
-      if (!hasTitle && !hasContent) {
-        return detail(res, 422, "PATCH must set at least one of title or content.");
+      // Phase 50: the scope arrays are also patchable, so a scope-only PATCH is
+      // valid (the api allows it; the web autosave always sends content too).
+      const hasScopeBook = Array.isArray(body.scope_book_ids);
+      const hasScopeCollection = Array.isArray(body.scope_collection_ids);
+      if (!hasTitle && !hasContent && !hasScopeBook && !hasScopeCollection) {
+        return detail(
+          res,
+          422,
+          "PATCH must set at least one of title, content, scope_book_ids, scope_collection_ids.",
+        );
       }
       // Optimistic concurrency: a base that doesn't match the stored updated_at
       // means another write landed first -> 409 (the stale-tab editor path).
@@ -782,6 +802,13 @@ const server = createServer(async (req, res) => {
       if (hasContent) {
         record.content = body.content;
         record.content_text = deriveContentText(body.content);
+      }
+      // Scope is three-state: present (incl. []) replaces; absent leaves it.
+      if (hasScopeBook) {
+        record.scope_book_ids = stringArray(body.scope_book_ids);
+      }
+      if (hasScopeCollection) {
+        record.scope_collection_ids = stringArray(body.scope_collection_ids);
       }
       record.updated_at = nextTimestamp();
       return send(res, 200, fullDoc(id, record));

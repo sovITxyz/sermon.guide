@@ -51,6 +51,35 @@ export interface DayCell {
   inMonth: boolean;
 }
 
+/**
+ * One cell in the horizontal year planner (the "spreadsheet" year layout): a
+ * single real day of a month. Unlike {@link DayCell} there is no `inMonth` flag
+ * — the planner has no borrowed-adjacent-month padding; a slot that would fall
+ * past the month's last day is simply absent (a `null` in the row), so every
+ * cell here is a real, in-month day.
+ */
+export interface YearPlannerCell {
+  /** `YYYY-MM-DD` for this day. */
+  date: string;
+  /** 1-based day-of-month (1 … 31). */
+  day: number;
+  /** True for Saturday/Sunday, for optional weekend shading. */
+  weekend: boolean;
+}
+
+/**
+ * One month-row of the horizontal year planner: a 1-based `month` and exactly
+ * 31 column slots. Slot index `i` (0-based) is day `i + 1`; a slot is `null`
+ * when that day does not exist in the month (Feb 30/31, the 31st of a 30-day
+ * month), which the view renders as an inert blocked cell.
+ */
+export interface YearPlannerRow {
+  /** 1-based month (1 = January). */
+  month: number;
+  /** Exactly 31 slots; `null` where the day does not exist in this month. */
+  cells: (YearPlannerCell | null)[];
+}
+
 /** A half-open `[start, end)` range of `YYYY-MM-DD` strings (matches the API). */
 export interface DateRange {
   /** Inclusive start, `YYYY-MM-DD`. */
@@ -228,6 +257,43 @@ export function monthGrid(year: number, month: number): DayCell[][] {
  */
 export function monthsOfYear(): number[] {
   return Array.from({ length: 12 }, (_, i) => i + 1);
+}
+
+/**
+ * Build the horizontal year planner grid for `year`: twelve {@link YearPlannerRow}s
+ * (January → December), each a fixed 31-slot row where column `i` (0-based) is
+ * day `i + 1`. A slot is `null` when that day does not exist in the month — Feb
+ * 30/31, and the 31st of any 30-day month — which the planner view renders as an
+ * inert blocked cell. Real slots carry the `YYYY-MM-DD` date, the day number,
+ * and a `weekend` flag.
+ *
+ * Pure string/number arithmetic: dates come from {@link formatDate} and the
+ * weekend flag from {@link weekdayOf} (the only Date hop, `Date.UTC`-based and
+ * therefore timezone-immune). The fixed 31-column shape lets the view render a
+ * clean rectangular months-down / days-across spreadsheet without per-row
+ * column math.
+ */
+export function yearGrid(year: number): YearPlannerRow[] {
+  const rows: YearPlannerRow[] = [];
+  for (let month = 1; month <= 12; month += 1) {
+    const lastDay = daysInMonth(year, month);
+    const cells: (YearPlannerCell | null)[] = [];
+    for (let day = 1; day <= 31; day += 1) {
+      if (day > lastDay) {
+        // The day does not exist in this month — a blocked slot.
+        cells.push(null);
+        continue;
+      }
+      const weekday = weekdayOf(year, month, day);
+      cells.push({
+        date: formatDate(year, month, day),
+        day,
+        weekend: weekday === 0 || weekday === 6,
+      });
+    }
+    rows.push({ month, cells });
+  }
+  return rows;
 }
 
 /**

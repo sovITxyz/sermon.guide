@@ -92,6 +92,95 @@ test("event days show series dots in the year view", async ({ page }) => {
   await expect(october.getByText("Evening Prayer")).toBeVisible();
 });
 
+test("year planner layout: a 12-row × 31-column spreadsheet whose event days drill to week", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  await page.goto(`/calendar?view=year&date=${YEAR}-01-01&layout=planner`);
+
+  // The Planner sub-toggle is active and the spreadsheet renders — the default
+  // twelve-mini-month grid does NOT.
+  await expect(page.getByRole("link", { name: "Planner", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(page.getByTestId("calendar-year-planner")).toBeVisible();
+  await expect(page.getByTestId("calendar-year")).toHaveCount(0);
+
+  // Day-of-month column headers run 1 … 31, and all twelve months are row
+  // headers (their accessible name is the full "Month YEAR" via an sr-only span).
+  await expect(page.getByRole("columnheader", { name: "1", exact: true })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "31", exact: true })).toBeVisible();
+  for (const month of [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ]) {
+    await expect(page.getByRole("rowheader", { name: `${month} ${YEAR}` })).toBeVisible();
+  }
+
+  // A seeded event day (Oct 1 2028 carries two events) is a drill-to-week link
+  // labelled with the date and its event count; clicking it opens that week.
+  const oct1 = page.getByRole("link", { name: /2028-10-01, 2 events/ });
+  await expect(oct1).toBeVisible();
+  await oct1.click();
+  await page.waitForURL(/view=week&date=2028-10-01/);
+  await expect(page.getByTestId("calendar-week")).toBeVisible();
+});
+
+test("the year layout sub-toggle flips between the mini-month grid and the planner", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  // The default year view is the mini-month grid; the Months sub-toggle is active.
+  await page.goto(`/calendar?view=year&date=${YEAR}-01-01`);
+  await expect(page.getByTestId("calendar-year")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Months", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+
+  // Planner → the spreadsheet replaces the grid and the URL gains layout=planner.
+  await page.getByRole("link", { name: "Planner", exact: true }).click();
+  await page.waitForURL(/\?view=year&date=2028-01-01&layout=planner$/);
+  await expect(page.getByTestId("calendar-year-planner")).toBeVisible();
+  await expect(page.getByTestId("calendar-year")).toHaveCount(0);
+
+  // Months → back to the grid, and the layout param drops (canonical clean URL).
+  await page.getByRole("link", { name: "Months", exact: true }).click();
+  await page.waitForURL(/\?view=year&date=2028-01-01$/);
+  await expect(page.getByTestId("calendar-year")).toBeVisible();
+  await expect(page.getByTestId("calendar-year-planner")).toHaveCount(0);
+});
+
+test("year prev/next preserves the active planner layout", async ({ page }) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/calendar");
+
+  await page.goto(`/calendar?view=year&date=${YEAR}-01-01&layout=planner`);
+  await expect(page.getByTestId("calendar-year-planner")).toBeVisible();
+
+  // The Next-year arrow must keep &layout=planner (regression guard: stepHref
+  // threads the layout rather than silently reverting to the mini-month grid).
+  await page.getByRole("link", { name: "Next year", exact: true }).click();
+  await page.waitForURL(/\?view=year&date=2029-01-01&layout=planner$/);
+  await expect(page.getByTestId("calendar-year-planner")).toBeVisible();
+  await expect(page.getByTestId("calendar-year")).toHaveCount(0);
+});
+
 test("?view=month&date=… deep-links straight to the right month", async ({ page }) => {
   const user = await signUp(page, makeUser());
   await loginViaUi(page, user, "/calendar");

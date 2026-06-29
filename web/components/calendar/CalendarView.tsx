@@ -5,6 +5,7 @@ import { MiniMonth } from "@/components/calendar/MiniMonth";
 import { MonthView } from "@/components/calendar/MonthView";
 import { QuickCreatePopover } from "@/components/calendar/QuickCreatePopover";
 import { WeekView } from "@/components/calendar/WeekView";
+import { YearPlannerView } from "@/components/calendar/YearPlannerView";
 import { applyMove, rollbackMove } from "@/lib/calendar-dnd";
 import {
   type CalendarState,
@@ -207,8 +208,21 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
 
   const eventsByDate = groupByDate(events);
 
+  // The year Planner is a 31-column wall-chart — the app shell's `max-w-3xl`
+  // content column (app/layout.tsx) is far too narrow for it, forcing a cramped
+  // horizontal scroll. ONLY in planner mode, break the whole calendar out of
+  // that column to the full viewport width with the standard full-bleed recipe
+  // (`width:100vw; margin-left:calc(50% - 50vw)`, valid because the shell column
+  // is centered). No transform, so the planner's 10px text stays crisp. Every
+  // other view/layout stays in the readable column. `overflow-x-auto` inside
+  // YearPlannerView remains the fallback when the viewport is still narrower
+  // than the grid (mobile).
+  const fullBleed = state.view === "year" && state.layout === "planner";
+
   return (
-    <section>
+    <section
+      className={fullBleed ? "ml-[calc(50%_-_50vw)] w-screen px-4 sm:px-6 lg:px-8" : undefined}
+    >
       <CalendarHeader state={state} />
 
       {status === "error" ? (
@@ -243,7 +257,16 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
         </output>
       ) : null}
 
-      {status === "ready" && state.view === "year" ? (
+      {status === "ready" && state.view === "year" && state.layout === "planner" ? (
+        <YearPlannerView
+          year={state.year}
+          eventsByDate={eventsByDate}
+          colorFor={seriesColor}
+          todayStr={todayStr}
+        />
+      ) : null}
+
+      {status === "ready" && state.view === "year" && state.layout === "grid" ? (
         <div
           data-testid="calendar-year"
           className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
@@ -511,9 +534,15 @@ function CalendarHeader({ state }: { state: CalendarState }) {
   const next = stepHref(state, 1);
 
   // Keep the same anchor when flipping views so year↔month↔week is a smooth pivot.
-  const yearHref = calendarHref("year", formatDate(state.year, state.month, 1));
+  // The Year link preserves the active layout (grid→clean URL, planner→&layout).
+  const yearHref = calendarHref("year", formatDate(state.year, state.month, 1), state.layout);
   const monthViewHref = calendarHref("month", formatDate(state.year, state.month, 1));
   const weekViewHref = calendarHref("week", state.anchor);
+  // The year-layout sub-toggle hrefs (only rendered in the year view): the
+  // anchor stays put, only the layout flips. Grid omits the param (clean URL).
+  const yearAnchor = formatDate(state.year, state.month, 1);
+  const gridLayoutHref = calendarHref("year", yearAnchor);
+  const plannerLayoutHref = calendarHref("year", yearAnchor, "planner");
 
   return (
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -534,32 +563,56 @@ function CalendarHeader({ state }: { state: CalendarState }) {
           →
         </Link>
       </div>
-      <div className="inline-flex overflow-hidden rounded border border-gray-300 text-sm">
-        <Link
-          href={yearHref}
-          aria-current={state.view === "year" ? "page" : undefined}
-          className={`px-3 py-1 ${state.view === "year" ? "bg-black text-white" : "hover:bg-gray-50"}`}
-        >
-          Year
-        </Link>
-        <Link
-          href={monthViewHref}
-          aria-current={state.view === "month" ? "page" : undefined}
-          className={`border-gray-300 border-l px-3 py-1 ${
-            state.view === "month" ? "bg-black text-white" : "hover:bg-gray-50"
-          }`}
-        >
-          Month
-        </Link>
-        <Link
-          href={weekViewHref}
-          aria-current={state.view === "week" ? "page" : undefined}
-          className={`border-gray-300 border-l px-3 py-1 ${
-            state.view === "week" ? "bg-black text-white" : "hover:bg-gray-50"
-          }`}
-        >
-          Week
-        </Link>
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="inline-flex overflow-hidden rounded border border-gray-300 text-sm">
+          <Link
+            href={yearHref}
+            aria-current={state.view === "year" ? "page" : undefined}
+            className={`px-3 py-1 ${state.view === "year" ? "bg-black text-white" : "hover:bg-gray-50"}`}
+          >
+            Year
+          </Link>
+          <Link
+            href={monthViewHref}
+            aria-current={state.view === "month" ? "page" : undefined}
+            className={`border-gray-300 border-l px-3 py-1 ${
+              state.view === "month" ? "bg-black text-white" : "hover:bg-gray-50"
+            }`}
+          >
+            Month
+          </Link>
+          <Link
+            href={weekViewHref}
+            aria-current={state.view === "week" ? "page" : undefined}
+            className={`border-gray-300 border-l px-3 py-1 ${
+              state.view === "week" ? "bg-black text-white" : "hover:bg-gray-50"
+            }`}
+          >
+            Week
+          </Link>
+        </div>
+        {state.view === "year" ? (
+          <div className="inline-flex overflow-hidden rounded border border-gray-300 text-sm">
+            <Link
+              href={gridLayoutHref}
+              aria-current={state.layout === "grid" ? "page" : undefined}
+              className={`px-3 py-1 ${
+                state.layout === "grid" ? "bg-black text-white" : "hover:bg-gray-50"
+              }`}
+            >
+              Months
+            </Link>
+            <Link
+              href={plannerLayoutHref}
+              aria-current={state.layout === "planner" ? "page" : undefined}
+              className={`border-gray-300 border-l px-3 py-1 ${
+                state.layout === "planner" ? "bg-black text-white" : "hover:bg-gray-50"
+              }`}
+            >
+              Planner
+            </Link>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -574,7 +627,8 @@ function prevNextLabel(view: CalendarState["view"], dir: "Previous" | "Next"): s
 /** The prev/next href, stepped by the active view's unit (year / month / week). */
 function stepHref(state: CalendarState, delta: number): string {
   if (state.view === "year") {
-    return calendarHref("year", formatDate(state.year + delta, state.month, 1));
+    // Preserve the active layout so paging years stays in the planner/grid.
+    return calendarHref("year", formatDate(state.year + delta, state.month, 1), state.layout);
   }
   if (state.view === "month") {
     const next = addMonths(state.year, state.month, delta);

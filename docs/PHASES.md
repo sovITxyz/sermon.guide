@@ -2355,6 +2355,29 @@ days** (half-open span `end - start` > 400 → 422; a year view is one call) and
 the weekly-materializer cap = **53 rows** (`repeat_weekly_until` producing > 53
 discrete weekly occurrences → 422).
 
+**DONE — second year layout (added 2026-06-22, implemented 2026-06-24, branch
+`calendar/year-planner-layout`):** the YEAR view ships as TWO switchable
+layouts. (a) The original 12-mini-month wall-planner grid (`grid-cols-3/4` of
+`MiniMonth`) — unchanged. (b) A new **linear / spreadsheet year planner**
+(`web/components/calendar/YearPlannerView.tsx`): one semantic `<table>` with the
+12 months as ROWS (Jan→Dec) and days-of-month **1–31 as COLUMNS**, every cell
+one day — the "huge spreadsheet, months down, days across" wall-chart. Built on
+a new pure `yearGrid(year)` helper in `web/lib/dates.ts` (12 rows × 31 fixed
+slots, `null` where the day doesn't exist → inert blocked cell; vitest-pinned,
+TZ-immune). Non-existent days render blocked; days with events show
+`seriesColor` dots (+"+N") and drill to that day's WEEK view (year stays an
+at-a-glance overview, mirroring the read-only mini-month layout — no DnD/create
+in the planner); weekends faintly shaded, today ringed; sticky day-header row +
+sticky month column over `overflow-x-auto` for narrow screens. State: an
+orthogonal `&layout=grid|planner` discriminator on the URL (`CalendarLayout` in
+`web/lib/calendar-view.ts`; `parseCalendarState` parses it, `calendarHref`
+serializes only the non-default `planner` so grid/month/week URLs stay clean;
+`page.tsx` reads `params.layout`). A "Months | Planner" sub-toggle shows only in
+the year view; year prev/next preserves the active layout. The SAME single
+`GET /sermon-events` year-range fetch drives both (no API work). Tests: `yearGrid`
++ layout cases in `web/test/dates.test.ts` & `calendar-view.test.ts`, two new
+planner specs in `web/e2e/calendar.spec.ts`.
+
 ### B4 — External editor round-trip (export + sync-back)
 
 **What:** export a sermon to the user's preferred editor (Google Docs and/or

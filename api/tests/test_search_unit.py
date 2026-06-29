@@ -52,6 +52,7 @@ from inference import RemoteInferenceError
 from pydantic import ValidationError
 from pymilvus import MilvusException
 from retrieval import RetrievalHit, _build_milvus_filter, rrf_fuse
+from sqlalchemy.dialects import postgresql
 
 import search as search_module
 from search import SearchOutcome, SearchRequest
@@ -169,13 +170,28 @@ def test_rrf_fuse_empty_both_arms_returns_empty() -> None:
 
 
 def test_search_request_forbids_extra_fields() -> None:
-    """Phase 18: a smuggled ``user_id``/``book_ids`` is a hard 422 — the
-    tenant scope comes from the JWT only (closes Phase 12 deviation d).
+    """Phase 18: a smuggled ``user_id`` (or any unknown field) is a hard 422 —
+    the tenant scope comes from the JWT only (closes Phase 12 deviation d).
     ``model_validate`` because pyright already rejects unknown kwargs."""
     with pytest.raises(ValidationError):
         SearchRequest.model_validate({"query": "grace", "user_id": str(uuid.uuid4())})
     with pytest.raises(ValidationError):
-        SearchRequest.model_validate({"query": "grace", "book_ids": [str(uuid.uuid4())]})
+        SearchRequest.model_validate({"query": "grace", "tenant": "evil"})
+
+
+def test_search_request_accepts_optional_scope_fields() -> None:
+    """Phase 49: ``book_ids`` / ``collection_ids`` are now ACCEPTED scope
+    narrowers (no longer a 422). They default to ``None`` (whole library) and
+    only ever narrow — ``run_search`` intersects them with the JWT library."""
+    bare = SearchRequest.model_validate({"query": "grace"})
+    assert bare.book_ids is None
+    assert bare.collection_ids is None
+    bid, cid = uuid.uuid4(), uuid.uuid4()
+    scoped = SearchRequest.model_validate(
+        {"query": "grace", "book_ids": [str(bid)], "collection_ids": [str(cid)]},
+    )
+    assert scoped.book_ids == [bid]
+    assert scoped.collection_ids == [cid]
 
 
 # --- run_search graceful degradation (Phase 22) ------------------------------
@@ -664,3 +680,236 @@ async def test_search_handler_carries_degraded_field(
     )
     assert resp.degraded == ["dense"]
     assert resp.hits == []
+
+
+# --- Phase 49: scoped search (intersection-with-library) ---------------------
+
+
+class _RoutedSession:
+    """Duck-typed ``AsyncSession`` routing the three ``run_search`` statements.
+
+    Routes on the compiled SQL's table (``test_calendar_unit.py`` philosophy):
+    ``user_library`` → the JWT user's library; ``collections`` → the OWNED
+    subset of the requested collection ids; ``collection_books`` → the member
+    books of the requested (owned) collections. ``collection_members`` maps
+    only the collections the user OWNS, so a requested id absent from it is a
+    foreign/nonexistent collection (drives the no-oracle 404 path).
+    """
+
+    def __init__(
+        self,
+        *,
+        library: list[uuid.UUID],
+        collection_members: dict[uuid.UUID, list[uuid.UUID]] | None = None,
+    ) -> None:
+        self.library = library
+        self.collection_members = collection_members or {}
+        self.tables_hit: list[str] = []
+
+    @staticmethod
+    def _requested_ids(params: dict[str, Any]) -> list[uuid.UUID]:
+        """The expanding ``IN (...)`` list rides one param value (a list/tuple)."""
+        for value in params.values():
+            if isinstance(value, (list, tuple)):
+                return list(value)
+        return []
+
+    async def execute(self, stmt: Any) -> _FakeExecuteResult:  # noqa: ANN401
+        compiled = stmt.compile(dialect=postgresql.dialect())
+        sql = str(compiled)
+        params = compiled.params
+        if "FROM user_library" in sql:
+            self.tables_hit.append("user_library")
+            return _FakeExecuteResult(self.library)
+        if "FROM collections" in sql:
+            self.tables_hit.append("collections")
+            requested = self._requested_ids(params)
+            owned = [cid for cid in requested if cid in self.collection_members]
+            return _FakeExecuteResult(owned)
+        if "FROM collection_books" in sql:
+            self.tables_hit.append("collection_books")
+            requested = self._requested_ids(params)
+            members: list[uuid.UUID] = []
+            for cid in requested:
+                members.extend(self.collection_members.get(cid, []))
+            return _FakeExecuteResult(members)
+        msg = f"unexpected statement: {sql}"
+        raise AssertionError(msg)
+
+
+def _capture_arms(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[uuid.UUID]]:
+    """Healthy arms that record the exact ``book_ids`` set each one received."""
+    seen: dict[str, list[uuid.UUID]] = {}
+
+    async def _dense(_query: str, book_ids: list[uuid.UUID]) -> list[RetrievalHit]:
+        seen["dense"] = list(book_ids)
+        return []
+
+    async def _sparse(**kwargs: Any) -> list[RetrievalHit]:
+        seen["sparse"] = list(kwargs["book_ids"])
+        return []
+
+    monkeypatch.setattr(search_module, "_dense_arm", _dense)
+    monkeypatch.setattr(search_module, "bm25_search", _sparse)
+    return seen
+
+
+async def _run_scoped(
+    *,
+    session: _RoutedSession,
+    requested_book_ids: list[uuid.UUID] | None = None,
+    requested_collection_ids: list[uuid.UUID] | None = None,
+) -> SearchOutcome:
+    typed_session: Any = session
+    return await search_module.run_search(
+        query="q",
+        limit=10,
+        do_rerank=False,
+        user_id=uuid.uuid4(),
+        session=typed_session,
+        requested_book_ids=requested_book_ids,
+        requested_collection_ids=requested_collection_ids,
+    )
+
+
+async def test_scope_both_none_searches_whole_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward compatible: omitting both fields scopes both arms to the whole
+    JWT library (no collections query runs)."""
+    seen = _capture_arms(monkeypatch)
+    a, b = uuid.UUID(int=1), uuid.UUID(int=2)
+    session = _RoutedSession(library=[a, b])
+
+    await _run_scoped(session=session)
+
+    assert seen["dense"] == sorted([a, b])
+    assert seen["sparse"] == sorted([a, b])
+    # Only the library was resolved — no collection ownership/member queries.
+    assert session.tables_hit == ["user_library"]
+
+
+async def test_scope_widening_book_ids_is_clamped_to_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE INVARIANT: a request naming books OUTSIDE the library cannot widen
+    scope — the effective set is intersected down to ``requested & library``,
+    and that subset reaches BOTH arms (effective ⊆ library)."""
+    seen = _capture_arms(monkeypatch)
+    a, b = uuid.UUID(int=1), uuid.UUID(int=2)
+    foreign = uuid.UUID(int=999)
+    session = _RoutedSession(library=[a, b])
+
+    # Request a in-library + a foreign id the user does NOT own.
+    await _run_scoped(session=session, requested_book_ids=[a, foreign])
+
+    # The foreign id is dropped; only the in-library intersection survives.
+    assert seen["dense"] == [a]
+    assert seen["sparse"] == [a]
+    assert foreign not in seen["dense"]
+    # effective ⊆ library on both arms.
+    assert set(seen["dense"]) <= set(session.library)
+    assert set(seen["sparse"]) <= set(session.library)
+
+
+async def test_scope_empty_intersection_short_circuits_no_arm_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request fully disjoint from the library → empty effective set → empty
+    outcome with NO arm run (no embed/remote call before the short-circuit)."""
+
+    async def _explode(*_args: Any, **_kwargs: Any) -> list[RetrievalHit]:
+        pytest.fail("retrieval arm must not run for an empty effective scope")
+
+    monkeypatch.setattr(search_module, "_dense_arm", _explode)
+    monkeypatch.setattr(search_module, "bm25_search", _explode)
+    a = uuid.UUID(int=1)
+    foreign = uuid.UUID(int=999)
+    session = _RoutedSession(library=[a])
+
+    outcome = await _run_scoped(session=session, requested_book_ids=[foreign])
+    assert outcome.hits == []
+    assert outcome.degraded == []
+
+
+async def test_scope_collection_member_books_union_then_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An owned collection contributes its member books (∪ ad-hoc book_ids),
+    then the union is clamped to the library; the deduped, sorted subset
+    reaches both arms (effective ⊆ library)."""
+    seen = _capture_arms(monkeypatch)
+    a, b, c = uuid.UUID(int=1), uuid.UUID(int=2), uuid.UUID(int=3)
+    foreign = uuid.UUID(int=999)
+    cid = uuid.UUID(int=500)
+    # The collection names b, c, and a foreign book; library is a, b, c.
+    session = _RoutedSession(
+        library=[a, b, c],
+        collection_members={cid: [b, c, foreign]},
+    )
+
+    # Ad-hoc a + collection {b, c, foreign}. ``a`` repeated to prove dedup.
+    await _run_scoped(
+        session=session,
+        requested_book_ids=[a, a],
+        requested_collection_ids=[cid],
+    )
+
+    # foreign dropped by the library clamp; a/b/c deduped + sorted.
+    assert seen["dense"] == sorted([a, b, c])
+    assert seen["sparse"] == sorted([a, b, c])
+    assert foreign not in seen["dense"]
+    assert set(seen["dense"]) <= set(session.library)
+    # Ownership + member queries both ran.
+    assert "collections" in session.tables_hit
+    assert "collection_books" in session.tables_hit
+
+
+async def test_scope_cross_tenant_collection_id_is_no_oracle_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``collection_id`` the JWT user does not own (foreign/nonexistent) is a
+    no-oracle 404 — and no retrieval arm runs (the gate precedes the fan-out)."""
+
+    async def _explode(*_args: Any, **_kwargs: Any) -> list[RetrievalHit]:
+        pytest.fail("retrieval arm must not run when a scope collection_id is unowned")
+
+    monkeypatch.setattr(search_module, "_dense_arm", _explode)
+    monkeypatch.setattr(search_module, "bm25_search", _explode)
+    a = uuid.UUID(int=1)
+    owned_cid = uuid.UUID(int=500)
+    foreign_cid = uuid.UUID(int=501)
+    session = _RoutedSession(library=[a], collection_members={owned_cid: [a]})
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _run_scoped(session=session, requested_collection_ids=[owned_cid, foreign_cid])
+    assert excinfo.value.status_code == 404
+    # No-oracle: the detail does not confirm which id was the problem.
+    assert str(excinfo.value.detail) == "Collection not found."
+    # The member query never ran past the failed ownership gate.
+    assert "collection_books" not in session.tables_hit
+
+
+async def test_scope_handler_forwards_payload_scope_to_run_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``POST /search`` handler forwards ``book_ids`` / ``collection_ids``
+    verbatim into ``run_search`` (where the intersection guard lives)."""
+    recorded: dict[str, Any] = {}
+
+    async def _fake_run_search(**kwargs: Any) -> SearchOutcome:  # noqa: ANN401
+        recorded.update(kwargs)
+        return SearchOutcome(hits=[], degraded=[])
+
+    monkeypatch.setattr(search_module, "run_search", _fake_run_search)
+    bid, cid = uuid.uuid4(), uuid.uuid4()
+    user: Any = type("U", (), {"user_id": uuid.uuid4()})()
+    session: Any = object()
+
+    await search_module.search(
+        payload=SearchRequest(query="q", book_ids=[bid], collection_ids=[cid]),
+        current_user=user,
+        session=session,
+    )
+    assert recorded["requested_book_ids"] == [bid]
+    assert recorded["requested_collection_ids"] == [cid]

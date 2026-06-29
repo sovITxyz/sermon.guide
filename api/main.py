@@ -27,6 +27,7 @@ from inference import MissingInferenceKeyError, RemoteInferenceError
 
 import auth
 import calendar_routes
+import collections_routes
 import documents
 import editor_links
 import integrations
@@ -201,6 +202,7 @@ app.add_middleware(observability.CorrelationMiddleware)
 
 app.include_router(auth.router)
 app.include_router(calendar_routes.router)
+app.include_router(collections_routes.router)
 app.include_router(documents.router)
 app.include_router(editor_links.router)
 app.include_router(integrations.router)

@@ -467,13 +467,15 @@ const server = createServer(async (req, res) => {
       return send(res, 200, { events });
     }
 
-    // POST create. Validates event_date + title (the proxy already dropped
-    // document_id). When repeat_weekly_until is set, MATERIALIZES independent
-    // weekly rows from event_date THROUGH that date inclusive (anchor + every +7
-    // days <= until), enforcing the real api's caps: until < event_date -> 422,
-    // and occurrence_count > MATERIALIZER_CAP_ROWS (53) -> 422. Each occurrence
-    // is its own row owned by the creator. Response: 201 { events } (a LIST,
-    // event_date ascending) even for a single create.
+    // POST create. Validates event_date + title. `document_id` (Phase 47
+    // schedule-from-sermon) is now forwarded by the proxy and may link the new
+    // event(s) to a sermon in one POST; a non-null id is ownership-checked here
+    // (no-oracle 404) exactly like the PATCH path. When repeat_weekly_until is
+    // set, MATERIALIZES independent weekly rows from event_date THROUGH that date
+    // inclusive (anchor + every +7 days <= until), enforcing the real api's caps:
+    // until < event_date -> 422, and occurrence_count > MATERIALIZER_CAP_ROWS
+    // (53) -> 422. Each occurrence is its own row owned by the creator. Response:
+    // 201 { events } (a LIST, event_date ascending) even for a single create.
     if (req.method === "POST") {
       const body = await readJson(req);
       const eventDate = typeof body?.event_date === "string" ? body.event_date : null;
@@ -483,6 +485,18 @@ const server = createServer(async (req, res) => {
       }
       const series = typeof body?.series === "string" ? body.series : null;
       const until = typeof body?.repeat_weekly_until === "string" ? body.repeat_weekly_until : null;
+      // Phase 38 ownership gate (mirrors PATCH): a NON-NULL document_id must be a
+      // doc owned by the caller; a cross-tenant/nonexistent/non-UUID id collapses
+      // to the SAME no-oracle 404. A null/absent document_id leaves the event
+      // unlinked.
+      const documentId =
+        body !== null && typeof body.document_id === "string" ? body.document_id : null;
+      if (documentId !== null) {
+        const doc = documents.get(documentId);
+        if (!doc || doc.userId !== userId) {
+          return detail(res, 404, "Document not found.");
+        }
+      }
 
       let occurrences = 1;
       if (until !== null) {
@@ -512,7 +526,7 @@ const server = createServer(async (req, res) => {
           event_date: addUtcDays(eventDate, i * 7),
           title,
           series,
-          document_id: null,
+          document_id: documentId,
           created_at: now,
           updated_at: now,
         };

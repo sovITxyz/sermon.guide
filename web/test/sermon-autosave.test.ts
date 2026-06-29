@@ -21,8 +21,13 @@ function doc(text: string): ProseMirrorDoc {
   };
 }
 
-function snap(title: string, text: string): EditorSnapshot {
-  return { title, content: doc(text) };
+function snap(
+  title: string,
+  text: string,
+  scopeBookIds: string[] = [],
+  scopeCollectionIds: string[] = [],
+): EditorSnapshot {
+  return { title, content: doc(text), scopeBookIds, scopeCollectionIds };
 }
 
 describe("timing constants", () => {
@@ -58,15 +63,41 @@ describe("isDirty", () => {
   it("is dirty on a content-only change", () => {
     expect(isDirty(snap("t", "before"), snap("t", "after"))).toBe(true);
   });
+
+  it("is dirty on a scope-only change (Phase 50 — books)", () => {
+    const saved = snap("t", "body", [], []);
+    const scoped = snap("t", "body", ["book-1"], []);
+    expect(isDirty(saved, scoped)).toBe(true);
+  });
+
+  it("is dirty on a scope-only change (Phase 50 — collections)", () => {
+    const saved = snap("t", "body", ["book-1"], []);
+    const scoped = snap("t", "body", ["book-1"], ["coll-1"]);
+    expect(isDirty(saved, scoped)).toBe(true);
+  });
+
+  it("is clean when title, content, and both scope arrays match", () => {
+    const saved = snap("t", "body", ["book-1"], ["coll-1"]);
+    const same = snap("t", "body", ["book-1"], ["coll-1"]);
+    expect(isDirty(saved, same)).toBe(false);
+  });
 });
 
 describe("buildPatchBody", () => {
-  it("emits exactly the three whitelisted fields with the base token", () => {
-    const body = buildPatchBody(snap("Title", "x"), "2026-06-15T10:00:00Z");
-    expect(Object.keys(body).sort()).toEqual(["base_updated_at", "content", "title"]);
+  it("emits the whitelisted fields, the scope arrays, and the base token", () => {
+    const body = buildPatchBody(snap("Title", "x", ["book-1"], ["coll-1"]), "2026-06-15T10:00:00Z");
+    expect(Object.keys(body).sort()).toEqual([
+      "base_updated_at",
+      "content",
+      "scope_book_ids",
+      "scope_collection_ids",
+      "title",
+    ]);
     expect(body.base_updated_at).toBe("2026-06-15T10:00:00Z");
     expect(body.title).toBe("Title");
     expect(body.content).toEqual(doc("x"));
+    expect(body.scope_book_ids).toEqual(["book-1"]);
+    expect(body.scope_collection_ids).toEqual(["coll-1"]);
   });
 });
 

@@ -40,6 +40,8 @@ function makeFullDoc(overrides: Partial<DocumentFull> = {}): DocumentFull {
     content: { type: "doc", content: [{ type: "paragraph" }] },
     content_text: "An opening line.",
     schema_version: 1,
+    scope_book_ids: [],
+    scope_collection_ids: [],
     created_at: "2026-06-15T00:00:00Z",
     updated_at: "2026-06-15T10:00:00Z",
     ...overrides,

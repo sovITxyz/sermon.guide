@@ -36,10 +36,35 @@ function isProseMirrorDoc(value: unknown): value is ProseMirrorDoc {
 }
 
 /**
- * Whitelist for the POST /documents proxy body. Forwards ONLY `title` (string)
- * and `content` (JSON object); every other key is dropped by constructing a
- * fresh object with just those two fields. Title length validation is left to
- * the API (min 1 / max 512 -> 422).
+ * Structural check for an optional `string[]` scope field (Phase 50). Returns a
+ * fresh array when `value` is an array of strings, or `null` to signal "not an
+ * array of strings" (the caller turns that into a 400). An empty array passes
+ * structurally — the per-array caps (book_ids <= 10000, collection_ids <= 500)
+ * and the ownership clamp stay with the API. Mirrors lib/search.ts:asStringArray
+ * (kept local so this proxy module stays independent of the search proxy).
+ */
+function asStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const out: string[] = [];
+  for (const element of value) {
+    if (typeof element !== "string") {
+      return null;
+    }
+    out.push(element);
+  }
+  return out;
+}
+
+/**
+ * Whitelist for the POST /documents proxy body. Forwards `title` (string) and
+ * `content` (JSON object), plus the optional citation-scope arrays
+ * `scope_book_ids`/`scope_collection_ids` (Phase 50) when present; every other
+ * key is dropped by constructing a fresh object. A scope field is OMITTED when
+ * absent (null counts as absent: the API defaults to whole library) and a 400
+ * only when present-but-not-an-array-of-strings. Title length and the per-array
+ * caps are left to the API (422).
  */
 export function whitelistCreateDocument(body: unknown): DocumentBodyResult<DocumentCreate> {
   const record = asRecord(body);
@@ -52,7 +77,22 @@ export function whitelistCreateDocument(body: unknown): DocumentBodyResult<Docum
   if (!isProseMirrorDoc(record.content)) {
     return { ok: false, error: "content must be a JSON object." };
   }
-  return { ok: true, body: { title: record.title, content: record.content } };
+  const out: DocumentCreate = { title: record.title, content: record.content };
+  if (record.scope_book_ids !== undefined && record.scope_book_ids !== null) {
+    const bookIds = asStringArray(record.scope_book_ids);
+    if (bookIds === null) {
+      return { ok: false, error: "scope_book_ids must be an array of strings." };
+    }
+    out.scope_book_ids = bookIds;
+  }
+  if (record.scope_collection_ids !== undefined && record.scope_collection_ids !== null) {
+    const collectionIds = asStringArray(record.scope_collection_ids);
+    if (collectionIds === null) {
+      return { ok: false, error: "scope_collection_ids must be an array of strings." };
+    }
+    out.scope_collection_ids = collectionIds;
+  }
+  return { ok: true, body: out };
 }
 
 /**
@@ -84,6 +124,23 @@ export function whitelistPatchDocument(body: unknown): DocumentBodyResult<Docume
       return { ok: false, error: "content must be a JSON object." };
     }
     out.content = record.content;
+  }
+  // Citation-scope arrays (Phase 50). Present (incl. `[]`) forwards a fresh
+  // array (the API replaces + clamps the stored scope); a null/absent field is
+  // omitted so the API leaves the stored scope untouched.
+  if (record.scope_book_ids !== undefined && record.scope_book_ids !== null) {
+    const bookIds = asStringArray(record.scope_book_ids);
+    if (bookIds === null) {
+      return { ok: false, error: "scope_book_ids must be an array of strings." };
+    }
+    out.scope_book_ids = bookIds;
+  }
+  if (record.scope_collection_ids !== undefined && record.scope_collection_ids !== null) {
+    const collectionIds = asStringArray(record.scope_collection_ids);
+    if (collectionIds === null) {
+      return { ok: false, error: "scope_collection_ids must be an array of strings." };
+    }
+    out.scope_collection_ids = collectionIds;
   }
   return { ok: true, body: out };
 }

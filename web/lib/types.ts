@@ -223,31 +223,47 @@ export interface DocumentFull {
   content: ProseMirrorDoc;
   content_text: string;
   schema_version: number;
+  // Per-sermon citation scope (Phase 50): the clamped book / collection ids the
+  // sermon's citation drawer is limited to. Always present (default `[]`); the
+  // API clamps each set to the JWT user's library / owned collections on write,
+  // so a value here can only name books/collections the user actually owns. An
+  // empty array means "whole library" (the citation drawer searches everything).
+  scope_book_ids: string[];
+  scope_collection_ids: string[];
   created_at: string;
   updated_at: string;
 }
 
 /**
  * POST /documents body (api/documents.py DocumentCreate, extra="forbid"). The
- * create proxy forwards ONLY these two fields — `content_text`/`schema_version`
- * are server-derived/-managed and a smuggled one is dropped here before it can
- * reach the API's 422.
+ * create proxy forwards `title`/`content` plus the optional citation-scope
+ * arrays — `content_text`/`schema_version` are server-derived/-managed and a
+ * smuggled one is dropped here before it can reach the API's 422. The scope
+ * arrays are clamped to the user's library / owned collections server-side, so
+ * omitting them (or sending `[]`) creates a whole-library sermon.
  */
 export interface DocumentCreate {
   title: string;
   content: ProseMirrorDoc;
+  scope_book_ids?: string[];
+  scope_collection_ids?: string[];
 }
 
 /**
  * PATCH /documents/{id} body (api/documents.py DocumentUpdate, extra="forbid").
  * `base_updated_at` (the optimistic-concurrency token) is REQUIRED; at least
- * one of `title`/`content` must be present (the API's 422 owns that rule). The
- * patch proxy forwards ONLY these three fields.
+ * one of `title`/`content`/`scope_book_ids`/`scope_collection_ids` must be
+ * present (the API's 422 owns that rule). The scope arrays are three-state on
+ * the API: ABSENT (omitted) leaves the stored value; PRESENT (incl. `[]`)
+ * replaces it (and is clamped to the user's library / owned collections). The
+ * patch proxy forwards ONLY these fields.
  */
 export interface DocumentPatch {
   base_updated_at: string;
   title?: string;
   content?: ProseMirrorDoc;
+  scope_book_ids?: string[];
+  scope_collection_ids?: string[];
 }
 
 /**

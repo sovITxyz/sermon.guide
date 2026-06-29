@@ -2,12 +2,13 @@ import { SermonEditorShell } from "@/app/sermons/[documentId]/SermonEditorShell"
 import {
   DocumentNotFoundError,
   UnauthenticatedError,
+  getCollections,
   getDocument,
   getEditorLinkStatus,
   getIntegrations,
   getLibrary,
 } from "@/lib/api-server";
-import type { DocumentFull, EditorLinkStatus, LibraryBookRef } from "@/lib/types";
+import type { Collection, DocumentFull, EditorLinkStatus, LibraryBookRef } from "@/lib/types";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
@@ -76,6 +77,19 @@ export default async function SermonEditorPage({ params }: SermonEditorPageProps
     libraryBooks = [];
   }
 
+  // The user's collections (Phase 50) back the editor's Scope control and let it
+  // prune stale (deleted) collection ids out of the citation-search scope before
+  // they reach /search (a deleted collection would otherwise trip the API's
+  // no-oracle 404 and fail every search). Non-fatal: an empty/failed fetch just
+  // means the Scope popover shows no collections and any scoped collection ids
+  // are pruned out of the drawer search — the persisted scope is untouched.
+  let collections: Collection[] = [];
+  try {
+    collections = await getCollections();
+  } catch {
+    collections = [];
+  }
+
   // External-editor link state (Phase 45). Fetched server-side on doc open so the
   // editor opens in the correct mode: when `state === "linked"` the editor is
   // HARD read-only with the "Editing externally" banner; otherwise editable. A
@@ -105,6 +119,7 @@ export default async function SermonEditorPage({ params }: SermonEditorPageProps
     <SermonEditorShell
       document={document}
       libraryBooks={libraryBooks}
+      collections={collections}
       linkStatus={linkStatus}
       googleConnected={googleConnected}
     />

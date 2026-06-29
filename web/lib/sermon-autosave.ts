@@ -42,18 +42,28 @@ export const AUTOSAVE_MAX_INTERVAL_MS = 15000;
  */
 export const KEEPALIVE_BODY_LIMIT = 64 * 1024;
 
-/** The user's in-memory buffer: the editable title + the ProseMirror content. */
+/**
+ * The user's in-memory buffer: the editable title, the ProseMirror content, and
+ * the per-sermon citation scope (Phase 50 — the books / collections the citation
+ * drawer is limited to). The scope arrays ride the SAME autosave path as the
+ * manuscript, so a Scope toggle persists through the existing debounce +
+ * single-flight + 409 machinery with no separate request.
+ */
 export interface EditorSnapshot {
   title: string;
   content: ProseMirrorDoc;
+  scopeBookIds: string[];
+  scopeCollectionIds: string[];
 }
 
 /**
  * True when `next` differs from the last-saved snapshot and is therefore worth
  * a PATCH. `lastSaved === null` means nothing has been saved yet, so any buffer
- * is dirty. Compares the title plus a stable JSON serialization of the content
+ * is dirty. Compares the title, a stable JSON serialization of the content
  * (TipTap returns a fresh object every getJSON(), so reference equality is
- * useless) — an unchanged buffer never PATCHes, mirroring reader shouldPersist.
+ * useless), and the two scope arrays (Phase 50: a Scope-only change must still
+ * trigger a save) — an unchanged buffer never PATCHes, mirroring reader
+ * shouldPersist.
  */
 export function isDirty(lastSaved: EditorSnapshot | null, next: EditorSnapshot): boolean {
   if (lastSaved === null) {
@@ -62,19 +72,30 @@ export function isDirty(lastSaved: EditorSnapshot | null, next: EditorSnapshot):
   if (lastSaved.title !== next.title) {
     return true;
   }
+  if (JSON.stringify(lastSaved.scopeBookIds) !== JSON.stringify(next.scopeBookIds)) {
+    return true;
+  }
+  if (JSON.stringify(lastSaved.scopeCollectionIds) !== JSON.stringify(next.scopeCollectionIds)) {
+    return true;
+  }
   return JSON.stringify(lastSaved.content) !== JSON.stringify(next.content);
 }
 
 /**
- * Build the whitelisted PATCH body: exactly `title`, `content`, and the REQUIRED
- * `base_updated_at` concurrency token. Matches the proxy whitelist
- * (lib/documents.ts whitelistPatchDocument) so nothing extra is ever sent.
+ * Build the whitelisted PATCH body: `title`, `content`, the current citation
+ * scope arrays (Phase 50), and the REQUIRED `base_updated_at` concurrency token.
+ * Matches the proxy whitelist (lib/documents.ts whitelistPatchDocument) so
+ * nothing extra is ever sent. The scope arrays carry the CURRENT scope on every
+ * save (not only when changed), so a content-only edit replays the unchanged
+ * scope — an idempotent no-op server-side (the API re-clamps it), never a wipe.
  */
 export function buildPatchBody(snapshot: EditorSnapshot, baseUpdatedAt: string): DocumentPatch {
   return {
     base_updated_at: baseUpdatedAt,
     title: snapshot.title,
     content: snapshot.content,
+    scope_book_ids: snapshot.scopeBookIds,
+    scope_collection_ids: snapshot.scopeCollectionIds,
   };
 }
 

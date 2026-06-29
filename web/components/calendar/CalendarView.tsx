@@ -208,8 +208,21 @@ export function CalendarView({ state, todayStr }: CalendarViewProps) {
 
   const eventsByDate = groupByDate(events);
 
+  // The year Planner is a 31-column wall-chart — the app shell's `max-w-3xl`
+  // content column (app/layout.tsx) is far too narrow for it, forcing a cramped
+  // horizontal scroll. ONLY in planner mode, break the whole calendar out of
+  // that column to the full viewport width with the standard full-bleed recipe
+  // (`width:100vw; margin-left:calc(50% - 50vw)`, valid because the shell column
+  // is centered). No transform, so the planner's 10px text stays crisp. Every
+  // other view/layout stays in the readable column. `overflow-x-auto` inside
+  // YearPlannerView remains the fallback when the viewport is still narrower
+  // than the grid (mobile).
+  const fullBleed = state.view === "year" && state.layout === "planner";
+
   return (
-    <section>
+    <section
+      className={fullBleed ? "ml-[calc(50%_-_50vw)] w-screen px-4 sm:px-6 lg:px-8" : undefined}
+    >
       <CalendarHeader state={state} />
 
       {status === "error" ? (

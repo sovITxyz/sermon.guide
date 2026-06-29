@@ -44,13 +44,46 @@ describe("whitelistCreateEvent", () => {
     }
   });
 
-  it("DROPS document_id — Phase 41 deferral, never reaches the upstream body", () => {
+  it("forwards a string document_id verbatim to LINK a sermon (Phase 47 schedule-from-sermon)", () => {
     const result = whitelistCreateEvent({
       event_date: "2028-03-15",
       title: "Easter",
       document_id: "11111111-1111-1111-1111-111111111111",
     });
-    expect(result).toEqual({ ok: true, body: { event_date: "2028-03-15", title: "Easter" } });
+    expect(result).toEqual({
+      ok: true,
+      body: {
+        event_date: "2028-03-15",
+        title: "Easter",
+        document_id: "11111111-1111-1111-1111-111111111111",
+      },
+    });
+  });
+
+  it("omits document_id when ABSENT rather than sending null", () => {
+    const result = whitelistCreateEvent({ event_date: "2028-03-15", title: "Easter" });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect("document_id" in result.body).toBe(false);
+    }
+  });
+
+  it("forwards document_id: null verbatim (no link) and rejects a non-string/non-null document_id", () => {
+    const nullLink = whitelistCreateEvent({
+      event_date: "2028-03-15",
+      title: "Easter",
+      document_id: null,
+    });
+    expect(nullLink).toEqual({
+      ok: true,
+      body: { event_date: "2028-03-15", title: "Easter", document_id: null },
+    });
+    expect(
+      whitelistCreateEvent({ event_date: "2028-03-15", title: "Easter", document_id: 12 }).ok,
+    ).toBe(false);
+    expect(
+      whitelistCreateEvent({ event_date: "2028-03-15", title: "Easter", document_id: {} }).ok,
+    ).toBe(false);
   });
 
   it("drops other unknown keys (e.g. a smuggled event_id / user_id)", () => {

@@ -77,15 +77,21 @@ RUN npm ci --omit=dev --prefix /app/worker/convert_node
 ENV PATH="/app/worker/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     NLTK_DATA=/usr/share/nltk_data
-# Bake WordNet (+ omw-1.4, which newer NLTK wants for some WordNet ops) so
-# dedup.signature() never downloads at runtime. The downloader leaves zips
-# that nltk.data.find('corpora/wordnet') can NOT resolve (verified against
-# this image) — extract and drop them, or the first signature() call tries
-# a network download anyway.
-RUN python -m nltk.downloader -d /usr/share/nltk_data wordnet omw-1.4 \
+# Bake every NLTK resource the worker needs at runtime so nothing is ever
+# downloaded — NLTK_DATA (above) is root-owned and the non-root worker can
+# neither write nor download into it. Two consumers:
+#   - dedup.signature() needs WordNet (+ omw-1.4, which newer NLTK wants).
+#   - the 'chunk' stage's LlamaIndex GlobalsHelper reads NLTK_DATA and loads
+#     corpora/stopwords + tokenizers/punkt(_tab); without them baked it tries to
+#     download into this root-owned dir and ingest dies in 'chunk' with
+#     PermissionError / "Resource 'stopwords' not found".
+# The downloader can leave zips that nltk.data.find() won't resolve — extract
+# and drop every zip under the data dir (corpora/ AND tokenizers/).
+RUN python -m nltk.downloader -d /usr/share/nltk_data \
+        wordnet omw-1.4 stopwords punkt punkt_tab \
     && python -c "import zipfile, pathlib; \
 [(zipfile.ZipFile(z).extractall(z.parent), z.unlink()) \
- for z in pathlib.Path('/usr/share/nltk_data/corpora').glob('*.zip')]"
+ for z in pathlib.Path('/usr/share/nltk_data').rglob('*.zip')]"
 WORKDIR /app/worker
 # Drop privileges: the worker reads api-staged uploads from /data/uploads (a
 # named volume shared with the api) plus its app dir / venv / nltk_data (all

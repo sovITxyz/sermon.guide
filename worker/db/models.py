@@ -356,6 +356,84 @@ class Collection(Base):
     __table_args__ = (Index("ix_collections_user_id", "user_id"),)
 
 
+class CollectionBook(Base):
+    """A book placed into a user's collection — the membership row (Phase 48).
+
+    The join half of the B-library collections feature: one row per
+    (collection, book) pairing. Mirrors ``UserLibraryEntry`` (a per-user
+    membership table keyed on ``book_id``) but carries a ``collection_id`` and
+    a DENORMALIZED ``user_id``.
+
+    ``user_id`` is DENORMALIZED — duplicated from the owning ``collections``
+    row (the ``EditorLink`` / ``SermonDocRevision`` precedent) — so the tenant
+    gate filters memberships by the JWT-derived ``user_id`` WITHOUT a join back
+    to ``collections``. Like every user-owned table it MUST be queried scoped
+    to ``user_id`` derived from the request's JWT (CLAUDE.md), never from
+    request input. The ``api/collections_routes.py`` add-books path additionally
+    CLAMPS the requested ``book_id`` set to the owner's ``user_library`` before
+    inserting, so a membership can never name a book the user does not own.
+
+    All three FKs are ON DELETE CASCADE: a membership is meaningless once its
+    collection, its book, or its user is gone. ``book_id`` -> ``global_books``
+    is CASCADE (unlike ``user_library``'s RESTRICT) because the membership is a
+    pure organizational pointer — the dedup invariant that keeps a shared book
+    alive lives on ``user_library``, not here.
+
+    ``UniqueConstraint(collection_id, book_id)`` backs the add-books
+    ``ON CONFLICT (collection_id, book_id) DO NOTHING`` idempotency (re-adding a
+    book already in the collection is a no-op) and forbids duplicate
+    memberships. ``Index(user_id, book_id)`` serves the denormalized tenant
+    gate's doubly-scoped lookups.
+
+    ``added_at`` carries the schema-wide ``server_default=func.now()``; there is
+    no ``updated_at`` — a membership is an immutable pairing (re-added rows are
+    deduped by the unique constraint, never mutated).
+    """
+
+    __tablename__ = "collection_books"
+
+    collection_book_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    collection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("collections.collection_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("global_books.book_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # DENORMALIZED owner — duplicated from the collections row so the tenant
+    # gate filters here without a join back to collections. See class docstring.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Backs ON CONFLICT (collection_id, book_id) DO NOTHING (idempotent
+        # re-add) AND forbids duplicate memberships.
+        UniqueConstraint(
+            "collection_id",
+            "book_id",
+            name="uq_collection_books_collection_book",
+        ),
+        # Doubly-scoped (user_id AND book_id) lookups for the denormalized
+        # tenant gate.
+        Index("ix_collection_books_user_book", "user_id", "book_id"),
+    )
+
+
 class Document(Base):
     """A user's sermon document — canonical TipTap/ProseMirror JSON (Phase 34).
 

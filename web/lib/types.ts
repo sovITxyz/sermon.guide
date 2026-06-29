@@ -473,3 +473,46 @@ export interface CollectionPatch {
 export interface CollectionBooksRequest {
   book_ids: string[];
 }
+
+/**
+ * One row in the lightweight "Recent" search-history list (Phase 51 —
+ * api/search_history.py SearchHistoryItem). Field names/casing match the
+ * FastAPI JSON verbatim. This is the LIST shape: it carries `query`, the
+ * Phase 49 scope the search ran under (`scope_book_ids`/`scope_collection_ids`,
+ * UUID strings), a SHORT `summary_preview` (first SUMMARY_PREVIEW_CHARS of the
+ * saved summary), and `created_at` — never the full `result`/citations blob
+ * (that rides only on the per-id GET, so the list stays cheap). There is NO
+ * `user_id`: the response is tenant-scoped server-side via the JWT.
+ */
+export interface SearchHistoryItem {
+  history_id: string;
+  query: string;
+  scope_book_ids: string[];
+  scope_collection_ids: string[];
+  summary_preview: string;
+  created_at: string;
+}
+
+/**
+ * One FULL saved search (Phase 51 — api/search_history.py SearchHistoryEntry):
+ * the instant-replay shape returned by GET /search-history/{id}. `result` is the
+ * serialized SummaryResponse exactly as it was returned (the API also carries a
+ * `degraded` key that this `SummaryResponse` shape ignores), so the panel
+ * rehydrates SearchPanel's summary + citation render with NO second
+ * /search-summary call (the costly 2–4 min pipeline is never re-run). There is
+ * NO `user_id` — the row is resolved by the JWT user's own history only (a
+ * non-owned / nonexistent / non-UUID id is the API's uniform no-oracle 404).
+ */
+export interface SearchHistoryEntry {
+  history_id: string;
+  query: string;
+  scope_book_ids: string[];
+  scope_collection_ids: string[];
+  result: SummaryResponse;
+  created_at: string;
+}
+
+/** GET /search-history response (api/search_history.py SearchHistoryListResponse). */
+export interface SearchHistoryListResponse {
+  items: SearchHistoryItem[];
+}

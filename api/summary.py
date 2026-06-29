@@ -242,10 +242,15 @@ _WHITESPACE = re.compile(r"\s+")
 class SummaryRequest(BaseModel):
     """Summary payload.
 
-    No ``user_id`` / ``book_ids`` fields — tenant scope is resolved
-    server-side by ``run_search`` from the JWT (see ``search.py``).
-    ``extra="forbid"`` (Phase 18) makes a smuggled extra field a hard
-    422 instead of a silently-dropped key.
+    No ``user_id`` field — tenant scope is resolved server-side by
+    ``run_search`` from the JWT (see ``search.py``). ``book_ids`` /
+    ``collection_ids`` (Phase 49) are OPTIONAL scope narrowers: when present,
+    ``run_search`` INTERSECTS them with the JWT user's ``user_library``
+    (``effective = requested & library``) so a client can only SHRINK scope,
+    never widen it; when omitted the whole library is summarized over
+    (backward compatible). ``extra="forbid"`` (Phase 18) makes a smuggled
+    ``user_id`` — or any other unknown field — a hard 422 instead of a
+    silently-dropped key.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -254,6 +259,11 @@ class SummaryRequest(BaseModel):
     # Feeds ``run_search``'s ``limit`` (the cross-encoder's top-N). The rerank
     # fan-out is 30, so values above that just return the full reranked pool.
     limit_chunks: int = Field(default=20, ge=1, le=100)
+    # Phase 49 scope narrowers — forwarded verbatim into ``run_search``, which
+    # owns the intersection-with-library guard. Caps mirror ``SearchRequest``
+    # (the API is the single 422 owner). ``None``/omitted = whole library.
+    book_ids: list[uuid.UUID] | None = Field(default=None, max_length=10_000)
+    collection_ids: list[uuid.UUID] | None = Field(default=None, max_length=500)
 
 
 class Citation(BaseModel):
@@ -632,6 +642,8 @@ async def search_summary(
         do_rerank=True,
         user_id=current_user.user_id,
         session=session,
+        requested_book_ids=payload.book_ids,
+        requested_collection_ids=payload.collection_ids,
     )
     hits = outcome.hits
     if not hits:

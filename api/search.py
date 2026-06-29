@@ -27,8 +27,14 @@ This is the load-bearing tenant invariant for retrieval (repo-root
   ``user_id`` is an automatic reject.
 - The ``book_id`` set used by both retrieval arms is resolved
   server-side from ``user_library`` for that JWT ``user_id`` on every
-  request. The client cannot widen its own scope by passing
-  ``book_ids: list[UUID]``.
+  request — that resolved library is the *universe*. A client MAY now
+  (Phase 49) narrow the search with ``book_ids`` / ``collection_ids``,
+  but the effective set is ALWAYS the INTERSECTION of the request with
+  that library (``effective = requested & library``): scope can only
+  SHRINK, never widen. ``collection_ids`` are ownership-checked against
+  the JWT user (a foreign/nonexistent id is a no-oracle 404) before
+  their member books join the requested set. Omitting both fields
+  searches the whole library (backward compatible).
 - Every Milvus search includes ``book_id IN (<set>)`` as the filter
   expression; every BM25 search includes ``book_id = ANY(<set>)`` in
   the WHERE clause. An empty library short-circuits to an empty
@@ -168,6 +174,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import CurrentUserDep, SessionDep
+
+# Phase 49: intentionally-exported tenant-scope builders (collections_routes docstring).
+from collections_routes import (
+    _member_book_ids_stmt,  # pyright: ignore[reportPrivateUsage]
+    _owned_collection_ids_stmt,  # pyright: ignore[reportPrivateUsage]
+)
 from highlight import highlight
 from metrics import RETRIEVAL_DEGRADED, RETRIEVAL_STAGE
 from rerank import RERANK_FANOUT, rerank
@@ -246,16 +258,27 @@ class SearchRequest(BaseModel):
     """Search payload.
 
     No ``user_id`` field — that always comes from the JWT (see module docstring).
-    No ``book_ids`` field — the library is resolved server-side.
-    ``extra="forbid"`` (Phase 18) makes that mechanical: a smuggled
-    ``user_id``/``book_ids`` is a hard 422, not a silently-dropped key
-    backed by a reviewer-enforced rule (closes Phase 12 deviation d).
+    ``book_ids`` / ``collection_ids`` (Phase 49) are OPTIONAL scope
+    narrowers: when present, ``run_search`` intersects them with the JWT
+    user's resolved ``user_library`` (``effective = requested & library``) so
+    a client can only SHRINK scope, never widen it; when omitted the whole
+    library is searched (backward compatible). ``extra="forbid"`` (Phase 18)
+    still makes a smuggled ``user_id`` — or any other unknown field — a hard
+    422, not a silently-dropped key (closes Phase 12 deviation d).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1, max_length=1024)
     limit: int = Field(default=10, ge=1, le=100)
+    # Phase 49 scope narrowers. The caps are the single 422 owner (the web
+    # whitelist does structural-only checks). ``book_ids`` matches the
+    # collections add/remove cap (a 10K-book library is bulk-scopable in one
+    # call); ``collection_ids`` is the smaller folder-count cap. ``None`` /
+    # omitted = whole library; both are INTERSECTED with the JWT library in
+    # ``run_search`` so they can only narrow.
+    book_ids: list[uuid.UUID] | None = Field(default=None, max_length=10_000)
+    collection_ids: list[uuid.UUID] | None = Field(default=None, max_length=500)
     # Phase 13 toggle. Default true so the canonical /search pipeline
     # matches ARCHITECTURE.md §5 (hybrid → rerank → highlight) and so
     # Phase 14's summary endpoint can call /search and get pre-pruned
@@ -395,6 +418,15 @@ class SearchOutcome:
 # connection errors can embed hosts and DSNs (the Phase 18 /readyz rule).
 _RETRIEVAL_UNAVAILABLE_DETAIL = "Search is temporarily unavailable; please retry shortly."
 
+# Phase 49: a no-oracle 404 for a scope ``collection_id`` the JWT user does not
+# own (foreign, nonexistent, or already-deleted). Byte-identical to the
+# ``collections_routes`` posture — a search scope must never become an
+# existence oracle for another tenant's collection.
+_COLLECTION_NOT_FOUND = HTTPException(
+    status_code=status.HTTP_404_NOT_FOUND,
+    detail="Collection not found.",
+)
+
 
 def _surviving_arm_hits(
     arm: str,
@@ -439,6 +471,8 @@ async def run_search(
     do_rerank: bool,
     user_id: uuid.UUID,
     session: AsyncSession,
+    requested_book_ids: list[uuid.UUID] | None = None,
+    requested_collection_ids: list[uuid.UUID] | None = None,
 ) -> SearchOutcome:
     """Hybrid → (rerank → highlight) retrieval over *user_id*'s library, minus HTTP.
 
@@ -454,6 +488,17 @@ async def run_search(
     from ``user_library`` for that user. An empty library short-circuits to
     an empty outcome before any embedding or remote call.
 
+    Phase 49 — optional client scope: *requested_book_ids* /
+    *requested_collection_ids* (from the request body) NARROW the search.
+    The resolved library is the UNIVERSE; the effective set is always
+    ``requested & library`` (after ownership-checking the collections and
+    unioning their member books), so a client can only SHRINK scope, never
+    widen it — ``effective ⊆ library`` is the non-negotiable invariant. A
+    foreign/nonexistent ``collection_id`` is a no-oracle 404; both fields
+    ``None``/omitted searches the whole library. An empty effective set
+    (disjoint request, or empty intersection) short-circuits to empty
+    BEFORE any embed/remote call, exactly like an empty library.
+
     Degradation (Phase 22) NEVER widens that scope: ``book_ids`` is resolved
     exactly once above the fan-out and the same list parameterizes both arms
     (Milvus ``book_id in [...]``, SQL ``book_id = ANY(...)``) — a surviving
@@ -466,9 +511,53 @@ async def run_search(
     stmt = select(UserLibraryEntry.book_id).where(
         UserLibraryEntry.user_id == user_id,
     )
-    book_ids: list[uuid.UUID] = list((await session.execute(stmt)).scalars().all())
-    if not book_ids:
+    library: set[uuid.UUID] = set((await session.execute(stmt)).scalars().all())
+    if not library:
         return SearchOutcome(hits=[], degraded=[])
+
+    # Phase 49: optional client-supplied scope. The library resolved above is
+    # the UNIVERSE; a request can only narrow within it. Omitting both fields
+    # searches the whole library (backward compatible).
+    if requested_book_ids is None and requested_collection_ids is None:
+        effective = library
+    else:
+        requested: set[uuid.UUID] = set(requested_book_ids or [])
+        if requested_collection_ids is not None:
+            # Ownership-check the collection ids against the JWT user FIRST: a
+            # foreign/nonexistent id is a no-oracle 404 (the Phase 48
+            # _require_owned_collection posture, in set form), never an oracle
+            # confirming another tenant's collection exists. Both stmt builders
+            # also carry the ``user_id`` predicate (defense in depth).
+            owned = set(
+                (
+                    await session.execute(
+                        _owned_collection_ids_stmt(requested_collection_ids, user_id),
+                    )
+                )
+                .scalars()
+                .all(),
+            )
+            if owned != set(requested_collection_ids):
+                raise _COLLECTION_NOT_FOUND
+            # Union in the member books of the (now all-owned) collections.
+            members = (
+                await session.execute(
+                    _member_book_ids_stmt(requested_collection_ids, user_id),
+                )
+            ).scalars().all()
+            requested |= set(members)
+        # THE INVARIANT (CLAUDE.md): intersect with the library — the effective
+        # set can only SHRINK, never widen. ``effective ⊆ library`` always.
+        effective = requested & library
+
+    if not effective:
+        # Short-circuit BEFORE any embed/remote call: an empty effective set
+        # (disjoint request, or an empty intersection) can return nothing, so
+        # we never run the model or issue a ``book_id in []`` filter.
+        return SearchOutcome(hits=[], degraded=[])
+
+    # Sorted so both retrieval arms receive a deterministic, identical book set.
+    book_ids: list[uuid.UUID] = sorted(effective)
 
     # Phase 22: return_exceptions=True so one arm's failure degrades to the
     # surviving arm instead of bubbling up as a 500 (the Phase 12 audit's
@@ -567,5 +656,7 @@ async def search(
         do_rerank=payload.rerank,
         user_id=current_user.user_id,
         session=session,
+        requested_book_ids=payload.book_ids,
+        requested_collection_ids=payload.collection_ids,
     )
     return SearchResponse(hits=outcome.hits, degraded=outcome.degraded)

@@ -366,6 +366,19 @@ function addUtcDays(value, delta) {
   return `${yy}-${mm}-${dd}`;
 }
 
+/**
+ * Phase 49 — pull the scope (book_ids/collection_ids) out of a /search or
+ * /search-summary body. The real api intersects these with the JWT user's
+ * library; the stub just echoes them back (and /search filters its hits by
+ * book_ids) so an e2e can prove the chosen scope reached the api. A missing /
+ * non-array field collapses to [].
+ */
+function readScope(body) {
+  const strings = (value) =>
+    Array.isArray(value) ? value.filter((element) => typeof element === "string") : [];
+  return { book_ids: strings(body?.book_ids), collection_ids: strings(body?.collection_ids) };
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
   const path = url.pathname;
@@ -400,24 +413,35 @@ const server = createServer(async (req, res) => {
   }
 
   // --- search-summary -------------------------------------------------------
+  // Phase 49: accepts the optional scope (book_ids/collection_ids) and ECHOES it
+  // back under `scope` so an e2e can confirm the chosen scope reached the api.
+  // The grounded summary is left whole (its [book:chunk] markers must keep
+  // resolving), so the stub does not filter citations.
   if (req.method === "POST" && path === "/search-summary") {
     if (!userIdFor(req)) {
       return detail(res, 401, "Not authenticated.");
     }
-    await readJson(req); // drain {query}
-    return send(res, 200, { summary: SUMMARY, citations: CITATIONS, degraded: [] });
+    const scope = readScope(await readJson(req));
+    return send(res, 200, { summary: SUMMARY, citations: CITATIONS, degraded: [], scope });
   }
 
   // --- search (raw hybrid hits, no LLM) -------------------------------------
   // Backs the Phase 37 in-editor LibraryDrawer. Bearer-scoped like the rest;
   // returns the deterministic SEARCH_HITS (already tenant-scoped in the real api
   // — the JWT user's library — so the stub just gates on a valid session).
+  // Phase 49: when the body carries a non-empty `book_ids` scope the stub SHRINKS
+  // the hit set to those books (the real api intersects with the library) and
+  // echoes the scope back.
   if (req.method === "POST" && path === "/search") {
     if (!userIdFor(req)) {
       return detail(res, 401, "Not authenticated.");
     }
-    await readJson(req); // drain {query}
-    return send(res, 200, { hits: SEARCH_HITS, degraded: [] });
+    const scope = readScope(await readJson(req));
+    const hits =
+      scope.book_ids.length > 0
+        ? SEARCH_HITS.filter((hit) => scope.book_ids.includes(hit.book_id))
+        : SEARCH_HITS;
+    return send(res, 200, { hits, degraded: [], scope });
   }
 
   // --- library --------------------------------------------------------------
@@ -428,6 +452,18 @@ const server = createServer(async (req, res) => {
       return detail(res, 401, "Not authenticated.");
     }
     return send(res, 200, { books: LIBRARY });
+  }
+
+  // --- collections (Phase 48 list) ------------------------------------------
+  // The /library + /search server components fetch this alongside /library
+  // (Phase 49 scoped search). The stub keeps no collection store yet, so a fresh
+  // user has none — an empty list is enough for the scoped-search flow, which
+  // selects ad-hoc books. Bearer-scoped like the rest.
+  if (req.method === "GET" && path === "/collections") {
+    if (!userIdFor(req)) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    return send(res, 200, { collections: [] });
   }
 
   // --- calendar events collection (Phase 39 GET + Phase 40 POST) ------------

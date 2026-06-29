@@ -53,3 +53,38 @@ test("an empty query surfaces a client-side validation error and never searches"
   await expect(page.getByText("Enter a question to search for.")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Summary" })).toHaveCount(0);
 });
+
+/**
+ * Scoped search (Phase 49): tick a book on /library, jump to /search via "Search
+ * these", and confirm the chosen scope rides over (the "N selected" label) and is
+ * folded into the /search-summary POST as `book_ids` — an INTERSECTION the api
+ * clamps to the library. The selection bridges the two routes through
+ * sessionStorage (no query string).
+ */
+test("scoping to a selected library book carries book_ids into the summary search", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/library");
+
+  // Tick one of the two seeded library books; the selection bar reflects it.
+  await page.getByLabel("Select On Grace").check();
+  await expect(page.getByTestId("selection-summary")).toHaveText(/1 book selected/);
+
+  // "Search these" is a same-tab nav to /search; the selection persists.
+  await page.getByRole("link", { name: "Search these" }).click();
+  await expect(page).toHaveURL(/\/search$/);
+  await expect(page.getByTestId("search-scope")).toHaveText("Searching 1 selected book.");
+
+  // The summary POST must carry the selected book_ids (scope -> api intersection).
+  const summaryRequest = page.waitForRequest(
+    (req) => req.url().endsWith("/api/search-summary") && req.method() === "POST",
+  );
+  await page.getByLabel("Question").fill("How do grace and faith relate?");
+  await page.getByRole("button", { name: "Search" }).click();
+  const body = JSON.parse((await summaryRequest).postData() ?? "{}");
+  expect(body.book_ids).toEqual(["11111111-1111-1111-1111-111111111111"]);
+
+  // The (stubbed) scoped summary still renders.
+  await expect(page.getByRole("heading", { name: "Summary" })).toBeVisible();
+});

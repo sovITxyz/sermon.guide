@@ -1,5 +1,5 @@
-import { LibraryTable } from "@/components/LibraryTable";
-import { CollectionsPanel } from "@/components/library/CollectionsPanel";
+import { LibraryBrowser } from "@/components/library/LibraryBrowser";
+import { SelectionProvider } from "@/components/library/selection-context";
 import { UnauthenticatedError, getCollections, getLibrary } from "@/lib/api-server";
 import type { Collection, LibraryBook } from "@/lib/types";
 import Link from "next/link";
@@ -26,10 +26,10 @@ export default async function LibraryPage() {
           Upload a book
         </Link>
       </div>
-      <LibraryTable books={books} />
-      <div className="mt-8">
-        <CollectionsPanel collections={collections} books={books} />
-      </div>
+      {/* The shared selection spans /library + /search via sessionStorage. */}
+      <SelectionProvider collections={collections}>
+        <LibraryBrowser books={books} collections={collections} />
+      </SelectionProvider>
     </section>
   );
 }

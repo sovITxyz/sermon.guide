@@ -1,8 +1,9 @@
 "use client";
 
+import { useSelection } from "@/components/library/selection-context";
 import { readHref } from "@/lib/library";
 import { displaySection, formatElapsed, searchQueryProblem, segmentSummary } from "@/lib/summary";
-import type { SummaryResponse } from "@/lib/types";
+import type { SummaryRequest, SummaryResponse } from "@/lib/types";
 import Link from "next/link";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
@@ -11,7 +12,15 @@ import { type FormEvent, useEffect, useRef, useState } from "react";
 // is line-based).
 const PREVIEW_TOGGLE_CHARS = 280;
 
-export function SearchPanel() {
+/**
+ * `totalBooks` (the JWT user's library size, server-fetched on the /search page)
+ * backs the unscoped "Searching all N books" label. It is optional so the
+ * component still renders bare in tests / outside the page.
+ */
+export function SearchPanel({ totalBooks }: { totalBooks?: number }) {
+  // The shared library selection (Phase 49). Empty (no provider, or nothing
+  // ticked) => whole library: the scope fields are omitted from the POST.
+  const { bookIds, collectionIds, resolved } = useSelection();
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
@@ -53,10 +62,21 @@ export function SearchPanel() {
     setResult(null);
     setExpanded(new Set());
     try {
+      // Fold the shared selection into the POST scope: the RAW selection (ad-hoc
+      // book_ids + whole collection_ids) so the API re-resolves collections to
+      // their current membership + ownership and intersects with the library.
+      // Empty arrays are OMITTED (= whole library).
+      const body: SummaryRequest = { query: q };
+      if (bookIds.length > 0) {
+        body.book_ids = bookIds;
+      }
+      if (collectionIds.length > 0) {
+        body.collection_ids = collectionIds;
+      }
       const res = await fetch("/api/search-summary", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify(body),
       });
       if (!mounted.current) {
         return;
@@ -118,6 +138,16 @@ export function SearchPanel() {
           {searching ? "Searching…" : "Search"}
         </button>
       </form>
+
+      {/* Scope hint. A plain <p> (NOT role=status) so it never collides with the
+          in-flight searching <output>. */}
+      <p className="text-gray-500 text-xs" data-testid="search-scope">
+        {resolved.length > 0
+          ? `Searching ${resolved.length} selected ${resolved.length === 1 ? "book" : "books"}.`
+          : totalBooks === undefined
+            ? "Searching your whole library."
+            : `Searching all ${totalBooks} ${totalBooks === 1 ? "book" : "books"} in your library.`}
+      </p>
 
       {error ? (
         <p role="alert" className="text-red-600 text-sm">

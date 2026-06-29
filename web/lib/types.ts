@@ -369,3 +369,65 @@ export interface UnlinkRequest {
 export interface AuthorizeResponse {
   authorize_url: string;
 }
+
+/**
+ * One library collection (api/collections_routes.py CollectionResponse,
+ * Phase 48) — the GET / POST / PATCH / books response shape. Field names/casing
+ * match the FastAPI JSON verbatim. A collection is a user-owned folder grouping
+ * books in the library; `book_ids` is its CURRENT membership (the JWT user's
+ * rows, in insertion order). `description` is nullable. There is NO `user_id` —
+ * the response is tenant-scoped server-side via the JWT.
+ */
+export interface Collection {
+  collection_id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  book_ids: string[];
+}
+
+/**
+ * GET /collections response (api/collections_routes.py CollectionListResponse).
+ * Just `collections`, newest-first — no pagination/total.
+ */
+export interface CollectionListResponse {
+  collections: Collection[];
+}
+
+/**
+ * POST /collections body (api/collections_routes.py CollectionCreate,
+ * extra="forbid"). The create proxy forwards `name` (required) plus the
+ * optional/nullable `description`; a smuggled `user_id` is dropped before it can
+ * reach the API's 422. Length caps (name 1..255, description <= 2000) are the
+ * API's 422 to own — the web whitelist does structural checks only.
+ */
+export interface CollectionCreate {
+  name: string;
+  description?: string | null;
+}
+
+/**
+ * PATCH /collections/{id} body (api/collections_routes.py CollectionUpdate,
+ * extra="forbid"). Both fields optional; the API's 422 owns the
+ * at-least-one-of rule and the length checks. `description` is three-state:
+ * absent leaves it, present-and-null clears it, present-and-string replaces it
+ * — so it is `string | null` when present, omitted when absent. `name` is the
+ * NOT-NULL column, so it is `string` (never null) when present, omitted when
+ * absent.
+ */
+export interface CollectionPatch {
+  name?: string;
+  description?: string | null;
+}
+
+/**
+ * POST/DELETE /collections/{id}/books body (api/collections_routes.py
+ * CollectionBooksRequest, extra="forbid"). `book_ids` is required. On the add
+ * path the API CLAMPS the set to the owner's library (a foreign/unowned id is
+ * silently dropped) before any insert — the web whitelist forwards the array
+ * structurally and never pre-validates ownership. The cap (1..10000) is the
+ * API's 422 to own.
+ */
+export interface CollectionBooksRequest {
+  book_ids: string[];
+}

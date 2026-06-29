@@ -12,13 +12,56 @@ describe("whitelistSearch", () => {
     expect(result).toEqual({ ok: true, body: { query: "grace" } });
   });
 
-  it("drops smuggled tenant fields — they never reach the API's extra=forbid gate", () => {
+  it("drops a smuggled user_id but FORWARDS the Phase 49 scope arrays", () => {
+    // user_id is not a scope field — it stays dropped (the API's extra=forbid
+    // owns it). book_ids/collection_ids ARE forwarded so the API can intersect
+    // them with the JWT user's library (intersection, never a replacement).
     const result = whitelistSearch({
       query: "grace",
       user_id: "11111111-1111-1111-1111-111111111111",
       book_ids: ["22222222-2222-2222-2222-222222222222"],
     });
+    expect(result).toEqual({
+      ok: true,
+      body: { query: "grace", book_ids: ["22222222-2222-2222-2222-222222222222"] },
+    });
+  });
+
+  it("forwards book_ids and collection_ids arrays when present", () => {
+    const result = whitelistSearch({
+      query: "grace",
+      book_ids: ["b1", "b2"],
+      collection_ids: ["c1"],
+    });
+    expect(result).toEqual({
+      ok: true,
+      body: { query: "grace", book_ids: ["b1", "b2"], collection_ids: ["c1"] },
+    });
+  });
+
+  it("omits the scope fields entirely when absent (= whole library)", () => {
+    expect(whitelistSearch({ query: "grace" })).toEqual({
+      ok: true,
+      body: { query: "grace" },
+    });
+  });
+
+  it("treats a null scope field as absent — whole library, omitted from the body", () => {
+    // The API's field is `list | None` defaulting to None, so a null is equivalent
+    // to omitting it; the proxy drops it rather than 400ing.
+    const result = whitelistSearch({ query: "grace", book_ids: null, collection_ids: null });
     expect(result).toEqual({ ok: true, body: { query: "grace" } });
+  });
+
+  it("forwards an EMPTY scope array structurally (the min cap is the API's 422)", () => {
+    const result = whitelistSearch({ query: "grace", book_ids: [] });
+    expect(result).toEqual({ ok: true, body: { query: "grace", book_ids: [] } });
+  });
+
+  it("rejects a scope field that is present but not an array of strings", () => {
+    expect(whitelistSearch({ query: "grace", book_ids: "b1" }).ok).toBe(false);
+    expect(whitelistSearch({ query: "grace", book_ids: [1, 2] }).ok).toBe(false);
+    expect(whitelistSearch({ query: "grace", collection_ids: [{}] }).ok).toBe(false);
   });
 
   it("rejects non-object bodies (malformed JSON parses to null upstream of this)", () => {

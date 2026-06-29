@@ -53,13 +53,39 @@ export interface SummaryResponse {
 
 /**
  * POST /search body (api/search.py SearchRequest, extra="forbid"). The search
- * proxy forwards ONLY `query` — `limit`/`rerank` stay at the API defaults so a
- * client cannot widen the retrieval fan-out or flip off the rerank/highlight
- * pipeline through this proxy. A smuggled `user_id`/`book_ids` never reaches
- * the API's 422 because the proxy drops it before serializing the body.
+ * proxy forwards `query` plus the optional SCOPE fields `book_ids` /
+ * `collection_ids` (Phase 49) when the caller supplies them; `limit`/`rerank`
+ * stay at the API defaults so a client cannot widen the retrieval fan-out or
+ * flip off the rerank/highlight pipeline through this proxy.
+ *
+ * SCOPE IS AN INTERSECTION, NEVER A REPLACEMENT. An OMITTED `book_ids` /
+ * `collection_ids` (the empty-selection default) means "whole library"; when
+ * present, the API resolves the JWT user's library server-side and intersects
+ * the requested set with it (a foreign/unknown id can only SHRINK the search,
+ * never widen it), ownership-checking each `collection_id` with a no-oracle 404.
+ * The proxy whitelist forwards each array STRUCTURALLY (array-of-strings) and
+ * omits it when absent; a smuggled `user_id` is still dropped before the body
+ * reaches the API's `extra="forbid"` gate. The per-array caps (book_ids
+ * <= 10000, collection_ids <= 500) are the API's 422 to own.
  */
 export interface SearchRequest {
   query: string;
+  book_ids?: string[];
+  collection_ids?: string[];
+}
+
+/**
+ * POST /search-summary body (api/summary.py SummaryRequest, extra="forbid").
+ * Same shape and the SAME scope contract as SearchRequest (Phase 49): `query`
+ * plus the optional `book_ids` / `collection_ids` scope, intersected with the
+ * JWT user's library server-side. The summary proxy whitelists these fields
+ * (lib/summary.ts:whitelistSummary) the way the /search proxy whitelists its
+ * body; an omitted scope searches the whole library.
+ */
+export interface SummaryRequest {
+  query: string;
+  book_ids?: string[];
+  collection_ids?: string[];
 }
 
 /**

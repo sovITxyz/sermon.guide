@@ -51,9 +51,12 @@ test("a summary search is saved to Recent, reopens without re-running, then dele
   const historyGet = page.waitForRequest(
     (req) => req.method() === "GET" && /\/api\/search-history\/[^/]+$/.test(req.url()),
   );
-  const openRow = recent
-    .locator("li", { has: deleteRow })
-    .getByRole("button", { name: new RegExp(`^${escapeRegExp(question)}`) });
+  // The row-open button's accessible name STARTS WITH the query (the Delete
+  // button's starts with "Delete recent search:"), so an anchored-regex match is
+  // unambiguous — no need to filter the <li> by the delete button.
+  const openRow = recent.getByRole("button", {
+    name: new RegExp(`^${escapeRegExp(question)}`),
+  });
   await openRow.click();
   await historyGet;
 

@@ -894,3 +894,87 @@ class SermonEvent(Base):
         # services one Sunday is normal.
         Index("ix_sermon_events_user_date", "user_id", "event_date"),
     )
+
+
+class SearchHistory(Base):
+    """One saved ``/search-summary`` run — query + scope + the full result (Phase 51).
+
+    The persistence half of the "Recent" panel on ``/search``. A summary
+    search is expensive (the 4-leg embed → rerank → highlight → LLM pipeline,
+    2–4 min wall time), so each successful run is saved WHOLE — the user can
+    reopen a past search and the saved ``result`` blob renders instantly
+    without re-running (and re-paying for) the pipeline. ``api/summary.py``
+    writes a row BEST-EFFORT after a successful summary (a write failure never
+    turns the costly, already-computed answer into a 5xx); ``api/search_history.py``
+    serves the list / full-entry / delete surface.
+
+    User-owned like ``documents`` / ``sermon_events``: every query MUST filter
+    by ``user_id`` (JWT-derived); a non-owned ``history_id`` is a uniform 404
+    with no existence oracle (the Phase 20 ``/tasks`` posture). The FK ->
+    ``users.user_id`` is ON DELETE CASCADE — a saved search is meaningless once
+    its user is gone.
+
+    ``query`` is the natural-language question (saved verbatim — unlike the
+    Phase 27 metrics path, which deliberately SCRUBS query text; this is the
+    user's OWN history, shown back only to them). ``scope_book_ids`` /
+    ``scope_collection_ids`` are the Phase 49 scope the search ran under (the
+    book / collection UUIDs as text), so the panel can show what was searched.
+    ``result`` is the serialized ``SummaryResponse`` (``summary`` + ``citations``
+    + ``degraded``) — the whole replayable blob, JSONB.
+
+    ``created_at`` carries the schema-wide ``server_default=func.now()`` and has
+    NO ``onupdate`` — a saved search is an IMMUTABLE row (the
+    ``SermonDocRevision`` precedent), never mutated after insert.
+    ``Index("ix_search_history_user_created", user_id, created_at DESC)`` backs
+    the panel's newest-first per-user list (the ``ix_documents_user_updated``
+    precedent) AND the per-user retention-cap prune (newest-N kept).
+    """
+
+    __tablename__ = "search_history"
+
+    history_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # The natural-language question, saved verbatim (this is the user's own
+    # history; the Phase 27 metrics path scrubs query text, this does not).
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    # The Phase 49 scope the search ran under — book / collection UUIDs as text.
+    # Empty = whole library. Tiny blobs read/written WHOLE with the row, so a
+    # JSONB array beats a join table (the documents scope-column precedent).
+    scope_book_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    scope_collection_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    # The serialized SummaryResponse (summary + citations + degraded) — the
+    # whole replayable result, so reopening a saved search needs no re-run.
+    result: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Recent-panel hot path: a user's saved searches newest-first. The DESC
+        # on ``created_at`` matches the list query's ORDER BY so the planner
+        # walks the index in order; ``user_id`` prefix scopes it per tenant.
+        # The same index backs the per-user retention-cap prune.
+        Index(
+            "ix_search_history_user_created",
+            "user_id",
+            text("created_at DESC"),
+        ),
+    )

@@ -159,6 +159,15 @@ for attempt in 1 2 3; do
   sleep 10
 done
 
+# Ensure the shared uploads volume is writable by the non-root app uid (10001)
+# BEFORE api/worker start. Fresh volumes inherit this from the image (api/worker
+# Dockerfile owns /data/uploads), but a volume left root-owned by a pre-non-root
+# image needs this one-time correction — without it every /upload 500s at mkdir.
+# Idempotent, so safe on every deploy; runs the api image as root with the
+# volume mounted (</dev/null per the 'compose run' stdin note above).
+compose run --rm --no-deps --user 0 --entrypoint sh api \
+  -c 'mkdir -p /data/uploads && chown -R 10001:10001 /data/uploads && chmod 775 /data/uploads' </dev/null
+
 # --- 6. full stack ---
 compose up -d --wait
 compose ps

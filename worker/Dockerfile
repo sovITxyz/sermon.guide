@@ -87,11 +87,17 @@ RUN python -m nltk.downloader -d /usr/share/nltk_data wordnet omw-1.4 \
 [(zipfile.ZipFile(z).extractall(z.parent), z.unlink()) \
  for z in pathlib.Path('/usr/share/nltk_data/corpora').glob('*.zip')]"
 WORKDIR /app/worker
-# Drop privileges: the worker only reads its app dir / venv / nltk_data (all
-# world-readable from the root-run COPY + installs above) and writes only to
-# /tmp (pandoc scratch). alembic-migrate and bootstrap-milvus, the image's two
+# Drop privileges: the worker reads api-staged uploads from /data/uploads (a
+# named volume shared with the api) plus its app dir / venv / nltk_data (all
+# world-readable from the root-run COPY + installs above), and writes only to
+# /tmp (pandoc scratch). It also owns the /data/uploads mountpoint so a FRESH
+# named volume initialized by this image inherits uid-10001 ownership (see
+# api/Dockerfile). alembic-migrate and bootstrap-milvus, the image's two
 # alternate one-shot commands, are equally read-only against the filesystem.
-RUN useradd --create-home --uid 10001 worker
+RUN useradd --create-home --uid 10001 worker \
+    && mkdir -p /data/uploads \
+    && chown -R worker:worker /data \
+    && chmod 775 /data/uploads
 USER worker
 # --concurrency=1: ingest is network-bound now (remote embeddings), not the
 # 3-4GB-resident model loads of the in-process era, but one-at-a-time keeps

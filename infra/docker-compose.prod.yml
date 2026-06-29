@@ -55,6 +55,19 @@ x-backend-env: &backend-env
   SERMON_REDIS_PASSWORD: ${SERMON_REDIS_PASSWORD:?}
   SERMON_MILVUS_HOST: milvus
   SERMON_MILVUS_PORT: "19530"
+  # Originals object storage (worker/storage.py StorageSettings, prefix
+  # SERMON_MINIO_). The code default is host=localhost — correct for the
+  # host-run dev box, fatal in prod where NOTHING publishes a port: without
+  # these the api/worker reach localhost:9000 → ConnectionRefused, so
+  # _backfill_original (and the new-book originals_put) fail and every ingest
+  # task ends FAILURE with no original ever stored. Point them at the
+  # compose-internal minio service. Root creds reuse the same vars the minio
+  # service itself requires (:? so a missing secret still refuses to start).
+  SERMON_MINIO_HOST: minio
+  SERMON_MINIO_PORT: "9000"
+  SERMON_MINIO_ROOT_USER: ${SERMON_MINIO_ROOT_USER:?}
+  SERMON_MINIO_ROOT_PASSWORD: ${SERMON_MINIO_ROOT_PASSWORD:?}
+  SERMON_MINIO_SECURE: "false"
   # The worker never reads SERMON_API_UPLOAD_DIR today (ingest tasks receive
   # absolute paths from the api), but keeping api and worker agreed on the
   # value makes the shared-volume contract explicit and refactor-safe.

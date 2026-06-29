@@ -486,6 +486,24 @@ class Document(Base):
         nullable=False,
         server_default=text("1"),
     )
+    # Per-sermon citation scope (Phase 50): the books / collections the editor's
+    # "Cite from your library" drawer is limited to while writing this sermon. A
+    # tiny JSONB blob of UUID strings, read/written WHOLE with the doc (never
+    # queried by "which sermons use book X"), so a JSONB array beats a join
+    # table. Both default to ``'[]'`` (empty = whole library, backward
+    # compatible). The API clamps each set to the JWT user's library / owned
+    # collections on every write, so a persisted scope can never name a book or
+    # collection the user does not own (the CLAUDE.md tenant invariant).
+    scope_book_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    scope_collection_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
     # Soft-delete sentinel: NULL = active, a timestamp = deleted. Restore
     # clears it back to NULL.
     deleted_at: Mapped[datetime | None] = mapped_column(

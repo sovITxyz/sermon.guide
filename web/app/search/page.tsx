@@ -1,17 +1,28 @@
-import { SearchPanel } from "@/components/SearchPanel";
 import { SelectionProvider } from "@/components/library/selection-context";
-import { UnauthenticatedError, getCollections, getLibrary } from "@/lib/api-server";
-import type { Collection, LibraryBook } from "@/lib/types";
+import { SearchWorkspace } from "@/components/search/SearchWorkspace";
+import {
+  UnauthenticatedError,
+  getCollections,
+  getLibrary,
+  getSearchHistory,
+} from "@/lib/api-server";
+import type { Collection, LibraryBook, SearchHistoryItem } from "@/lib/types";
 import { redirect } from "next/navigation";
 
 export default async function SearchPage() {
   let books: LibraryBook[];
   let collections: Collection[];
+  let history: SearchHistoryItem[];
   try {
-    // Both bearer-scoped (token stays on the server). The library count backs
-    // the "Searching all N books" scope label; collections resolve a whole-
-    // collection selection to its member books for the same label.
-    [books, collections] = await Promise.all([getLibrary(), getCollections()]);
+    // All bearer-scoped (token stays on the server). The library count backs the
+    // "Searching all N books" scope label; collections resolve a whole-collection
+    // selection to its member books for the same label; the recent searches back
+    // the "Recent" panel (Phase 51 — server-fetched here, reopened client-side).
+    [books, collections, history] = await Promise.all([
+      getLibrary(),
+      getCollections(),
+      getSearchHistory(),
+    ]);
   } catch (err) {
     if (err instanceof UnauthenticatedError) {
       redirect("/login?next=/search");
@@ -28,7 +39,7 @@ export default async function SearchPage() {
       </p>
       {/* The selection set on /library rides over via sessionStorage and scopes the search. */}
       <SelectionProvider collections={collections}>
-        <SearchPanel totalBooks={books.length} />
+        <SearchWorkspace totalBooks={books.length} history={history} />
       </SelectionProvider>
     </section>
   );

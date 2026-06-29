@@ -85,8 +85,16 @@ ENV PATH="/app/api/.venv/bin:$PATH" \
     PYTHONPATH=/app/worker \
     PYTHONUNBUFFERED=1
 # Drop privileges: the app needs no write access to its own tree at runtime.
+# It DOES need /data/uploads (a named volume shared with the worker) — the api
+# stages each upload there. Create + own that mountpoint as the run user so a
+# FRESH named volume inherits uid-10001 ownership; otherwise Docker creates the
+# mountpoint as root and every /upload 500s at mkdir (the non-root app user
+# can't write). Pre-existing root-owned volumes still need a one-time chown.
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin appuser \
-    && chown -R appuser:appuser /app
+    && chown -R appuser:appuser /app \
+    && mkdir -p /data/uploads \
+    && chown -R appuser:appuser /data \
+    && chmod 775 /data/uploads
 USER appuser
 WORKDIR /app/api
 EXPOSE 8000

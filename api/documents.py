@@ -796,9 +796,7 @@ async def update_document(
         content_text=content_text,
         schema_version=schema_version,
         scope_book_ids=[uuid.UUID(book_id) for book_id in scope_book_ids],
-        scope_collection_ids=[
-            uuid.UUID(collection_id) for collection_id in scope_collection_ids
-        ],
+        scope_collection_ids=[uuid.UUID(collection_id) for collection_id in scope_collection_ids],
         created_at=created_at,
         updated_at=updated_at,
     )
@@ -1122,9 +1120,7 @@ async def import_document_docx(
         content_text=content_text,
         schema_version=schema_version,
         scope_book_ids=[uuid.UUID(book_id) for book_id in scope_book_ids],
-        scope_collection_ids=[
-            uuid.UUID(collection_id) for collection_id in scope_collection_ids
-        ],
+        scope_collection_ids=[uuid.UUID(collection_id) for collection_id in scope_collection_ids],
         created_at=created_at,
         updated_at=updated_at,
     )

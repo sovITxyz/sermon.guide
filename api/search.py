@@ -541,10 +541,14 @@ async def run_search(
                 raise _COLLECTION_NOT_FOUND
             # Union in the member books of the (now all-owned) collections.
             members = (
-                await session.execute(
-                    _member_book_ids_stmt(requested_collection_ids, user_id),
+                (
+                    await session.execute(
+                        _member_book_ids_stmt(requested_collection_ids, user_id),
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             requested |= set(members)
         # THE INVARIANT (CLAUDE.md): intersect with the library — the effective
         # set can only SHRINK, never widen. ``effective ⊆ library`` always.

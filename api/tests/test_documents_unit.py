@@ -63,6 +63,8 @@ from documents import (
     _list_stmt,
     _owned_active_stmt,
     _owned_any_stmt,
+    _owned_book_ids_stmt,
+    _owned_collection_ids_stmt,
     _update_stmt,
     derive_content_text,
 )
@@ -118,6 +120,8 @@ class _StoredDoc:
         created_at: datetime,
         updated_at: datetime,
         deleted_at: datetime | None = None,
+        scope_book_ids: list[str] | None = None,
+        scope_collection_ids: list[str] | None = None,
     ) -> None:
         self.document_id = document_id
         self.user_id = user_id
@@ -128,6 +132,10 @@ class _StoredDoc:
         self.created_at = created_at
         self.updated_at = updated_at
         self.deleted_at = deleted_at
+        self.scope_book_ids: list[str] = scope_book_ids if scope_book_ids is not None else []
+        self.scope_collection_ids: list[str] = (
+            scope_collection_ids if scope_collection_ids is not None else []
+        )
 
 
 class _FakeResult:
@@ -136,6 +144,9 @@ class _FakeResult:
 
     def scalar_one_or_none(self) -> Any:
         return self._rows[0] if self._rows else None
+
+    def scalars(self) -> _FakeResult:
+        return self
 
     def tuples(self) -> _FakeResult:
         return self
@@ -162,6 +173,8 @@ _UPDATE_TUPLE_COLS = (
     "content",
     "content_text",
     "schema_version",
+    "scope_book_ids",
+    "scope_collection_ids",
     "created_at",
     "updated_at",
 )
@@ -181,8 +194,19 @@ class _FakeSession:
     gate).
     """
 
-    def __init__(self, docs: dict[uuid.UUID, _StoredDoc] | None = None) -> None:
+    def __init__(
+        self,
+        docs: dict[uuid.UUID, _StoredDoc] | None = None,
+        *,
+        library: dict[uuid.UUID, set[uuid.UUID]] | None = None,
+        owned_collections: dict[uuid.UUID, set[uuid.UUID]] | None = None,
+    ) -> None:
         self.docs: dict[uuid.UUID, _StoredDoc] = docs or {}
+        # Per-user library / owned-collection sets the scope clamps intersect
+        # against (Phase 50). Keyed by user_id so a clamp is doubly checked
+        # (the IN set AND the user_id predicate), mirroring the real tables.
+        self.library: dict[uuid.UUID, set[uuid.UUID]] = library or {}
+        self.owned_collections: dict[uuid.UUID, set[uuid.UUID]] = owned_collections or {}
         self.added: list[Any] = []
         self.executed: list[str] = []
         self.commits = 0
@@ -220,6 +244,8 @@ class _FakeSession:
             created_at=obj.created_at,
             updated_at=obj.updated_at,
             deleted_at=obj.deleted_at,
+            scope_book_ids=list(getattr(obj, "scope_book_ids", []) or []),
+            scope_collection_ids=list(getattr(obj, "scope_collection_ids", []) or []),
         )
 
     async def execute(self, stmt: Any) -> _FakeResult:
@@ -246,8 +272,29 @@ class _FakeSession:
                 doc.content = params["content"]
             if "content_text" in params:
                 doc.content_text = params["content_text"]
+            if "scope_book_ids" in params:
+                doc.scope_book_ids = params["scope_book_ids"]
+            if "scope_collection_ids" in params:
+                doc.scope_collection_ids = params["scope_collection_ids"]
             doc.updated_at = self._now()
             return _FakeResult([self._update_row(doc)])
+
+        if "FROM user_library" in sql:
+            # Scope book-id clamp: intersect the requested (expanding IN) set
+            # with the JWT user's library. Mirrors _owned_book_ids_stmt.
+            self.executed.append("library_clamp")
+            requested_books: list[Any] = params.get("book_id_1") or []
+            owned_books = self.library.get(params["user_id_1"], set())
+            return _FakeResult([book_id for book_id in requested_books if book_id in owned_books])
+
+        if "FROM collections" in sql:
+            # Scope collection-id clamp: intersect the requested (expanding IN)
+            # set with the JWT user's owned collections. Mirrors
+            # _owned_collection_ids_stmt.
+            self.executed.append("collection_clamp")
+            requested_colls: list[Any] = params.get("collection_id_1") or []
+            owned_colls = self.owned_collections.get(params["user_id_1"], set())
+            return _FakeResult([cid for cid in requested_colls if cid in owned_colls])
 
         if "FROM documents" in sql:
             # Distinguish the list query (no document_id predicate) from the
@@ -567,6 +614,134 @@ def test_get_full_returns_content(
     body = resp.json()
     assert body["content"] == DOC_JSON
     assert body["content_text"] == DOC_TEXT
+
+
+# --- per-sermon citation scope (Phase 50) ------------------------------------
+
+
+def test_create_without_scope_defaults_empty_and_skips_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+) -> None:
+    # The common path (no scope) defaults both arrays to [] and runs NO
+    # library/collection clamp query (the empty-set short-circuit).
+    session = _FakeSession()
+    _wire_session(monkeypatch, session)
+
+    with client:
+        created = _create(client)
+
+    assert created["scope_book_ids"] == []
+    assert created["scope_collection_ids"] == []
+    assert "library_clamp" not in session.executed
+    assert "collection_clamp" not in session.executed
+
+
+def test_create_clamps_scope_to_owned_books_and_collections(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    fake_user: _FakeUser,
+) -> None:
+    # A foreign book / collection in the requested scope is silently clamped
+    # out (intersected with the JWT user's library / owned collections) before
+    # it is ever persisted — the tenant invariant.
+    owned_book = uuid.uuid4()
+    foreign_book = uuid.uuid4()
+    owned_coll = uuid.uuid4()
+    foreign_coll = uuid.uuid4()
+    session = _FakeSession(
+        library={fake_user.user_id: {owned_book}},
+        owned_collections={fake_user.user_id: {owned_coll}},
+    )
+    _wire_session(monkeypatch, session)
+
+    with client:
+        resp = client.post(
+            "/documents",
+            json={
+                "title": "Scoped",
+                "content": DOC_JSON,
+                "scope_book_ids": [str(owned_book), str(foreign_book)],
+                "scope_collection_ids": [str(owned_coll), str(foreign_coll)],
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["scope_book_ids"] == [str(owned_book)]
+    assert body["scope_collection_ids"] == [str(owned_coll)]
+    # The persisted JSONB form is the clamped set (UUID strings).
+    stored = session.docs[uuid.UUID(body["document_id"])]
+    assert stored.scope_book_ids == [str(owned_book)]
+    assert stored.scope_collection_ids == [str(owned_coll)]
+
+
+def test_patch_sets_and_clamps_scope_then_reads_back(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    fake_user: _FakeUser,
+) -> None:
+    # A scope-only PATCH is a valid write (not an empty-patch 422): it clamps
+    # to the owner's library / collections, leaves title/content untouched,
+    # bumps updated_at, and the persisted scope survives a fresh GET.
+    owned_book = uuid.uuid4()
+    foreign_book = uuid.uuid4()
+    owned_coll = uuid.uuid4()
+    session = _FakeSession(
+        library={fake_user.user_id: {owned_book}},
+        owned_collections={fake_user.user_id: {owned_coll}},
+    )
+    _wire_session(monkeypatch, session)
+
+    with client:
+        created = _create(client)
+        assert created["scope_book_ids"] == []
+        resp = client.patch(
+            f"/documents/{created['document_id']}",
+            json={
+                "base_updated_at": created["updated_at"],
+                "scope_book_ids": [str(owned_book), str(foreign_book)],
+                "scope_collection_ids": [str(owned_coll)],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["title"] == "Sermon"
+        assert body["content"] == DOC_JSON
+        assert body["scope_book_ids"] == [str(owned_book)]
+        assert body["scope_collection_ids"] == [str(owned_coll)]
+        assert body["updated_at"] != created["updated_at"]
+        # Round-trip: the persisted scope reads back on a fresh GET.
+        got = client.get(f"/documents/{created['document_id']}").json()
+
+    assert got["scope_book_ids"] == [str(owned_book)]
+    assert got["scope_collection_ids"] == [str(owned_coll)]
+
+
+def test_patch_empty_scope_array_clears_it(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    fake_user: _FakeUser,
+) -> None:
+    # The scope arrays are three-state: a present-and-empty [] CLEARS the
+    # stored scope (whole library again), distinct from absent (None = leave).
+    owned_book = uuid.uuid4()
+    session = _FakeSession(library={fake_user.user_id: {owned_book}})
+    _wire_session(monkeypatch, session)
+
+    with client:
+        created = client.post(
+            "/documents",
+            json={"title": "S", "content": DOC_JSON, "scope_book_ids": [str(owned_book)]},
+        ).json()
+        assert created["scope_book_ids"] == [str(owned_book)]
+        resp = client.patch(
+            f"/documents/{created['document_id']}",
+            json={"base_updated_at": created["updated_at"], "scope_book_ids": []},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["scope_book_ids"] == []
 
 
 # --- request-model posture: extra="forbid" + size cap ------------------------
@@ -1072,4 +1247,47 @@ def test_update_stmt_is_user_scoped_and_bumps_updated_at() -> None:
     assert "updated_at=now()" in sql
     assert "RETURNING" in sql
     assert document_id in compiled.params.values()
+    assert user_id in compiled.params.values()
+
+
+def test_update_stmt_returning_includes_scope_columns() -> None:
+    # Phase 50: the PATCH RETURNING ships both scope columns so the handler can
+    # echo the clamped scope without a second round-trip.
+    document_id, user_id = uuid.uuid4(), uuid.uuid4()
+    compiled = _update_stmt(
+        document_id,
+        user_id,
+        values={"title": "X"},
+    ).compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "RETURNING" in sql
+    assert "documents.scope_book_ids" in sql
+    assert "documents.scope_collection_ids" in sql
+
+
+def test_owned_book_ids_stmt_is_user_scoped() -> None:
+    # The scope book-id clamp: which of the requested ids the JWT user owns.
+    # The user_id predicate is the load-bearing tenant line.
+    book_ids = [uuid.uuid4(), uuid.uuid4()]
+    user_id = uuid.uuid4()
+    compiled = _owned_book_ids_stmt(book_ids, user_id).compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "FROM user_library" in sql
+    assert "user_library.book_id IN" in sql
+    assert "user_library.user_id =" in sql
+    assert user_id in compiled.params.values()
+
+
+def test_owned_collection_ids_stmt_is_user_scoped() -> None:
+    # The scope collection-id clamp: which of the requested collections the JWT
+    # user owns. The user_id predicate is the load-bearing tenant line.
+    collection_ids = [uuid.uuid4()]
+    user_id = uuid.uuid4()
+    compiled = _owned_collection_ids_stmt(collection_ids, user_id).compile(
+        dialect=postgresql.dialect(),
+    )
+    sql = str(compiled)
+    assert "FROM collections" in sql
+    assert "collections.collection_id IN" in sql
+    assert "collections.user_id =" in sql
     assert user_id in compiled.params.values()

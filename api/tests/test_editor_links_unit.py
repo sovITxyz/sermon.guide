@@ -302,6 +302,10 @@ class _FakeDocument:
         }
         self.content_text = "Original body."
         self.schema_version = 1
+        # Phase 50 scope columns ride through the _update_stmt RETURNING; the
+        # Google-Docs pull/unlink paths never change them.
+        self.scope_book_ids: list[str] = []
+        self.scope_collection_ids: list[str] = []
         self.deleted_at: datetime | None = None
         self.created_at = datetime(2026, 6, 22, 12, 0, 0, tzinfo=UTC)
         self.updated_at = self.created_at
@@ -419,6 +423,8 @@ class _RouteSession:
                     self.updated_content,
                     self.updated_content_text,
                     self.document.schema_version,
+                    self.document.scope_book_ids,
+                    self.document.scope_collection_ids,
                     self.document.created_at,
                     datetime.now(tz=UTC),
                 ),

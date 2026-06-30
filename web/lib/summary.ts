@@ -1,9 +1,11 @@
-import type { SummaryCitation } from "./types";
+import { asStringArray } from "./search";
+import type { SummaryCitation, SummaryRequest } from "./types";
 
 /**
  * Pure helpers for the /search summary page: query validation, splitting the
- * summary prose into text/citation segments, and the elapsed-time label for
- * the long-request affordance. No DOM — unit-tested in test/summary.test.ts.
+ * summary prose into text/citation segments, the elapsed-time label for the
+ * long-request affordance, and the POST /search-summary body whitelist. No DOM
+ * — unit-tested in test/summary.test.ts.
  */
 
 /** Mirrors the API's `SummaryRequest.query` max_length (api/summary.py). */
@@ -219,4 +221,53 @@ export function formatElapsed(totalSeconds: number): string {
   const minutes = Math.floor(whole / 60);
   const seconds = whole % 60;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+export type SummaryBodyResult = { ok: true; body: SummaryRequest } | { ok: false; error: string };
+
+/** Reject anything that is not a plain JSON object (arrays and null included). */
+function asRecord(body: unknown): Record<string, unknown> | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return null;
+  }
+  return body as Record<string, unknown>;
+}
+
+/**
+ * Whitelist for the POST /search-summary proxy body (Phase 49). The symmetric
+ * twin of lib/search.ts:whitelistSearch — a STRUCTURAL whitelist that forwards
+ * `query` (string) plus the optional `book_ids`/`collection_ids` scope arrays
+ * when present, dropping every other key (a smuggled `user_id`/`limit_chunks`
+ * never reaches the API's `extra="forbid"` gate). A scope field is OMITTED when
+ * absent (null counts as absent = whole library) and rejected with a 400 only
+ * when present-but-not-an-array-of-strings. SCOPE IS AN INTERSECTION: the API
+ * intersects the forwarded set with the JWT user's library (it can only shrink
+ * the search). Query length and the per-array caps stay with the API (422); the
+ * route keeps its own empty-query guard (searchQueryProblem) for the friendly
+ * message.
+ */
+export function whitelistSummary(body: unknown): SummaryBodyResult {
+  const record = asRecord(body);
+  if (record === null) {
+    return { ok: false, error: "Request body must be a JSON object." };
+  }
+  if (typeof record.query !== "string") {
+    return { ok: false, error: "query must be a string." };
+  }
+  const out: SummaryRequest = { query: record.query };
+  if (record.book_ids !== undefined && record.book_ids !== null) {
+    const bookIds = asStringArray(record.book_ids);
+    if (bookIds === null) {
+      return { ok: false, error: "book_ids must be an array of strings." };
+    }
+    out.book_ids = bookIds;
+  }
+  if (record.collection_ids !== undefined && record.collection_ids !== null) {
+    const collectionIds = asStringArray(record.collection_ids);
+    if (collectionIds === null) {
+      return { ok: false, error: "collection_ids must be an array of strings." };
+    }
+    out.collection_ids = collectionIds;
+  }
+  return { ok: true, body: out };
 }

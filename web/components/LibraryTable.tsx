@@ -8,7 +8,25 @@ function formatAdded(iso: string): string {
   return iso.slice(0, 10);
 }
 
-export function LibraryTable({ books }: { books: LibraryBook[] }) {
+/**
+ * Presentational library table. Phase 49 adds an OPTIONAL leading checkbox
+ * column for scoped search: it renders ONLY when `onToggle` is supplied, with
+ * each row's box checked from `selectedBookIds`. The table owns no selection
+ * state — it lifts every toggle to the caller (the LibraryBrowser island, which
+ * drives the shared SelectionProvider), staying a pure render of `books` +
+ * `selectedBookIds`.
+ */
+export function LibraryTable({
+  books,
+  selectedBookIds,
+  onToggle,
+}: {
+  books: LibraryBook[];
+  selectedBookIds?: ReadonlySet<string>;
+  onToggle?: (bookId: string) => void;
+}) {
+  const selectable = onToggle !== undefined;
+
   if (books.length === 0) {
     return (
       <p className="rounded-lg border border-gray-300 border-dashed p-8 text-center text-gray-600 text-sm">
@@ -25,6 +43,11 @@ export function LibraryTable({ books }: { books: LibraryBook[] }) {
     <table className="w-full border-collapse text-left text-sm">
       <thead>
         <tr className="border-gray-200 border-b text-gray-500">
+          {selectable ? (
+            <th className="py-2 pr-2 font-medium">
+              <span className="sr-only">Select</span>
+            </th>
+          ) : null}
           <th className="py-2 pr-4 font-medium">Title</th>
           <th className="py-2 pr-4 font-medium">Author</th>
           <th className="py-2 pr-4 font-medium">Category</th>
@@ -39,6 +62,16 @@ export function LibraryTable({ books }: { books: LibraryBook[] }) {
           const progressLabel = formatProgress(book.progress);
           return (
             <tr key={book.book_id} className="border-gray-100 border-b">
+              {selectable ? (
+                <td className="py-2 pr-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedBookIds?.has(book.book_id) ?? false}
+                    onChange={() => onToggle?.(book.book_id)}
+                    aria-label={`Select ${book.title}`}
+                  />
+                </td>
+              ) : null}
               <td className="py-2 pr-4">{book.title}</td>
               <td className="py-2 pr-4 text-gray-600">{book.author ?? "—"}</td>
               <td className="py-2 pr-4 text-gray-600">{book.category ?? "—"}</td>

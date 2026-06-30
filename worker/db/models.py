@@ -356,6 +356,84 @@ class Collection(Base):
     __table_args__ = (Index("ix_collections_user_id", "user_id"),)
 
 
+class CollectionBook(Base):
+    """A book placed into a user's collection — the membership row (Phase 48).
+
+    The join half of the B-library collections feature: one row per
+    (collection, book) pairing. Mirrors ``UserLibraryEntry`` (a per-user
+    membership table keyed on ``book_id``) but carries a ``collection_id`` and
+    a DENORMALIZED ``user_id``.
+
+    ``user_id`` is DENORMALIZED — duplicated from the owning ``collections``
+    row (the ``EditorLink`` / ``SermonDocRevision`` precedent) — so the tenant
+    gate filters memberships by the JWT-derived ``user_id`` WITHOUT a join back
+    to ``collections``. Like every user-owned table it MUST be queried scoped
+    to ``user_id`` derived from the request's JWT (CLAUDE.md), never from
+    request input. The ``api/collections_routes.py`` add-books path additionally
+    CLAMPS the requested ``book_id`` set to the owner's ``user_library`` before
+    inserting, so a membership can never name a book the user does not own.
+
+    All three FKs are ON DELETE CASCADE: a membership is meaningless once its
+    collection, its book, or its user is gone. ``book_id`` -> ``global_books``
+    is CASCADE (unlike ``user_library``'s RESTRICT) because the membership is a
+    pure organizational pointer — the dedup invariant that keeps a shared book
+    alive lives on ``user_library``, not here.
+
+    ``UniqueConstraint(collection_id, book_id)`` backs the add-books
+    ``ON CONFLICT (collection_id, book_id) DO NOTHING`` idempotency (re-adding a
+    book already in the collection is a no-op) and forbids duplicate
+    memberships. ``Index(user_id, book_id)`` serves the denormalized tenant
+    gate's doubly-scoped lookups.
+
+    ``added_at`` carries the schema-wide ``server_default=func.now()``; there is
+    no ``updated_at`` — a membership is an immutable pairing (re-added rows are
+    deduped by the unique constraint, never mutated).
+    """
+
+    __tablename__ = "collection_books"
+
+    collection_book_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    collection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("collections.collection_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("global_books.book_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # DENORMALIZED owner — duplicated from the collections row so the tenant
+    # gate filters here without a join back to collections. See class docstring.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Backs ON CONFLICT (collection_id, book_id) DO NOTHING (idempotent
+        # re-add) AND forbids duplicate memberships.
+        UniqueConstraint(
+            "collection_id",
+            "book_id",
+            name="uq_collection_books_collection_book",
+        ),
+        # Doubly-scoped (user_id AND book_id) lookups for the denormalized
+        # tenant gate.
+        Index("ix_collection_books_user_book", "user_id", "book_id"),
+    )
+
+
 class Document(Base):
     """A user's sermon document — canonical TipTap/ProseMirror JSON (Phase 34).
 
@@ -407,6 +485,24 @@ class Document(Base):
         Integer,
         nullable=False,
         server_default=text("1"),
+    )
+    # Per-sermon citation scope (Phase 50): the books / collections the editor's
+    # "Cite from your library" drawer is limited to while writing this sermon. A
+    # tiny JSONB blob of UUID strings, read/written WHOLE with the doc (never
+    # queried by "which sermons use book X"), so a JSONB array beats a join
+    # table. Both default to ``'[]'`` (empty = whole library, backward
+    # compatible). The API clamps each set to the JWT user's library / owned
+    # collections on every write, so a persisted scope can never name a book or
+    # collection the user does not own (the CLAUDE.md tenant invariant).
+    scope_book_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    scope_collection_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
     )
     # Soft-delete sentinel: NULL = active, a timestamp = deleted. Restore
     # clears it back to NULL.
@@ -797,4 +893,88 @@ class SermonEvent(Base):
         # scan. DELIBERATELY no unique on (user_id, event_date) — two
         # services one Sunday is normal.
         Index("ix_sermon_events_user_date", "user_id", "event_date"),
+    )
+
+
+class SearchHistory(Base):
+    """One saved ``/search-summary`` run — query + scope + the full result (Phase 51).
+
+    The persistence half of the "Recent" panel on ``/search``. A summary
+    search is expensive (the 4-leg embed → rerank → highlight → LLM pipeline,
+    2–4 min wall time), so each successful run is saved WHOLE — the user can
+    reopen a past search and the saved ``result`` blob renders instantly
+    without re-running (and re-paying for) the pipeline. ``api/summary.py``
+    writes a row BEST-EFFORT after a successful summary (a write failure never
+    turns the costly, already-computed answer into a 5xx); ``api/search_history.py``
+    serves the list / full-entry / delete surface.
+
+    User-owned like ``documents`` / ``sermon_events``: every query MUST filter
+    by ``user_id`` (JWT-derived); a non-owned ``history_id`` is a uniform 404
+    with no existence oracle (the Phase 20 ``/tasks`` posture). The FK ->
+    ``users.user_id`` is ON DELETE CASCADE — a saved search is meaningless once
+    its user is gone.
+
+    ``query`` is the natural-language question (saved verbatim — unlike the
+    Phase 27 metrics path, which deliberately SCRUBS query text; this is the
+    user's OWN history, shown back only to them). ``scope_book_ids`` /
+    ``scope_collection_ids`` are the Phase 49 scope the search ran under (the
+    book / collection UUIDs as text), so the panel can show what was searched.
+    ``result`` is the serialized ``SummaryResponse`` (``summary`` + ``citations``
+    + ``degraded``) — the whole replayable blob, JSONB.
+
+    ``created_at`` carries the schema-wide ``server_default=func.now()`` and has
+    NO ``onupdate`` — a saved search is an IMMUTABLE row (the
+    ``SermonDocRevision`` precedent), never mutated after insert.
+    ``Index("ix_search_history_user_created", user_id, created_at DESC)`` backs
+    the panel's newest-first per-user list (the ``ix_documents_user_updated``
+    precedent) AND the per-user retention-cap prune (newest-N kept).
+    """
+
+    __tablename__ = "search_history"
+
+    history_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # The natural-language question, saved verbatim (this is the user's own
+    # history; the Phase 27 metrics path scrubs query text, this does not).
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    # The Phase 49 scope the search ran under — book / collection UUIDs as text.
+    # Empty = whole library. Tiny blobs read/written WHOLE with the row, so a
+    # JSONB array beats a join table (the documents scope-column precedent).
+    scope_book_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    scope_collection_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    # The serialized SummaryResponse (summary + citations + degraded) — the
+    # whole replayable result, so reopening a saved search needs no re-run.
+    result: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Recent-panel hot path: a user's saved searches newest-first. The DESC
+        # on ``created_at`` matches the list query's ORDER BY so the planner
+        # walks the index in order; ``user_id`` prefix scopes it per tenant.
+        # The same index backs the per-user retention-cap prune.
+        Index(
+            "ix_search_history_user_created",
+            "user_id",
+            text("created_at DESC"),
+        ),
     )

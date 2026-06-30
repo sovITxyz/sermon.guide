@@ -155,7 +155,8 @@ def test_request_defaults_and_bounds() -> None:
 
 
 def test_request_forbids_extra_fields() -> None:
-    """Phase 18: smuggled tenant-scope fields are a hard 422, never dropped.
+    """Phase 18: a smuggled ``user_id`` (or any unknown field) is a hard 422,
+    never dropped.
 
     ``model_validate`` because pyright already rejects unknown kwargs at
     type-check time — the wire payload arrives as a dict.
@@ -163,7 +164,22 @@ def test_request_forbids_extra_fields() -> None:
     with pytest.raises(ValidationError):
         summary_module.SummaryRequest.model_validate({"query": "q", "user_id": "evil"})
     with pytest.raises(ValidationError):
-        summary_module.SummaryRequest.model_validate({"query": "q", "book_ids": ["x"]})
+        summary_module.SummaryRequest.model_validate({"query": "q", "tenant": "evil"})
+
+
+def test_request_accepts_optional_scope_fields() -> None:
+    """Phase 49: ``book_ids`` / ``collection_ids`` are now ACCEPTED scope
+    narrowers (no longer a 422) — ``run_search`` intersects them with the JWT
+    library, so they can only narrow. Default ``None`` = whole library."""
+    bare = summary_module.SummaryRequest.model_validate({"query": "q"})
+    assert bare.book_ids is None
+    assert bare.collection_ids is None
+    bid, cid = uuid.uuid4(), uuid.uuid4()
+    scoped = summary_module.SummaryRequest.model_validate(
+        {"query": "q", "book_ids": [str(bid)], "collection_ids": [str(cid)]},
+    )
+    assert scoped.book_ids == [bid]
+    assert scoped.collection_ids == [cid]
 
 
 # --- citation labels -------------------------------------------------------
@@ -609,6 +625,8 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
         do_rerank: bool,
         user_id: uuid.UUID,
         session: Any,  # noqa: ANN401
+        requested_book_ids: list[uuid.UUID] | None = None,
+        requested_collection_ids: list[uuid.UUID] | None = None,
     ) -> SearchOutcome:
         recorded.update(
             query=query,
@@ -616,6 +634,8 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
             do_rerank=do_rerank,
             user_id=user_id,
             session=session,
+            requested_book_ids=requested_book_ids,
+            requested_collection_ids=requested_collection_ids,
         )
         return SearchOutcome(hits=[_hit(1, 7, content="grace abounds")], degraded=[])
 
@@ -651,6 +671,156 @@ async def test_handler_happy_path_forces_rerank_and_extracts_citations(
     assert resp.citations[0].content == "grace abounds"
     # Phase 22: a healthy pipeline reports no degraded stages.
     assert resp.degraded == []
+
+
+async def test_handler_forwards_scope_to_run_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 49: the summary handler forwards ``book_ids`` / ``collection_ids``
+    verbatim into ``run_search`` (where the intersection-with-library guard
+    lives). The handler never resolves scope itself — both search paths funnel
+    through ``run_search`` so the tenant clamp is enforced exactly once."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
+    recorded: dict[str, Any] = {}
+
+    async def _fake_run_search(**kwargs: Any) -> SearchOutcome:  # noqa: ANN401
+        recorded.update(kwargs)
+        # Empty hits → deterministic no-context guard, no LLM call needed.
+        return SearchOutcome(hits=[], degraded=[])
+
+    monkeypatch.setattr(summary_module, "run_search", _fake_run_search)
+    bid, cid = uuid.uuid4(), uuid.uuid4()
+    user = _FakeUser()
+    user_arg: Any = user
+    session_arg: Any = object()
+
+    await summary_module.search_summary(
+        payload=summary_module.SummaryRequest(
+            query="grace?",
+            book_ids=[bid],
+            collection_ids=[cid],
+        ),
+        current_user=user_arg,
+        session=session_arg,
+    )
+    assert recorded["requested_book_ids"] == [bid]
+    assert recorded["requested_collection_ids"] == [cid]
+    # The JWT user_id still rides through unchanged (tenant scope owner).
+    assert recorded["user_id"] == user.user_id
+
+
+# --- search-history save hook (Phase 51) -------------------------------------
+
+
+class _RecordingSession:
+    """Minimal duck-typed session capturing the best-effort history insert."""
+
+    def __init__(self, *, add_raises: bool = False) -> None:
+        self.added: list[Any] = []
+        self.commits = 0
+        self.rolled_back = False
+        self._add_raises = add_raises
+
+    def add(self, obj: Any) -> None:  # noqa: ANN401
+        if self._add_raises:
+            msg = "history insert boom"
+            raise RuntimeError(msg)
+        self.added.append(obj)
+
+    async def flush(self) -> None: ...
+
+    async def execute(self, _stmt: Any) -> None:  # noqa: ANN401
+        # The retention prune runs here; the handler ignores its result.
+        return None
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
+
+
+async def test_successful_summary_writes_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 51: a successful summary best-effort saves one history row carrying
+    the query + chosen scope + the serialized result, scoped to the JWT user."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
+    b1 = uuid.UUID(int=1)
+    bid = uuid.uuid4()
+
+    async def _fake_run_search(**_: Any) -> SearchOutcome:  # noqa: ANN401
+        return SearchOutcome(hits=[_hit(1, 7, content="grace abounds")], degraded=[])
+
+    async def _fake_resolve_titles(_session: Any, _book_ids: Any) -> dict[uuid.UUID, str]:  # noqa: ANN401
+        return {b1: "Romans"}
+
+    def _fake_gen(**_: Any) -> str:  # noqa: ANN401
+        return "Grace [Romans:7]."
+
+    monkeypatch.setattr(summary_module, "run_search", _fake_run_search)
+    monkeypatch.setattr(summary_module, "_resolve_titles", _fake_resolve_titles)
+    monkeypatch.setattr(summary_module, "_generate_summary", _fake_gen)
+
+    user = _FakeUser()
+    session = _RecordingSession()
+    user_arg: Any = user
+    session_arg: Any = session
+
+    resp = await summary_module.search_summary(
+        payload=summary_module.SummaryRequest(query="grace?", book_ids=[bid]),
+        current_user=user_arg,
+        session=session_arg,
+    )
+
+    assert resp.summary == "Grace [Romans:7]."
+    assert len(session.added) == 1
+    row = session.added[0]
+    assert row.user_id == user.user_id
+    assert row.query == "grace?"
+    assert row.scope_book_ids == [str(bid)]
+    assert row.result["summary"] == "Grace [Romans:7]."
+    assert session.commits == 1
+
+
+async def test_history_write_failure_does_not_fail_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 51 best-effort contract: a history-write failure is swallowed — the
+    costly, already-computed summary still returns 200 (never a 5xx)."""
+    monkeypatch.setattr(summary_module.settings, "llm_provider", "google")
+    monkeypatch.setattr(summary_module.settings, "google_api_key", "k")
+    b1 = uuid.UUID(int=1)
+
+    async def _fake_run_search(**_: Any) -> SearchOutcome:  # noqa: ANN401
+        return SearchOutcome(hits=[_hit(1, 7, content="grace abounds")], degraded=[])
+
+    async def _fake_resolve_titles(_session: Any, _book_ids: Any) -> dict[uuid.UUID, str]:  # noqa: ANN401
+        return {b1: "Romans"}
+
+    def _fake_gen(**_: Any) -> str:  # noqa: ANN401
+        return "Grace [Romans:7]."
+
+    monkeypatch.setattr(summary_module, "run_search", _fake_run_search)
+    monkeypatch.setattr(summary_module, "_resolve_titles", _fake_resolve_titles)
+    monkeypatch.setattr(summary_module, "_generate_summary", _fake_gen)
+
+    user: Any = _FakeUser()
+    # The session's insert raises — the summary must survive it.
+    session: Any = _RecordingSession(add_raises=True)
+
+    resp = await summary_module.search_summary(
+        payload=summary_module.SummaryRequest(query="grace?"),
+        current_user=user,
+        session=session,
+    )
+
+    # The answer is intact despite the failed history write.
+    assert resp.summary == "Grace [Romans:7]."
+    assert [c.marker for c in resp.citations] == ["[Romans:7]"]
+    # Best-effort rolled back, nothing committed.
+    assert session.rolled_back is True
+    assert session.commits == 0
 
 
 # --- degraded retrieval (Phase 22) -------------------------------------------

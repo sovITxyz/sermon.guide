@@ -1,6 +1,6 @@
 "use client";
 
-import type { DocumentFull, EditorLinkStatus, LibraryBookRef } from "@/lib/types";
+import type { Collection, DocumentFull, EditorLinkStatus, LibraryBookRef } from "@/lib/types";
 import dynamic from "next/dynamic";
 
 /**
@@ -35,11 +35,16 @@ const SermonEditor = dynamic(
 export function SermonEditorShell({
   document,
   libraryBooks,
+  collections,
   linkStatus,
   googleConnected,
 }: {
   document: DocumentFull;
   libraryBooks: readonly LibraryBookRef[];
+  // The user's library collections (Phase 50), fetched server-side on doc open.
+  // Backs the editor's Scope control + prunes stale (deleted) collection ids out
+  // of the scope handed to the citation drawer's search.
+  collections: Collection[];
   // The external-editor link state (Phase 45), fetched server-side on doc open.
   // When `state === "linked"` the editor opens HARD read-only with the "Editing
   // externally" banner; otherwise editable. `web_url` is the only external
@@ -56,6 +61,11 @@ export function SermonEditorShell({
       document={document}
       ownedBookIds={ownedBookIds}
       bookTitles={bookTitles}
+      collections={collections}
+      // Per-sermon citation scope (Phase 50), read straight off the document the
+      // page already fetched — no extra round-trip.
+      scopeBookIds={document.scope_book_ids}
+      scopeCollectionIds={document.scope_collection_ids}
       linkStatus={linkStatus}
       googleConnected={googleConnected}
     />

@@ -4,6 +4,8 @@ import { cookies } from "next/headers";
 import { apiBaseUrl } from "./config";
 import { SESSION_COOKIE } from "./session";
 import type {
+  Collection,
+  CollectionListResponse,
   DocumentFull,
   DocumentListItem,
   DocumentListResponse,
@@ -12,6 +14,8 @@ import type {
   IntegrationsResponse,
   LibraryBook,
   LibraryResponse,
+  SearchHistoryItem,
+  SearchHistoryListResponse,
 } from "./types";
 
 /** Read the JWT out of the HttpOnly session cookie (server context only). */
@@ -56,6 +60,74 @@ export async function getLibrary(): Promise<LibraryBook[]> {
   }
   const data = (await res.json()) as LibraryResponse;
   return data.books;
+}
+
+/**
+ * Fetch the authenticated user's library collections (Phase 48), server-side,
+ * attaching the bearer from the HttpOnly cookie. The token never reaches the
+ * browser. Each collection carries its current `book_ids` membership. The API
+ * resolves the caller's collections from the JWT `user_id` server-side. Returns
+ * `[]` when the user has no collections; raises `UnauthenticatedError` on a 401
+ * so the /library server component can redirect to /login. Mirrors getLibrary().
+ */
+export async function getCollections(): Promise<Collection[]> {
+  const token = await getSessionToken();
+  if (!token) {
+    throw new UnauthenticatedError();
+  }
+  const res = await fetch(`${apiBaseUrl()}/collections`, {
+    headers: { authorization: `Bearer ${token}` },
+    // Per-user data — never cache across requests.
+    cache: "no-store",
+  });
+  if (res.status === 401) {
+    throw new UnauthenticatedError();
+  }
+  if (!res.ok) {
+    throw new Error(`Collections fetch failed (${res.status}).`);
+  }
+  const data = (await res.json()) as CollectionListResponse;
+  return data.collections;
+}
+
+/**
+ * Fetch the authenticated user's saved searches for the "Recent" panel
+ * (Phase 51), server-side, attaching the bearer from the HttpOnly cookie. The
+ * token never reaches the browser. The list is LIGHTWEIGHT (query + scope +
+ * summary preview + timestamp, newest-first) — the full `result`/citations blob
+ * rides only on the per-id GET the panel fetches on click. Raises
+ * `UnauthenticatedError` on a 401 so the /search server component can redirect
+ * to /login.
+ *
+ * The Recent panel is AUXILIARY to the search page, so a non-401 failure is
+ * non-fatal: it collapses to `[]` (an empty panel) rather than 500-ing the whole
+ * /search page — a flaky history endpoint must never take search down with it.
+ * Mirrors getCollections() otherwise.
+ */
+export async function getSearchHistory(): Promise<SearchHistoryItem[]> {
+  const token = await getSessionToken();
+  if (!token) {
+    throw new UnauthenticatedError();
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${apiBaseUrl()}/search-history`, {
+      headers: { authorization: `Bearer ${token}` },
+      // Per-user data — never cache across requests.
+      cache: "no-store",
+    });
+  } catch {
+    // Transport failure — degrade to an empty panel, never break search.
+    return [];
+  }
+  if (res.status === 401) {
+    throw new UnauthenticatedError();
+  }
+  if (!res.ok) {
+    return [];
+  }
+  const data = (await res.json()) as SearchHistoryListResponse;
+  return data.items;
 }
 
 /**

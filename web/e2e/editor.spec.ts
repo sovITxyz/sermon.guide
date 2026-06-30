@@ -21,6 +21,9 @@ import { loginViaUi, makeUser, signUp } from "./support/users";
  *      a `citation` block (cached title + snippet + a Read-in-context deep link),
  *      let autosave settle, and reload — the node parses on load and persists
  *      through documents.content JSON.
+ *   6. SCOPE (Phase 50): tick a book in the Scope popover; the choice persists
+ *      per-sermon via the SAME autosave path (survives reload), and the citation
+ *      drawer's /search is then limited to the scoped book.
  *
  * Backend is the in-memory fake api in CI (e2e/support/fake-api.mjs: documents
  * endpoints with a strictly-monotonic updated_at so the 409 is deterministic,
@@ -131,6 +134,49 @@ test("drawer search inserts a citation block that persists across reload", async
   const reloaded = page.locator('[data-type="citation"]');
   await expect(reloaded).toContainText("On Grace");
   await expect(reloaded).toContainText("Grace is the unearned favor of God");
+});
+
+test("Scope: ticking a book scopes the citation drawer and persists across reload", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/sermons");
+
+  await page.getByRole("button", { name: "New sermon" }).click();
+  await page.waitForURL(/\/sermons\/[^/]+$/);
+
+  // Seed a little content so the doc is non-empty, then let autosave settle.
+  await typeAndAwaitSaved(page, "A sermon scoped to one book.");
+
+  // Open the Scope popover and tick ONE library book ("Of Faith", book 2222).
+  // The popover lists both library books from the shell's one-shot /library map.
+  await page.getByRole("button", { name: "Scope citations to selected books" }).click();
+  await expect(page.getByTestId("scope-popover")).toBeVisible();
+  await page.getByLabel("Of Faith").check();
+
+  // The scope change rides the SAME autosave path — wait for it to flip off
+  // "saved" then settle back once the PATCH lands (the scope is now persisted).
+  await expect(saveStatus(page)).not.toHaveAttribute("data-save-status", "saved");
+  await expect(saveStatus(page)).toHaveAttribute("data-save-status", "saved", { timeout: 15_000 });
+
+  // Reload: the server shell re-fetches the doc (incl. its stored scope) and the
+  // editor opens with "Of Faith" still ticked — the scope survived the round trip.
+  await page.reload();
+  await page.getByRole("button", { name: "Scope citations to selected books" }).click();
+  await expect(page.getByLabel("Of Faith")).toBeChecked();
+  await expect(page.getByLabel("On Grace")).not.toBeChecked();
+
+  // Close the scope popover, open the citation drawer, and search: the scoped
+  // /search returns ONLY hits from the chosen book, so "Of Faith" is the single
+  // result and "On Grace" is gone (the fake api shrinks the hit set to book_ids).
+  await page.getByRole("button", { name: "Scope citations to selected books" }).click();
+  await page.getByRole("button", { name: "Cite from your library" }).click();
+  await page.getByLabel("Search your library").fill("grace");
+  await page.getByRole("button", { name: "Search" }).click();
+
+  await expect(page.getByTestId("library-drawer-hit")).toHaveCount(1);
+  await expect(page.getByTestId("library-drawer-hit").first()).toContainText("Of Faith");
+  await expect(page.getByTestId("library-drawer-hit").first()).not.toContainText("On Grace");
 });
 
 test("export downloads a .docx and import replaces the editor content", async ({ page }) => {

@@ -45,6 +45,52 @@ describe("whitelistCreateDocument", () => {
     // must not duplicate it.
     expect(whitelistCreateDocument({ title: "", content: DOC }).ok).toBe(true);
   });
+
+  it("forwards the citation-scope arrays when present (Phase 50)", () => {
+    const result = whitelistCreateDocument({
+      title: "Sermon",
+      content: DOC,
+      scope_book_ids: ["11111111-1111-1111-1111-111111111111"],
+      scope_collection_ids: ["33333333-3333-3333-3333-333333333333"],
+    });
+    expect(result).toEqual({
+      ok: true,
+      body: {
+        title: "Sermon",
+        content: DOC,
+        scope_book_ids: ["11111111-1111-1111-1111-111111111111"],
+        scope_collection_ids: ["33333333-3333-3333-3333-333333333333"],
+      },
+    });
+  });
+
+  it("omits an absent or null scope field rather than forwarding it", () => {
+    const absent = whitelistCreateDocument({ title: "Sermon", content: DOC });
+    expect(absent).toEqual({ ok: true, body: { title: "Sermon", content: DOC } });
+    const nulled = whitelistCreateDocument({
+      title: "Sermon",
+      content: DOC,
+      scope_book_ids: null,
+      scope_collection_ids: null,
+    });
+    expect(nulled).toEqual({ ok: true, body: { title: "Sermon", content: DOC } });
+  });
+
+  it("rejects a scope field that is not an array of strings", () => {
+    expect(whitelistCreateDocument({ title: "Sermon", content: DOC, scope_book_ids: "x" }).ok).toBe(
+      false,
+    );
+    expect(
+      whitelistCreateDocument({ title: "Sermon", content: DOC, scope_book_ids: [1, 2] }).ok,
+    ).toBe(false);
+    expect(
+      whitelistCreateDocument({
+        title: "Sermon",
+        content: DOC,
+        scope_collection_ids: [{}],
+      }).ok,
+    ).toBe(false);
+  });
 });
 
 describe("whitelistPatchDocument", () => {
@@ -108,5 +154,51 @@ describe("whitelistPatchDocument", () => {
     // + the required concurrency token.
     expect(whitelistPatchDocument({ base_updated_at: BASE }).ok).toBe(true);
     expect(whitelistPatchDocument({ base_updated_at: BASE, title: "" }).ok).toBe(true);
+  });
+
+  it("forwards the citation-scope arrays when present (Phase 50)", () => {
+    const result = whitelistPatchDocument({
+      base_updated_at: BASE,
+      content: DOC,
+      scope_book_ids: ["11111111-1111-1111-1111-111111111111"],
+      scope_collection_ids: ["33333333-3333-3333-3333-333333333333"],
+    });
+    expect(result).toEqual({
+      ok: true,
+      body: {
+        base_updated_at: BASE,
+        content: DOC,
+        scope_book_ids: ["11111111-1111-1111-1111-111111111111"],
+        scope_collection_ids: ["33333333-3333-3333-3333-333333333333"],
+      },
+    });
+  });
+
+  it("forwards an explicit empty scope array (present-[] clears the stored scope)", () => {
+    const result = whitelistPatchDocument({ base_updated_at: BASE, scope_book_ids: [] });
+    expect(result).toEqual({ ok: true, body: { base_updated_at: BASE, scope_book_ids: [] } });
+  });
+
+  it("omits an absent or null scope field (the API leaves the stored scope alone)", () => {
+    const absent = whitelistPatchDocument({ base_updated_at: BASE, content: DOC });
+    expect(absent).toEqual({ ok: true, body: { base_updated_at: BASE, content: DOC } });
+    if (absent.ok) {
+      expect("scope_book_ids" in absent.body).toBe(false);
+      expect("scope_collection_ids" in absent.body).toBe(false);
+    }
+    const nulled = whitelistPatchDocument({
+      base_updated_at: BASE,
+      content: DOC,
+      scope_book_ids: null,
+      scope_collection_ids: null,
+    });
+    expect(nulled).toEqual({ ok: true, body: { base_updated_at: BASE, content: DOC } });
+  });
+
+  it("rejects a scope field that is not an array of strings", () => {
+    expect(whitelistPatchDocument({ base_updated_at: BASE, scope_book_ids: "x" }).ok).toBe(false);
+    expect(whitelistPatchDocument({ base_updated_at: BASE, scope_collection_ids: [42] }).ok).toBe(
+      false,
+    );
   });
 });

@@ -27,6 +27,7 @@ from inference import MissingInferenceKeyError, RemoteInferenceError
 
 import auth
 import calendar_routes
+import collections_routes
 import documents
 import editor_links
 import integrations
@@ -36,6 +37,7 @@ import observability
 import reader
 import readyz
 import search
+import search_history
 import summary
 import uploads
 from crypto_vault import OAuthUnconfiguredError
@@ -201,6 +203,7 @@ app.add_middleware(observability.CorrelationMiddleware)
 
 app.include_router(auth.router)
 app.include_router(calendar_routes.router)
+app.include_router(collections_routes.router)
 app.include_router(documents.router)
 app.include_router(editor_links.router)
 app.include_router(integrations.router)
@@ -208,6 +211,7 @@ app.include_router(library.router)
 app.include_router(reader.router)
 app.include_router(uploads.router)
 app.include_router(search.router)
+app.include_router(search_history.router)
 app.include_router(summary.router)
 app.include_router(readyz.router)
 app.include_router(metrics.router)

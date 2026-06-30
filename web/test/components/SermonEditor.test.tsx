@@ -138,6 +138,8 @@ function makeDoc(overrides: Partial<DocumentFull> = {}): DocumentFull {
     content: { type: "doc", content: [{ type: "paragraph" }] },
     content_text: "",
     schema_version: 1,
+    scope_book_ids: [],
+    scope_collection_ids: [],
     created_at: "2026-06-15T00:00:00Z",
     updated_at: "2026-06-15T10:00:00Z",
     ...overrides,
@@ -217,8 +219,18 @@ describe("SermonEditor — autosave debounce", () => {
     expect(url).toBe("/api/documents/doc-1");
     expect(init.method).toBe("PATCH");
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
-    expect(Object.keys(body).sort()).toEqual(["base_updated_at", "content", "title"]);
+    // Phase 50: the autosave body now also carries the (default-empty) citation
+    // scope arrays, matching the proxy whitelist (lib/documents.ts).
+    expect(Object.keys(body).sort()).toEqual([
+      "base_updated_at",
+      "content",
+      "scope_book_ids",
+      "scope_collection_ids",
+      "title",
+    ]);
     expect(body.base_updated_at).toBe("2026-06-15T10:00:00Z");
+    expect(body.scope_book_ids).toEqual([]);
+    expect(body.scope_collection_ids).toEqual([]);
     expect(screen.getByText("Saved")).toBeInTheDocument();
   });
 
@@ -745,5 +757,61 @@ describe("SermonEditor — external-editor link (Phase 45)", () => {
       await Promise.resolve();
     });
     expect(screen.queryByTestId("link-error")).not.toBeInTheDocument();
+  });
+});
+
+describe("SermonEditor — citation scope (Phase 50)", () => {
+  it("ticking a book in the Scope popover persists scope_book_ids via the autosave body", async () => {
+    vi.useFakeTimers();
+    const stub = installFetch(() =>
+      Promise.resolve(jsonResponse(makeDoc({ updated_at: "2026-06-15T11:00:00Z" }))),
+    );
+    render(
+      <SermonEditor
+        document={makeDoc()}
+        bookTitles={new Map([["book-1", "Book One"]])}
+        collections={[]}
+      />,
+    );
+
+    // Open the Scope popover and tick the one library book.
+    fireEvent.click(screen.getByRole("button", { name: "Scope citations to selected books" }));
+    expect(screen.getByTestId("scope-popover")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Book One"));
+
+    // A scope-only change is dirty, so the existing autosave debounce PATCHes it.
+    await act(() => vi.advanceTimersByTimeAsync(AUTOSAVE_DEBOUNCE_MS));
+
+    const body = lastBody(stub);
+    expect(body.scope_book_ids).toEqual(["book-1"]);
+    expect(body.scope_collection_ids).toEqual([]);
+    // The toolbar badge reflects the scoped count.
+    expect(
+      screen.getByRole("button", { name: "Scope citations to selected books" }),
+    ).toHaveTextContent("Scope (1)");
+  });
+
+  it("reflects the sermon's initial scope as checked and persists an untick", async () => {
+    vi.useFakeTimers();
+    const stub = installFetch(() =>
+      Promise.resolve(jsonResponse(makeDoc({ updated_at: "2026-06-15T11:00:00Z" }))),
+    );
+    render(
+      <SermonEditor
+        document={makeDoc()}
+        bookTitles={new Map([["book-1", "Book One"]])}
+        scopeBookIds={["book-1"]}
+        collections={[]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Scope citations to selected books" }));
+    const checkbox = screen.getByLabelText("Book One") as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+
+    // Untick -> autosave persists the now-empty book scope.
+    fireEvent.click(checkbox);
+    await act(() => vi.advanceTimersByTimeAsync(AUTOSAVE_DEBOUNCE_MS));
+    expect(lastBody(stub).scope_book_ids).toEqual([]);
   });
 });

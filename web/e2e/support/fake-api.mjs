@@ -78,6 +78,21 @@ const documents = new Map();
 const editorLinks = new Map();
 
 /**
+ * Search-history store (Phase 51 — backs /search-history). Keyed by historyId.
+ * A successful /search-summary INSERTS a row for the JWT user (the real api's
+ * best-effort save-on-summary), so the e2e can run a search, see it appear in
+ * the "Recent" panel, REOPEN it (GET the full row — no second /search-summary
+ * call), and DELETE it. The list endpoint ships a lightweight preview; the
+ * per-id GET ships the whole `result` blob. A non-owned / unknown id is the
+ * uniform no-oracle 404. There is NO retention prune here (the e2e never makes
+ * 100+ rows).
+ *
+ * historyId -> { userId, query, scope_book_ids, scope_collection_ids, result,
+ *                created_at }.
+ */
+const searchHistory = new Map();
+
+/**
  * OAuth connections store (Phase 44 — backs /integrations). Keyed
  * `${userId}:${provider}` so a reconnect overwrites in place (the real api's
  * ON CONFLICT(user_id, provider) upsert). The wire shape carries NO token
@@ -142,9 +157,17 @@ function fullDoc(id, record) {
     content: record.content,
     content_text: record.content_text,
     schema_version: record.schema_version,
+    // Per-sermon citation scope (Phase 50). Always present; default [].
+    scope_book_ids: record.scope_book_ids,
+    scope_collection_ids: record.scope_collection_ids,
     created_at: record.created_at,
     updated_at: record.updated_at,
   };
+}
+
+/** Keep only the string elements of a value that may be an array (scope clamp). */
+function stringArray(value) {
+  return Array.isArray(value) ? value.filter((el) => typeof el === "string") : [];
 }
 
 /** Preview-only DocumentSummary list item (no `content`). */
@@ -366,6 +389,19 @@ function addUtcDays(value, delta) {
   return `${yy}-${mm}-${dd}`;
 }
 
+/**
+ * Phase 49 — pull the scope (book_ids/collection_ids) out of a /search or
+ * /search-summary body. The real api intersects these with the JWT user's
+ * library; the stub just echoes them back (and /search filters its hits by
+ * book_ids) so an e2e can prove the chosen scope reached the api. A missing /
+ * non-array field collapses to [].
+ */
+function readScope(body) {
+  const strings = (value) =>
+    Array.isArray(value) ? value.filter((element) => typeof element === "string") : [];
+  return { book_ids: strings(body?.book_ids), collection_ids: strings(body?.collection_ids) };
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
   const path = url.pathname;
@@ -400,24 +436,49 @@ const server = createServer(async (req, res) => {
   }
 
   // --- search-summary -------------------------------------------------------
+  // Phase 49: accepts the optional scope (book_ids/collection_ids) and ECHOES it
+  // back under `scope` so an e2e can confirm the chosen scope reached the api.
+  // The grounded summary is left whole (its [book:chunk] markers must keep
+  // resolving), so the stub does not filter citations.
   if (req.method === "POST" && path === "/search-summary") {
-    if (!userIdFor(req)) {
+    const userId = userIdFor(req);
+    if (!userId) {
       return detail(res, 401, "Not authenticated.");
     }
-    await readJson(req); // drain {query}
-    return send(res, 200, { summary: SUMMARY, citations: CITATIONS, degraded: [] });
+    const body = await readJson(req);
+    const scope = readScope(body);
+    const result = { summary: SUMMARY, citations: CITATIONS, degraded: [] };
+    // Phase 51 best-effort save-on-summary: persist the whole result so the
+    // "Recent" panel can reopen it without re-running the pipeline.
+    const historyId = randomUUID();
+    searchHistory.set(historyId, {
+      userId,
+      query: typeof body?.query === "string" ? body.query : "",
+      scope_book_ids: scope.book_ids,
+      scope_collection_ids: scope.collection_ids,
+      result,
+      created_at: nextTimestamp(),
+    });
+    return send(res, 200, { ...result, scope });
   }
 
   // --- search (raw hybrid hits, no LLM) -------------------------------------
   // Backs the Phase 37 in-editor LibraryDrawer. Bearer-scoped like the rest;
   // returns the deterministic SEARCH_HITS (already tenant-scoped in the real api
   // — the JWT user's library — so the stub just gates on a valid session).
+  // Phase 49: when the body carries a non-empty `book_ids` scope the stub SHRINKS
+  // the hit set to those books (the real api intersects with the library) and
+  // echoes the scope back.
   if (req.method === "POST" && path === "/search") {
     if (!userIdFor(req)) {
       return detail(res, 401, "Not authenticated.");
     }
-    await readJson(req); // drain {query}
-    return send(res, 200, { hits: SEARCH_HITS, degraded: [] });
+    const scope = readScope(await readJson(req));
+    const hits =
+      scope.book_ids.length > 0
+        ? SEARCH_HITS.filter((hit) => scope.book_ids.includes(hit.book_id))
+        : SEARCH_HITS;
+    return send(res, 200, { hits, degraded: [], scope });
   }
 
   // --- library --------------------------------------------------------------
@@ -428,6 +489,81 @@ const server = createServer(async (req, res) => {
       return detail(res, 401, "Not authenticated.");
     }
     return send(res, 200, { books: LIBRARY });
+  }
+
+  // --- collections (Phase 48 list) ------------------------------------------
+  // The /library + /search server components fetch this alongside /library
+  // (Phase 49 scoped search). The stub keeps no collection store yet, so a fresh
+  // user has none — an empty list is enough for the scoped-search flow, which
+  // selects ad-hoc books. Bearer-scoped like the rest.
+  if (req.method === "GET" && path === "/collections") {
+    if (!userIdFor(req)) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    return send(res, 200, { collections: [] });
+  }
+
+  // --- search history (Phase 51) --------------------------------------------
+  // GET /search-history — the caller's saved searches, newest-first, lightweight
+  // (query + scope + summary PREVIEW + created_at, NO full result). Bearer-scoped.
+  if (req.method === "GET" && path === "/search-history") {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const items = [];
+    for (const [id, record] of searchHistory) {
+      if (record.userId !== userId) {
+        continue;
+      }
+      items.push({
+        history_id: id,
+        query: record.query,
+        scope_book_ids: record.scope_book_ids,
+        scope_collection_ids: record.scope_collection_ids,
+        summary_preview: (record.result.summary ?? "").slice(0, PREVIEW_CHARS),
+        created_at: record.created_at,
+      });
+    }
+    // created_at DESC (newest first), matching the real api's list ordering.
+    items.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+    return send(res, 200, { items });
+  }
+
+  // GET full / DELETE one saved search. A non-owned / unknown / non-UUID id
+  // collapses to the SAME uniform 404 (no existence oracle).
+  const historyMatch = path.match(/^\/search-history\/([^/]+)$/);
+  if (historyMatch && (req.method === "GET" || req.method === "DELETE")) {
+    const userId = userIdFor(req);
+    if (!userId) {
+      return detail(res, 401, "Not authenticated.");
+    }
+    const id = decodeURIComponent(historyMatch[1]);
+    const record = searchHistory.get(id);
+    const owned = record && record.userId === userId;
+
+    if (req.method === "GET") {
+      if (!owned) {
+        return detail(res, 404, "Search history entry not found.");
+      }
+      return send(res, 200, {
+        history_id: id,
+        query: record.query,
+        scope_book_ids: record.scope_book_ids,
+        scope_collection_ids: record.scope_collection_ids,
+        result: record.result,
+        created_at: record.created_at,
+      });
+    }
+
+    if (req.method === "DELETE") {
+      if (!owned) {
+        return detail(res, 404, "Search history entry not found.");
+      }
+      searchHistory.delete(id);
+      res.writeHead(204);
+      return res.end();
+    }
   }
 
   // --- calendar events collection (Phase 39 GET + Phase 40 POST) ------------
@@ -678,6 +814,10 @@ const server = createServer(async (req, res) => {
         content,
         content_text: deriveContentText(content),
         schema_version: SCHEMA_VERSION,
+        // Per-sermon citation scope (Phase 50). The real api clamps to the user's
+        // library / owned collections; the stub just stores the string arrays.
+        scope_book_ids: stringArray(body?.scope_book_ids),
+        scope_collection_ids: stringArray(body?.scope_collection_ids),
         created_at: now,
         updated_at: now,
         deleted_at: null,
@@ -732,8 +872,16 @@ const server = createServer(async (req, res) => {
       const hasTitle = typeof body.title === "string";
       const hasContent =
         typeof body.content === "object" && body.content !== null && !Array.isArray(body.content);
-      if (!hasTitle && !hasContent) {
-        return detail(res, 422, "PATCH must set at least one of title or content.");
+      // Phase 50: the scope arrays are also patchable, so a scope-only PATCH is
+      // valid (the api allows it; the web autosave always sends content too).
+      const hasScopeBook = Array.isArray(body.scope_book_ids);
+      const hasScopeCollection = Array.isArray(body.scope_collection_ids);
+      if (!hasTitle && !hasContent && !hasScopeBook && !hasScopeCollection) {
+        return detail(
+          res,
+          422,
+          "PATCH must set at least one of title, content, scope_book_ids, scope_collection_ids.",
+        );
       }
       // Optimistic concurrency: a base that doesn't match the stored updated_at
       // means another write landed first -> 409 (the stale-tab editor path).
@@ -746,6 +894,13 @@ const server = createServer(async (req, res) => {
       if (hasContent) {
         record.content = body.content;
         record.content_text = deriveContentText(body.content);
+      }
+      // Scope is three-state: present (incl. []) replaces; absent leaves it.
+      if (hasScopeBook) {
+        record.scope_book_ids = stringArray(body.scope_book_ids);
+      }
+      if (hasScopeCollection) {
+        record.scope_collection_ids = stringArray(body.scope_collection_ids);
       }
       record.updated_at = nextTimestamp();
       return send(res, 200, fullDoc(id, record));

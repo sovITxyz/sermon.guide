@@ -53,13 +53,39 @@ export interface SummaryResponse {
 
 /**
  * POST /search body (api/search.py SearchRequest, extra="forbid"). The search
- * proxy forwards ONLY `query` — `limit`/`rerank` stay at the API defaults so a
- * client cannot widen the retrieval fan-out or flip off the rerank/highlight
- * pipeline through this proxy. A smuggled `user_id`/`book_ids` never reaches
- * the API's 422 because the proxy drops it before serializing the body.
+ * proxy forwards `query` plus the optional SCOPE fields `book_ids` /
+ * `collection_ids` (Phase 49) when the caller supplies them; `limit`/`rerank`
+ * stay at the API defaults so a client cannot widen the retrieval fan-out or
+ * flip off the rerank/highlight pipeline through this proxy.
+ *
+ * SCOPE IS AN INTERSECTION, NEVER A REPLACEMENT. An OMITTED `book_ids` /
+ * `collection_ids` (the empty-selection default) means "whole library"; when
+ * present, the API resolves the JWT user's library server-side and intersects
+ * the requested set with it (a foreign/unknown id can only SHRINK the search,
+ * never widen it), ownership-checking each `collection_id` with a no-oracle 404.
+ * The proxy whitelist forwards each array STRUCTURALLY (array-of-strings) and
+ * omits it when absent; a smuggled `user_id` is still dropped before the body
+ * reaches the API's `extra="forbid"` gate. The per-array caps (book_ids
+ * <= 10000, collection_ids <= 500) are the API's 422 to own.
  */
 export interface SearchRequest {
   query: string;
+  book_ids?: string[];
+  collection_ids?: string[];
+}
+
+/**
+ * POST /search-summary body (api/summary.py SummaryRequest, extra="forbid").
+ * Same shape and the SAME scope contract as SearchRequest (Phase 49): `query`
+ * plus the optional `book_ids` / `collection_ids` scope, intersected with the
+ * JWT user's library server-side. The summary proxy whitelists these fields
+ * (lib/summary.ts:whitelistSummary) the way the /search proxy whitelists its
+ * body; an omitted scope searches the whole library.
+ */
+export interface SummaryRequest {
+  query: string;
+  book_ids?: string[];
+  collection_ids?: string[];
 }
 
 /**
@@ -197,31 +223,47 @@ export interface DocumentFull {
   content: ProseMirrorDoc;
   content_text: string;
   schema_version: number;
+  // Per-sermon citation scope (Phase 50): the clamped book / collection ids the
+  // sermon's citation drawer is limited to. Always present (default `[]`); the
+  // API clamps each set to the JWT user's library / owned collections on write,
+  // so a value here can only name books/collections the user actually owns. An
+  // empty array means "whole library" (the citation drawer searches everything).
+  scope_book_ids: string[];
+  scope_collection_ids: string[];
   created_at: string;
   updated_at: string;
 }
 
 /**
  * POST /documents body (api/documents.py DocumentCreate, extra="forbid"). The
- * create proxy forwards ONLY these two fields — `content_text`/`schema_version`
- * are server-derived/-managed and a smuggled one is dropped here before it can
- * reach the API's 422.
+ * create proxy forwards `title`/`content` plus the optional citation-scope
+ * arrays — `content_text`/`schema_version` are server-derived/-managed and a
+ * smuggled one is dropped here before it can reach the API's 422. The scope
+ * arrays are clamped to the user's library / owned collections server-side, so
+ * omitting them (or sending `[]`) creates a whole-library sermon.
  */
 export interface DocumentCreate {
   title: string;
   content: ProseMirrorDoc;
+  scope_book_ids?: string[];
+  scope_collection_ids?: string[];
 }
 
 /**
  * PATCH /documents/{id} body (api/documents.py DocumentUpdate, extra="forbid").
  * `base_updated_at` (the optimistic-concurrency token) is REQUIRED; at least
- * one of `title`/`content` must be present (the API's 422 owns that rule). The
- * patch proxy forwards ONLY these three fields.
+ * one of `title`/`content`/`scope_book_ids`/`scope_collection_ids` must be
+ * present (the API's 422 owns that rule). The scope arrays are three-state on
+ * the API: ABSENT (omitted) leaves the stored value; PRESENT (incl. `[]`)
+ * replaces it (and is clamped to the user's library / owned collections). The
+ * patch proxy forwards ONLY these fields.
  */
 export interface DocumentPatch {
   base_updated_at: string;
   title?: string;
   content?: ProseMirrorDoc;
+  scope_book_ids?: string[];
+  scope_collection_ids?: string[];
 }
 
 /**
@@ -368,4 +410,109 @@ export interface UnlinkRequest {
  */
 export interface AuthorizeResponse {
   authorize_url: string;
+}
+
+/**
+ * One library collection (api/collections_routes.py CollectionResponse,
+ * Phase 48) — the GET / POST / PATCH / books response shape. Field names/casing
+ * match the FastAPI JSON verbatim. A collection is a user-owned folder grouping
+ * books in the library; `book_ids` is its CURRENT membership (the JWT user's
+ * rows, in insertion order). `description` is nullable. There is NO `user_id` —
+ * the response is tenant-scoped server-side via the JWT.
+ */
+export interface Collection {
+  collection_id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  book_ids: string[];
+}
+
+/**
+ * GET /collections response (api/collections_routes.py CollectionListResponse).
+ * Just `collections`, newest-first — no pagination/total.
+ */
+export interface CollectionListResponse {
+  collections: Collection[];
+}
+
+/**
+ * POST /collections body (api/collections_routes.py CollectionCreate,
+ * extra="forbid"). The create proxy forwards `name` (required) plus the
+ * optional/nullable `description`; a smuggled `user_id` is dropped before it can
+ * reach the API's 422. Length caps (name 1..255, description <= 2000) are the
+ * API's 422 to own — the web whitelist does structural checks only.
+ */
+export interface CollectionCreate {
+  name: string;
+  description?: string | null;
+}
+
+/**
+ * PATCH /collections/{id} body (api/collections_routes.py CollectionUpdate,
+ * extra="forbid"). Both fields optional; the API's 422 owns the
+ * at-least-one-of rule and the length checks. `description` is three-state:
+ * absent leaves it, present-and-null clears it, present-and-string replaces it
+ * — so it is `string | null` when present, omitted when absent. `name` is the
+ * NOT-NULL column, so it is `string` (never null) when present, omitted when
+ * absent.
+ */
+export interface CollectionPatch {
+  name?: string;
+  description?: string | null;
+}
+
+/**
+ * POST/DELETE /collections/{id}/books body (api/collections_routes.py
+ * CollectionBooksRequest, extra="forbid"). `book_ids` is required. On the add
+ * path the API CLAMPS the set to the owner's library (a foreign/unowned id is
+ * silently dropped) before any insert — the web whitelist forwards the array
+ * structurally and never pre-validates ownership. The cap (1..10000) is the
+ * API's 422 to own.
+ */
+export interface CollectionBooksRequest {
+  book_ids: string[];
+}
+
+/**
+ * One row in the lightweight "Recent" search-history list (Phase 51 —
+ * api/search_history.py SearchHistoryItem). Field names/casing match the
+ * FastAPI JSON verbatim. This is the LIST shape: it carries `query`, the
+ * Phase 49 scope the search ran under (`scope_book_ids`/`scope_collection_ids`,
+ * UUID strings), a SHORT `summary_preview` (first SUMMARY_PREVIEW_CHARS of the
+ * saved summary), and `created_at` — never the full `result`/citations blob
+ * (that rides only on the per-id GET, so the list stays cheap). There is NO
+ * `user_id`: the response is tenant-scoped server-side via the JWT.
+ */
+export interface SearchHistoryItem {
+  history_id: string;
+  query: string;
+  scope_book_ids: string[];
+  scope_collection_ids: string[];
+  summary_preview: string;
+  created_at: string;
+}
+
+/**
+ * One FULL saved search (Phase 51 — api/search_history.py SearchHistoryEntry):
+ * the instant-replay shape returned by GET /search-history/{id}. `result` is the
+ * serialized SummaryResponse exactly as it was returned (the API also carries a
+ * `degraded` key that this `SummaryResponse` shape ignores), so the panel
+ * rehydrates SearchPanel's summary + citation render with NO second
+ * /search-summary call (the costly 2–4 min pipeline is never re-run). There is
+ * NO `user_id` — the row is resolved by the JWT user's own history only (a
+ * non-owned / nonexistent / non-UUID id is the API's uniform no-oracle 404).
+ */
+export interface SearchHistoryEntry {
+  history_id: string;
+  query: string;
+  scope_book_ids: string[];
+  scope_collection_ids: string[];
+  result: SummaryResponse;
+  created_at: string;
+}
+
+/** GET /search-history response (api/search_history.py SearchHistoryListResponse). */
+export interface SearchHistoryListResponse {
+  items: SearchHistoryItem[];
 }

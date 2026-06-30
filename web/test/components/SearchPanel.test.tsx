@@ -1,7 +1,11 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SearchPanel } from "../../components/SearchPanel";
-import type { SummaryCitation, SummaryResponse } from "../../lib/types";
+import {
+  SELECTION_STORAGE_KEY,
+  SelectionProvider,
+} from "../../components/library/selection-context";
+import type { Collection, SummaryCitation, SummaryResponse } from "../../lib/types";
 import { installFetch, jsonResponse } from "./helpers";
 
 function citation(overrides: Partial<SummaryCitation> & { marker: string }): SummaryCitation {
@@ -16,10 +20,21 @@ function citation(overrides: Partial<SummaryCitation> & { marker: string }): Sum
   };
 }
 
+function collection(overrides: Partial<Collection> & { collection_id: string }): Collection {
+  return {
+    name: "A collection",
+    description: null,
+    created_at: "2026-06-15T00:00:00Z",
+    book_ids: [],
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  sessionStorage.clear();
 });
 
 function submitQuery(value: string): void {
@@ -172,6 +187,54 @@ describe("SearchPanel", () => {
     await screen.findByRole("heading", { name: "Summary" });
     expect(screen.getByRole("link", { name: "[1]" })).toHaveAttribute("href", "#citation-1");
     expect(screen.queryByRole("link", { name: "[2]" })).not.toBeInTheDocument();
+  });
+
+  it("omits the scope and shows the whole-library label with no selection", async () => {
+    const fetchStub = installFetch(() =>
+      Promise.resolve(jsonResponse({ summary: "ok", citations: [] } satisfies SummaryResponse)),
+    );
+    render(<SearchPanel totalBooks={7} />);
+
+    expect(screen.getByTestId("search-scope")).toHaveTextContent(
+      "Searching all 7 books in your library.",
+    );
+
+    submitQuery("grace");
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    const [, init] = fetchStub.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ query: "grace" });
+  });
+
+  it("folds the shared selection into the POST scope and shows the resolved count", async () => {
+    // Seed the selection the way navigating from /library would (sessionStorage);
+    // the provider hydrates it after mount. c1 contributes b9, so the resolved
+    // distinct count is 3 (b1, b2, b9) but the POST carries the RAW selection.
+    sessionStorage.setItem(
+      SELECTION_STORAGE_KEY,
+      JSON.stringify({ bookIds: ["b1", "b2"], collectionIds: ["c1"] }),
+    );
+    const fetchStub = installFetch(() =>
+      Promise.resolve(jsonResponse({ summary: "ok", citations: [] } satisfies SummaryResponse)),
+    );
+    render(
+      <SelectionProvider collections={[collection({ collection_id: "c1", book_ids: ["b9"] })]}>
+        <SearchPanel totalBooks={7} />
+      </SelectionProvider>,
+    );
+
+    // The hydration effect resolves the union -> "3 selected books".
+    await waitFor(() =>
+      expect(screen.getByTestId("search-scope")).toHaveTextContent("Searching 3 selected books."),
+    );
+
+    submitQuery("grace");
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    const [, init] = fetchStub.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      query: "grace",
+      book_ids: ["b1", "b2"],
+      collection_ids: ["c1"],
+    });
   });
 
   it("re-enables the form after a successful search so a second query can run", async () => {

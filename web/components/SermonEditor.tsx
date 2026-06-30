@@ -14,6 +14,7 @@ import {
   onSaveRequested,
 } from "@/lib/sermon-autosave";
 import type {
+  Collection,
   DocumentFull,
   EditorLinkState,
   EditorLinkStatus,
@@ -153,6 +154,9 @@ export function SermonEditor({
   document: initialDocument,
   ownedBookIds,
   bookTitles,
+  collections = [],
+  scopeBookIds: initialScopeBookIds = [],
+  scopeCollectionIds: initialScopeCollectionIds = [],
   linkStatus,
   googleConnected = false,
 }: {
@@ -164,8 +168,18 @@ export function SermonEditor({
   ownedBookIds?: ReadonlySet<string>;
   // The {book_id -> title} map from the SAME one-shot /library fetch — the only
   // source of a citation's title (a raw /search hit carries none). Used by the
-  // in-editor LibraryDrawer to cache `bookTitle` at insert. Empty by default.
+  // in-editor LibraryDrawer to cache `bookTitle` at insert, AND to label the
+  // Scope control's per-book checkboxes (Phase 50). Empty by default.
   bookTitles?: ReadonlyMap<string, string>;
+  // The user's library collections (Phase 50), fetched server-side on doc open.
+  // Backs the Scope control's collection checkboxes and prunes stale (deleted)
+  // collection ids out of the scope handed to the citation drawer's search.
+  collections?: Collection[];
+  // The per-sermon citation scope (Phase 50), derived by the shell from the
+  // document's stored `scope_book_ids` / `scope_collection_ids` (no extra fetch).
+  // Empty arrays = whole library. Persisted via the existing autosave path.
+  scopeBookIds?: string[];
+  scopeCollectionIds?: string[];
   // The external-editor link state (Phase 45), fetched server-side on doc open.
   // When `state === "linked"` the editor is HARD read-only with the "Editing
   // externally" banner; otherwise editable. Defaults to unlinked when omitted.
@@ -197,6 +211,14 @@ export function SermonEditor({
   // The LibraryDrawer is opened from a toolbar affordance; closed by default so
   // the editor opens uncluttered.
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Per-sermon citation scope (Phase 50). The books / collections the citation
+  // drawer is limited to. Held as state for the Scope-control UI AND mirrored
+  // into refs below so the autosave loop (which reads refs, never render
+  // closures) sees the current scope when it builds a PATCH. The Scope popover
+  // is closed by default like the drawer.
+  const [scopeOpen, setScopeOpen] = useState(false);
+  const [scopeBookIds, setScopeBookIds] = useState<string[]>(initialScopeBookIds);
+  const [scopeCollectionIds, setScopeCollectionIds] = useState<string[]>(initialScopeCollectionIds);
   // Schedule-on-calendar (Phase 47): the popover open flag, and the date of the
   // most recently scheduled event — non-null shows a confirmation linking to the
   // calendar. Distinct from the save/link/docx state so a successful schedule
@@ -234,10 +256,17 @@ export function SermonEditor({
   const lastSaved = useRef<EditorSnapshot>({
     title: initialDocument.title,
     content: initialDocument.content,
+    scopeBookIds: initialScopeBookIds,
+    scopeCollectionIds: initialScopeCollectionIds,
   });
   // Latest title kept in a ref so the autosave loop (and the pagehide flush, a
   // non-React event) reads the current value, not a stale render closure.
   const titleRef = useRef(initialDocument.title);
+  // The current citation scope mirrored into refs for the same reason — the
+  // autosave loop reads these (not the render-closure state) when it builds the
+  // PATCH body, so a Scope toggle that just fired the debounce saves correctly.
+  const scopeBookIdsRef = useRef(scopeBookIds);
+  const scopeCollectionIdsRef = useRef(scopeCollectionIds);
   const flight = useRef<FlightState>(idleFlight());
   // Once a 409 lands, the loop STOPS until the user reloads. Guards every
   // scheduler entry point (debounce, max-interval, trailing) so a conflicted
@@ -270,7 +299,12 @@ export function SermonEditor({
     if (!editor) {
       return null;
     }
-    return { title: titleRef.current, content: editor.getJSON() as ProseMirrorDoc };
+    return {
+      title: titleRef.current,
+      content: editor.getJSON() as ProseMirrorDoc,
+      scopeBookIds: scopeBookIdsRef.current,
+      scopeCollectionIds: scopeCollectionIdsRef.current,
+    };
   }, [editor]);
 
   const clearTimers = useCallback((): void => {
@@ -282,6 +316,16 @@ export function SermonEditor({
       window.clearTimeout(maxIntervalTimer.current);
       maxIntervalTimer.current = null;
     }
+  }, []);
+
+  // Adopt a scope into both the render state and the autosave-loop refs at once
+  // (Phase 50). Used by the reload/import/pull reset points so the scope tracks
+  // the server's returned document, and by the toggles below.
+  const syncScope = useCallback((bookIds: string[], collectionIds: string[]): void => {
+    scopeBookIdsRef.current = bookIds;
+    scopeCollectionIdsRef.current = collectionIds;
+    setScopeBookIds(bookIds);
+    setScopeCollectionIds(collectionIds);
   }, []);
 
   // The actual PATCH. Single-flight is enforced by the caller (runSave) via the
@@ -410,6 +454,50 @@ export function SermonEditor({
     };
   }, [editor, scheduleAutosave]);
 
+  // --- citation scope (Phase 50) -------------------------------------------
+  // Toggling a book / collection in the Scope popover updates the ref (so a
+  // pending autosave reads the new value) and the state (so the popover
+  // re-renders), then schedules an autosave — the scope rides the SAME debounce
+  // + single-flight path as the manuscript, so no separate request is needed.
+  const toggleScopeBook = useCallback(
+    (bookId: string): void => {
+      const prev = scopeBookIdsRef.current;
+      const next = prev.includes(bookId) ? prev.filter((id) => id !== bookId) : [...prev, bookId];
+      syncScope(next, scopeCollectionIdsRef.current);
+      scheduleAutosave();
+    },
+    [syncScope, scheduleAutosave],
+  );
+  const toggleScopeCollection = useCallback(
+    (collectionId: string): void => {
+      const prev = scopeCollectionIdsRef.current;
+      const next = prev.includes(collectionId)
+        ? prev.filter((id) => id !== collectionId)
+        : [...prev, collectionId];
+      syncScope(scopeBookIdsRef.current, next);
+      scheduleAutosave();
+    },
+    [syncScope, scheduleAutosave],
+  );
+
+  // The scope handed to the citation drawer's /search. PRUNE stale collection
+  // ids: a collection the user deleted (so it is no longer in `collections`)
+  // would otherwise reach /search and trip the API's no-oracle 404, failing
+  // EVERY citation search. The persisted scope is left intact — the API re-clamps
+  // it on the next save — so a transient collections-fetch miss never wipes it.
+  const liveCollectionIds = useMemo(
+    () => new Set(collections.map((c) => c.collection_id)),
+    [collections],
+  );
+  const drawerScope = useMemo(
+    () => ({
+      book_ids: scopeBookIds,
+      collection_ids: scopeCollectionIds.filter((id) => liveCollectionIds.has(id)),
+    }),
+    [scopeBookIds, scopeCollectionIds, liveCollectionIds],
+  );
+  const scopeCount = scopeBookIds.length + drawerScope.collection_ids.length;
+
   // The read-only lock (Phase 45). While LINKED the editor is HARD read-only —
   // setEditable(false) disables the contenteditable AND the linked ref gates the
   // autosave loop so NO PATCH ever fires while the native Doc is the source of
@@ -485,14 +573,20 @@ export function SermonEditor({
       setTitle(latest.title);
       titleRef.current = latest.title;
       baseUpdatedAt.current = latest.updated_at;
-      lastSaved.current = { title: latest.title, content: latest.content };
+      syncScope(latest.scope_book_ids, latest.scope_collection_ids);
+      lastSaved.current = {
+        title: latest.title,
+        content: latest.content,
+        scopeBookIds: latest.scope_book_ids,
+        scopeCollectionIds: latest.scope_collection_ids,
+      };
       flight.current = idleFlight();
       conflicted.current = false;
       setStatus("saved");
     } catch {
       setStatus("conflict");
     }
-  }, [editor, documentId]);
+  }, [editor, documentId, syncScope]);
 
   // --- DOCX round-trip (Phase 43) ------------------------------------------
   // Download .docx: fetch the export proxy as a Blob and trigger a browser
@@ -581,7 +675,13 @@ export function SermonEditor({
         setTitle(imported.title);
         titleRef.current = imported.title;
         baseUpdatedAt.current = imported.updated_at;
-        lastSaved.current = { title: imported.title, content: imported.content };
+        syncScope(imported.scope_book_ids, imported.scope_collection_ids);
+        lastSaved.current = {
+          title: imported.title,
+          content: imported.content,
+          scopeBookIds: imported.scope_book_ids,
+          scopeCollectionIds: imported.scope_collection_ids,
+        };
         flight.current = idleFlight();
         conflicted.current = false;
         setStatus("saved");
@@ -591,7 +691,7 @@ export function SermonEditor({
         setDocxBusy(false);
       }
     },
-    [editor, documentId],
+    [editor, documentId, syncScope],
   );
 
   // --- external-editor link actions (Phase 45) -----------------------------
@@ -608,10 +708,16 @@ export function SermonEditor({
       setTitle(doc.title);
       titleRef.current = doc.title;
       baseUpdatedAt.current = doc.updated_at;
-      lastSaved.current = { title: doc.title, content: doc.content };
+      syncScope(doc.scope_book_ids, doc.scope_collection_ids);
+      lastSaved.current = {
+        title: doc.title,
+        content: doc.content,
+        scopeBookIds: doc.scope_book_ids,
+        scopeCollectionIds: doc.scope_collection_ids,
+      };
       flight.current = idleFlight();
     },
-    [editor],
+    [editor, syncScope],
   );
 
   // Link: POST the link proxy. On success the API created the Drive Doc and
@@ -956,6 +1062,20 @@ export function SermonEditor({
             + Citation
           </button>
 
+          {/* Scope (Phase 50). Opens a popover of the user's library books +
+            collections; ticking limits the citation drawer's search to that set
+            and persists per-sermon via the autosave path. The count badge shows
+            how many books/collections are scoped (0 = whole library). */}
+          <button
+            type="button"
+            aria-label="Scope citations to selected books"
+            aria-expanded={scopeOpen}
+            onClick={() => setScopeOpen((open) => !open)}
+            className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700 text-sm disabled:opacity-50"
+          >
+            Scope{scopeCount > 0 ? ` (${scopeCount})` : ""}
+          </button>
+
           {/* Schedule on calendar (Phase 47). Opens a popover that creates a
             calendar event linked to this sermon. Does NOT depend on the editor
             instance (it uses the title state + document_id), so it stays usable
@@ -1058,8 +1178,25 @@ export function SermonEditor({
         </div>
       ) : null}
 
+      {scopeOpen && !isLinked ? (
+        <ScopePopover
+          bookTitles={titleMap}
+          collections={collections}
+          scopeBookIds={scopeBookIds}
+          scopeCollectionIds={scopeCollectionIds}
+          onToggleBook={toggleScopeBook}
+          onToggleCollection={toggleScopeCollection}
+          onClose={() => setScopeOpen(false)}
+        />
+      ) : null}
+
       {drawerOpen && !isLinked ? (
-        <LibraryDrawer editor={editor} bookTitles={titleMap} onClose={() => setDrawerOpen(false)} />
+        <LibraryDrawer
+          editor={editor}
+          bookTitles={titleMap}
+          scope={drawerScope}
+          onClose={() => setDrawerOpen(false)}
+        />
       ) : null}
 
       {scheduleOpen && !isLinked ? (
@@ -1193,5 +1330,113 @@ function ToolbarButton({
     >
       {children}
     </button>
+  );
+}
+
+/**
+ * The per-sermon Scope popover (Phase 50). A checkbox list of the user's library
+ * books and collections; ticking limits the citation drawer's search to that
+ * set, and the choice persists per-sermon through the autosave path. An EMPTY
+ * selection means the whole library (the citation drawer omits the scope). Books
+ * come from the shell's one-shot {book_id -> title} map; collections from the
+ * server-fetched list. All labels render as PLAIN TEXT — never
+ * dangerouslySetInnerHTML.
+ */
+function ScopePopover({
+  bookTitles,
+  collections,
+  scopeBookIds,
+  scopeCollectionIds,
+  onToggleBook,
+  onToggleCollection,
+  onClose,
+}: {
+  bookTitles: ReadonlyMap<string, string>;
+  collections: Collection[];
+  scopeBookIds: string[];
+  scopeCollectionIds: string[];
+  onToggleBook: (bookId: string) => void;
+  onToggleCollection: (collectionId: string) => void;
+  onClose: () => void;
+}) {
+  const bookEntries = useMemo(() => [...bookTitles.entries()], [bookTitles]);
+  const bookSet = useMemo(() => new Set(scopeBookIds), [scopeBookIds]);
+  const collectionSet = useMemo(() => new Set(scopeCollectionIds), [scopeCollectionIds]);
+  const empty = bookEntries.length === 0 && collections.length === 0;
+
+  return (
+    <aside
+      aria-label="Scope citations to your library"
+      data-testid="scope-popover"
+      className="mb-3 rounded-lg border border-gray-300 bg-gray-50 p-4"
+    >
+      <div className="mb-2 flex items-baseline justify-between gap-4">
+        <h2 className="font-semibold text-sm">Limit citations to…</h2>
+        <button
+          type="button"
+          onClick={onClose}
+          className="shrink-0 text-blue-600 text-xs hover:underline"
+        >
+          Close
+        </button>
+      </div>
+      <p className="mb-3 text-gray-600 text-xs">
+        Tick books or collections to scope the citation search for this sermon. Leave everything
+        unticked to search your whole library.
+      </p>
+
+      {empty ? (
+        <p className="rounded-lg border border-gray-300 border-dashed p-4 text-center text-gray-600 text-sm">
+          Your library is empty.
+        </p>
+      ) : null}
+
+      {collections.length > 0 ? (
+        <div className="mb-3">
+          <h3 className="mb-1 font-medium text-gray-700 text-xs uppercase tracking-wide">
+            Collections
+          </h3>
+          <ul className="space-y-1">
+            {collections.map((collection) => (
+              <li key={collection.collection_id}>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={collectionSet.has(collection.collection_id)}
+                    onChange={() => onToggleCollection(collection.collection_id)}
+                  />
+                  <span className="min-w-0 truncate">{collection.name}</span>
+                  <span className="text-gray-500 text-xs">
+                    {`${collection.book_ids.length} ${
+                      collection.book_ids.length === 1 ? "book" : "books"
+                    }`}
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {bookEntries.length > 0 ? (
+        <div>
+          <h3 className="mb-1 font-medium text-gray-700 text-xs uppercase tracking-wide">Books</h3>
+          <ul className="max-h-56 space-y-1 overflow-y-auto">
+            {bookEntries.map(([bookId, bookTitle]) => (
+              <li key={bookId}>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={bookSet.has(bookId)}
+                    onChange={() => onToggleBook(bookId)}
+                  />
+                  <span className="min-w-0 truncate">{bookTitle}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </aside>
   );
 }

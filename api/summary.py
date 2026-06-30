@@ -115,6 +115,7 @@ sermon prep; the architecture-locked GPU swap is the documented path.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -122,19 +123,22 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import openai
-from db import GlobalBook
+from db import GlobalBook, User
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import ratelimit
+import search_history
 from auth import CurrentUserDep, SessionDep
 from metrics import RETRIEVAL_STAGE
 from search import SearchHit, run_search
 from settings import settings
 
 router = APIRouter(prefix="/search-summary", tags=["summary"])
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,10 +246,15 @@ _WHITESPACE = re.compile(r"\s+")
 class SummaryRequest(BaseModel):
     """Summary payload.
 
-    No ``user_id`` / ``book_ids`` fields — tenant scope is resolved
-    server-side by ``run_search`` from the JWT (see ``search.py``).
-    ``extra="forbid"`` (Phase 18) makes a smuggled extra field a hard
-    422 instead of a silently-dropped key.
+    No ``user_id`` field — tenant scope is resolved server-side by
+    ``run_search`` from the JWT (see ``search.py``). ``book_ids`` /
+    ``collection_ids`` (Phase 49) are OPTIONAL scope narrowers: when present,
+    ``run_search`` INTERSECTS them with the JWT user's ``user_library``
+    (``effective = requested & library``) so a client can only SHRINK scope,
+    never widen it; when omitted the whole library is summarized over
+    (backward compatible). ``extra="forbid"`` (Phase 18) makes a smuggled
+    ``user_id`` — or any other unknown field — a hard 422 instead of a
+    silently-dropped key.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -254,6 +263,11 @@ class SummaryRequest(BaseModel):
     # Feeds ``run_search``'s ``limit`` (the cross-encoder's top-N). The rerank
     # fan-out is 30, so values above that just return the full reranked pool.
     limit_chunks: int = Field(default=20, ge=1, le=100)
+    # Phase 49 scope narrowers — forwarded verbatim into ``run_search``, which
+    # owns the intersection-with-library guard. Caps mirror ``SearchRequest``
+    # (the API is the single 422 owner). ``None``/omitted = whole library.
+    book_ids: list[uuid.UUID] | None = Field(default=None, max_length=10_000)
+    collection_ids: list[uuid.UUID] | None = Field(default=None, max_length=500)
 
 
 class Citation(BaseModel):
@@ -603,6 +617,37 @@ async def _summary_rate_limit(current_user: CurrentUserDep) -> None:
     await ratelimit.enforce("summary_user", str(current_user.user_id))
 
 
+async def _record_history(
+    session: AsyncSession,
+    current_user: User,
+    payload: SummaryRequest,
+    response: SummaryResponse,
+) -> None:
+    """Best-effort save of this summary into the user's search history (Phase 51).
+
+    Delegates to ``search_history.record_search_history`` (which guards the
+    insert + retention prune and rolls back on failure). This OUTER guard is the
+    belt-and-suspenders boundary: a history-write failure — a DB error caught
+    inside the helper, OR any unexpected error in the save path — is logged and
+    swallowed here so the costly, already-computed summary is NEVER turned into
+    a 5xx (the Phase 51 best-effort contract). The scope stored is the request's
+    chosen ``book_ids`` / ``collection_ids`` (Phase 49); ``result`` is the
+    serialized ``SummaryResponse`` for instant replay. ``user_id`` is ALWAYS the
+    JWT value (``current_user.user_id``).
+    """
+    try:
+        await search_history.record_search_history(
+            session,
+            user_id=current_user.user_id,
+            query=payload.query,
+            scope_book_ids=payload.book_ids,
+            scope_collection_ids=payload.collection_ids,
+            result=response.model_dump(mode="json"),
+        )
+    except Exception:  # noqa: BLE001 — best-effort; a history write must never 5xx the summary
+        logger.warning("failed to record search history", exc_info=True)
+
+
 @router.post("", response_model=SummaryResponse, dependencies=[Depends(_summary_rate_limit)])
 async def search_summary(
     payload: SummaryRequest,
@@ -632,6 +677,8 @@ async def search_summary(
         do_rerank=True,
         user_id=current_user.user_id,
         session=session,
+        requested_book_ids=payload.book_ids,
+        requested_collection_ids=payload.collection_ids,
     )
     hits = outcome.hits
     if not hits:
@@ -640,11 +687,13 @@ async def search_summary(
         # short-circuits the same way (nothing to ground on) but keeps the
         # flags so the client can caveat that the emptiness may reflect the
         # outage, not the corpus.
-        return SummaryResponse(
+        response = SummaryResponse(
             summary=_NO_CONTEXT_MESSAGE,
             citations=[],
             degraded=outcome.degraded,
         )
+        await _record_history(session, current_user, payload, response)
+        return response
 
     titles = await _resolve_titles(session, [h.book_id for h in hits])
     sources = _build_sources(hits, titles)
@@ -663,8 +712,10 @@ async def search_summary(
     # Proceed-with-flag (Phase 22, module docstring): a degraded retrieval
     # still produced tenant-scoped context, so summarize it and let the
     # flags ride along rather than 503ing a recoverable partial answer.
-    return SummaryResponse(
+    response = SummaryResponse(
         summary=summary_text,
         citations=citations,
         degraded=outcome.degraded,
     )
+    await _record_history(session, current_user, payload, response)
+    return response

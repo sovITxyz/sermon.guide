@@ -1,8 +1,9 @@
 "use client";
 
+import { useSelection } from "@/components/library/selection-context";
 import { readHref } from "@/lib/library";
 import { displaySection, formatElapsed, searchQueryProblem, segmentSummary } from "@/lib/summary";
-import type { SummaryResponse } from "@/lib/types";
+import type { SummaryRequest, SummaryResponse } from "@/lib/types";
 import Link from "next/link";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
@@ -11,7 +12,33 @@ import { type FormEvent, useEffect, useRef, useState } from "react";
 // is line-based).
 const PREVIEW_TOGGLE_CHARS = 280;
 
-export function SearchPanel() {
+/**
+ * `totalBooks` (the JWT user's library size, server-fetched on the /search page)
+ * backs the unscoped "Searching all N books" label. It is optional so the
+ * component still renders bare in tests / outside the page.
+ *
+ * Phase 51 hydration: `hydratedResult` is a saved `SummaryResponse` pushed in
+ * when the user reopens an entry from the "Recent" panel. When its identity
+ * CHANGES to a non-null value the panel adopts it as the rendered result — the
+ * SAME summary/citation render the live search uses — with NO second
+ * /search-summary call (the costly 2–4 min pipeline is never re-run). A fresh
+ * live search later still wins because it sets `result` directly; the hydration
+ * effect only fires when the prop reference changes (RecentSearches passes a
+ * fresh object per reopen). `onSearched` lets the parent refresh the Recent list
+ * after a successful live search so the new row appears.
+ */
+export function SearchPanel({
+  totalBooks,
+  hydratedResult,
+  onSearched,
+}: {
+  totalBooks?: number;
+  hydratedResult?: SummaryResponse | null;
+  onSearched?: () => void;
+}) {
+  // The shared library selection (Phase 49). Empty (no provider, or nothing
+  // ticked) => whole library: the scope fields are omitted from the POST.
+  const { bookIds, collectionIds, resolved } = useSelection();
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
@@ -28,6 +55,19 @@ export function SearchPanel() {
       mounted.current = false;
     };
   }, []);
+
+  // Reopen a saved search from the "Recent" panel (Phase 51): adopt the pushed
+  // result into the existing render. Fires only when the prop identity changes
+  // to a non-null value, so it never clobbers a live search's result (whose
+  // object reference it does not share). Clears any in-flight/error state.
+  useEffect(() => {
+    if (hydratedResult) {
+      setResult(hydratedResult);
+      setSearching(false);
+      setError(null);
+      setExpanded(new Set());
+    }
+  }, [hydratedResult]);
 
   // Elapsed ticker for the long-request affordance; the interval lives only
   // while a search is in flight.
@@ -53,10 +93,21 @@ export function SearchPanel() {
     setResult(null);
     setExpanded(new Set());
     try {
+      // Fold the shared selection into the POST scope: the RAW selection (ad-hoc
+      // book_ids + whole collection_ids) so the API re-resolves collections to
+      // their current membership + ownership and intersects with the library.
+      // Empty arrays are OMITTED (= whole library).
+      const body: SummaryRequest = { query: q };
+      if (bookIds.length > 0) {
+        body.book_ids = bookIds;
+      }
+      if (collectionIds.length > 0) {
+        body.collection_ids = collectionIds;
+      }
       const res = await fetch("/api/search-summary", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify(body),
       });
       if (!mounted.current) {
         return;
@@ -73,6 +124,10 @@ export function SearchPanel() {
       }
       setResult(data);
       setSearching(false);
+      // Tell the parent a search just landed so it can refresh the Recent list
+      // (the API saved this run server-side) — the new row appears without a
+      // full reload. Best-effort: never block the render on it.
+      onSearched?.();
     } catch {
       if (mounted.current) {
         setError("Network error. Please try again.");
@@ -118,6 +173,16 @@ export function SearchPanel() {
           {searching ? "Searching…" : "Search"}
         </button>
       </form>
+
+      {/* Scope hint. A plain <p> (NOT role=status) so it never collides with the
+          in-flight searching <output>. */}
+      <p className="text-gray-500 text-xs" data-testid="search-scope">
+        {resolved.length > 0
+          ? `Searching ${resolved.length} selected ${resolved.length === 1 ? "book" : "books"}.`
+          : totalBooks === undefined
+            ? "Searching your whole library."
+            : `Searching all ${totalBooks} ${totalBooks === 1 ? "book" : "books"} in your library.`}
+      </p>
 
       {error ? (
         <p role="alert" className="text-red-600 text-sm">

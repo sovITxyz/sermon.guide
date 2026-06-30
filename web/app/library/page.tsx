@@ -1,13 +1,16 @@
-import { LibraryTable } from "@/components/LibraryTable";
-import { UnauthenticatedError, getLibrary } from "@/lib/api-server";
-import type { LibraryBook } from "@/lib/types";
+import { LibraryBrowser } from "@/components/library/LibraryBrowser";
+import { SelectionProvider } from "@/components/library/selection-context";
+import { UnauthenticatedError, getCollections, getLibrary } from "@/lib/api-server";
+import type { Collection, LibraryBook } from "@/lib/types";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
 export default async function LibraryPage() {
   let books: LibraryBook[];
+  let collections: Collection[];
   try {
-    books = await getLibrary();
+    // Server-fetched together (both bearer-scoped, token stays on the server).
+    [books, collections] = await Promise.all([getLibrary(), getCollections()]);
   } catch (err) {
     if (err instanceof UnauthenticatedError) {
       redirect("/login?next=/library");
@@ -23,7 +26,10 @@ export default async function LibraryPage() {
           Upload a book
         </Link>
       </div>
-      <LibraryTable books={books} />
+      {/* The shared selection spans /library + /search via sessionStorage. */}
+      <SelectionProvider collections={collections}>
+        <LibraryBrowser books={books} collections={collections} />
+      </SelectionProvider>
     </section>
   );
 }

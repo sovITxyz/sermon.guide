@@ -89,6 +89,20 @@ function renderDrawer(editor: FakeEditor) {
   return { onClose };
 }
 
+function renderScopedDrawer(
+  editor: FakeEditor,
+  scope: { book_ids?: string[]; collection_ids?: string[] },
+) {
+  render(
+    <LibraryDrawer
+      editor={editor as unknown as Editor}
+      bookTitles={TITLES}
+      scope={scope}
+      onClose={vi.fn()}
+    />,
+  );
+}
+
 function submitQuery(value: string): void {
   fireEvent.change(screen.getByLabelText("Search your library"), { target: { value } });
   fireEvent.click(screen.getByRole("button", { name: "Search" }));
@@ -112,6 +126,33 @@ describe("LibraryDrawer — search", () => {
     const [url, init] = fetchStub.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/search");
     expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ query: "grace" });
+  });
+
+  it("folds a non-empty scope into the /api/search POST body (Phase 49)", async () => {
+    const fetchStub = installFetch(() => Promise.resolve(jsonResponse(searchResponse([hit()]))));
+    renderScopedDrawer(makeFakeEditor(), { book_ids: ["b1", "b2"], collection_ids: ["c1"] });
+
+    submitQuery("grace");
+    await screen.findByText("On Grace");
+
+    const [url, init] = fetchStub.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/search");
+    expect(JSON.parse(init.body as string)).toEqual({
+      query: "grace",
+      book_ids: ["b1", "b2"],
+      collection_ids: ["c1"],
+    });
+  });
+
+  it("omits empty scope arrays — an empty selection searches the whole library", async () => {
+    const fetchStub = installFetch(() => Promise.resolve(jsonResponse(searchResponse([hit()]))));
+    renderScopedDrawer(makeFakeEditor(), { book_ids: [], collection_ids: [] });
+
+    submitQuery("grace");
+    await screen.findByText("On Grace");
+
+    const [, init] = fetchStub.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ query: "grace" });
   });
 

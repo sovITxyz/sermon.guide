@@ -126,6 +126,8 @@ class _StoredDoc:
         created_at: datetime,
         updated_at: datetime,
         deleted_at: datetime | None = None,
+        scope_book_ids: list[str] | None = None,
+        scope_collection_ids: list[str] | None = None,
     ) -> None:
         self.document_id = document_id
         self.user_id = user_id
@@ -136,6 +138,12 @@ class _StoredDoc:
         self.created_at = created_at
         self.updated_at = updated_at
         self.deleted_at = deleted_at
+        # Phase 50 scope columns ride through the _update_stmt RETURNING; the
+        # docx import / pull paths never change them, so they default to [].
+        self.scope_book_ids: list[str] = scope_book_ids if scope_book_ids is not None else []
+        self.scope_collection_ids: list[str] = (
+            scope_collection_ids if scope_collection_ids is not None else []
+        )
 
 
 class _Revision:
@@ -168,6 +176,8 @@ _UPDATE_TUPLE_COLS = (
     "content",
     "content_text",
     "schema_version",
+    "scope_book_ids",
+    "scope_collection_ids",
     "created_at",
     "updated_at",
 )

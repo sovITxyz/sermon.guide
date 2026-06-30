@@ -63,13 +63,14 @@ import json
 import re
 import shutil
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, cast
 
 import magic
 from convert import ConversionError, convert_from_docx, convert_to_docx
-from db import Document, SermonDocRevision
+from db import Collection, Document, SermonDocRevision, UserLibraryEntry
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -129,6 +130,14 @@ PREVIEW_CHARS = 280
 # a pathological or abusive payload, mirroring the ``/upload`` size cap.
 MAX_CONTENT_BYTES = 2 * 1024 * 1024
 
+# Per-sermon citation-scope caps (Phase 50). The API is the single 422 owner
+# (the web whitelists do structural-only checks); these mirror the Phase 49
+# scoped-search caps so the editor's Scope control and the search path agree on
+# the limits. A whole 10K-book library can be scoped ad-hoc; collections are far
+# fewer.
+SCOPE_BOOK_IDS_CAP = 10_000
+SCOPE_COLLECTION_IDS_CAP = 500
+
 
 class DocumentCreate(BaseModel):
     """POST body. No ``user_id``/``content_text``/``schema_version`` fields.
@@ -146,16 +155,29 @@ class DocumentCreate(BaseModel):
 
     title: str = Field(min_length=1, max_length=512)
     content: dict[str, object]
+    # Per-sermon citation scope (Phase 50). Default empty = whole library. The
+    # API clamps each set to the JWT user's library / owned collections on
+    # write, so a smuggled foreign id is silently dropped (not an oracle-leaking
+    # error). Caps are the single 422 owner.
+    scope_book_ids: list[uuid.UUID] = Field(default_factory=list, max_length=SCOPE_BOOK_IDS_CAP)
+    scope_collection_ids: list[uuid.UUID] = Field(
+        default_factory=list,
+        max_length=SCOPE_COLLECTION_IDS_CAP,
+    )
 
 
 class DocumentUpdate(BaseModel):
-    """PATCH body — partial (title and/or content); base_updated_at REQUIRED.
+    """PATCH body — partial (title/content/scope); base_updated_at REQUIRED.
 
     ``extra="forbid"`` (Phase 18): a smuggled ``user_id`` / ``content_text``
     is a hard 422. ``base_updated_at`` is the optimistic-concurrency token:
     it MUST equal the stored ``updated_at`` or the PATCH is a 409 (single
-    author, no versions table — B2). ``title`` and ``content`` are both
-    optional, but at least one must be present (an empty patch is a 422).
+    author, no versions table — B2). ``title``, ``content``, and the two scope
+    arrays are all optional, but at least one must be present (an empty patch is
+    a 422). The scope arrays are three-state: ABSENT (``None`` — leave the
+    stored value) vs present (replace it, where ``[]`` clears the scope to whole
+    library). Each present scope set is clamped to the JWT user's library /
+    owned collections on write.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -163,6 +185,11 @@ class DocumentUpdate(BaseModel):
     base_updated_at: datetime
     title: str | None = Field(default=None, min_length=1, max_length=512)
     content: dict[str, object] | None = None
+    scope_book_ids: list[uuid.UUID] | None = Field(default=None, max_length=SCOPE_BOOK_IDS_CAP)
+    scope_collection_ids: list[uuid.UUID] | None = Field(
+        default=None,
+        max_length=SCOPE_COLLECTION_IDS_CAP,
+    )
 
 
 class DocumentSummary(BaseModel):
@@ -181,13 +208,18 @@ class DocumentListResponse(BaseModel):
 
 
 class DocumentResponse(BaseModel):
-    """Full document — includes the ``content`` JSON node tree."""
+    """Full document — includes the ``content`` JSON node tree + scope."""
 
     document_id: uuid.UUID
     title: str
     content: dict[str, object]
     content_text: str
     schema_version: int
+    # Per-sermon citation scope (Phase 50): the clamped book / collection ids the
+    # sermon's citation drawer is limited to. Stored as JSONB UUID strings;
+    # coerced to ``uuid.UUID`` on the way out.
+    scope_book_ids: list[uuid.UUID]
+    scope_collection_ids: list[uuid.UUID]
     created_at: datetime
     updated_at: datetime
 
@@ -398,6 +430,84 @@ def _owned_any_stmt(document_id: uuid.UUID, user_id: uuid.UUID) -> Select[tuple[
     )
 
 
+def _owned_book_ids_stmt(
+    book_ids: Sequence[uuid.UUID],
+    user_id: uuid.UUID,
+) -> Select[tuple[uuid.UUID]]:
+    """Build the scope-clamp: which of *book_ids* the JWT user owns (library).
+
+    ``scope_book_ids`` arrives as ATTACKER-CONTROLLED body input, so the
+    requested set is INTERSECTED with the owner's ``user_library`` before it is
+    persisted — a sermon's scope can never name a book the user does not own
+    (the CLAUDE.md library-intersection invariant, the same guard every search
+    uses). The ``user_id`` filter is load-bearing — ALWAYS the JWT value. An
+    empty ``book_ids`` yields a false predicate (no rows); callers short-circuit
+    before reaching here. Factored into a module-level builder so the
+    ``user_id`` scoping is compile-pinned in ``tests/test_documents_unit.py``.
+    """
+    return select(UserLibraryEntry.book_id).where(
+        UserLibraryEntry.book_id.in_(book_ids),
+        UserLibraryEntry.user_id == user_id,
+    )
+
+
+def _owned_collection_ids_stmt(
+    collection_ids: Sequence[uuid.UUID],
+    user_id: uuid.UUID,
+) -> Select[tuple[uuid.UUID]]:
+    """Build the scope-clamp: which of *collection_ids* the JWT user owns.
+
+    ``scope_collection_ids`` is likewise attacker-controlled body input: the
+    requested set is INTERSECTED with the user's owned ``collections`` before it
+    is persisted, so a foreign/nonexistent collection is silently clamped out
+    (the no-oracle posture, in set form). The ``user_id`` filter is load-bearing
+    — ALWAYS the JWT value. An empty ``collection_ids`` yields no rows; callers
+    short-circuit first.
+    """
+    return select(Collection.collection_id).where(
+        Collection.collection_id.in_(collection_ids),
+        Collection.user_id == user_id,
+    )
+
+
+async def _clamp_scope_book_ids(
+    book_ids: Sequence[uuid.UUID],
+    user_id: uuid.UUID,
+    session: AsyncSession,
+) -> list[str]:
+    """Intersect requested scope *book_ids* with the JWT user's library.
+
+    Returns the owned subset as UUID strings (the JSONB column stores text), in
+    the request's order with duplicates dropped. A foreign/unowned id is
+    silently clamped out. An empty/absent request short-circuits with no query.
+    """
+    deduped = list(dict.fromkeys(book_ids))
+    if not deduped:
+        return []
+    result = await session.execute(_owned_book_ids_stmt(deduped, user_id))
+    owned = set(result.scalars().all())
+    return [str(book_id) for book_id in deduped if book_id in owned]
+
+
+async def _clamp_scope_collection_ids(
+    collection_ids: Sequence[uuid.UUID],
+    user_id: uuid.UUID,
+    session: AsyncSession,
+) -> list[str]:
+    """Intersect requested scope *collection_ids* with the JWT user's collections.
+
+    Returns the owned subset as UUID strings, in request order with duplicates
+    dropped. A foreign/nonexistent collection is silently clamped out. An
+    empty/absent request short-circuits with no query.
+    """
+    deduped = list(dict.fromkeys(collection_ids))
+    if not deduped:
+        return []
+    result = await session.execute(_owned_collection_ids_stmt(deduped, user_id))
+    owned = set(result.scalars().all())
+    return [str(collection_id) for collection_id in deduped if collection_id in owned]
+
+
 def _delete_stmt(
     document_id: uuid.UUID,
     user_id: uuid.UUID,
@@ -430,7 +540,9 @@ def _update_stmt(
     user_id: uuid.UUID,
     *,
     values: dict[str, object],
-) -> ReturningUpdate[tuple[uuid.UUID, str, dict[str, object], str, int, datetime, datetime]]:
+) -> ReturningUpdate[
+    tuple[uuid.UUID, str, dict[str, object], str, int, list[str], list[str], datetime, datetime]
+]:
     """Build the PATCH UPDATE: apply *values* + bump ``updated_at`` on an owned row.
 
     Scoped by ``document_id`` AND ``user_id`` (the tenant gate) AND
@@ -459,6 +571,8 @@ def _update_stmt(
             Document.content,
             Document.content_text,
             Document.schema_version,
+            Document.scope_book_ids,
+            Document.scope_collection_ids,
             Document.created_at,
             Document.updated_at,
         )
@@ -501,6 +615,10 @@ def _to_response(document: Document) -> DocumentResponse:
         content=document.content,
         content_text=document.content_text,
         schema_version=document.schema_version,
+        scope_book_ids=[uuid.UUID(book_id) for book_id in document.scope_book_ids],
+        scope_collection_ids=[
+            uuid.UUID(collection_id) for collection_id in document.scope_collection_ids
+        ],
         created_at=document.created_at,
         updated_at=document.updated_at,
     )
@@ -512,14 +630,31 @@ async def create_document(
     current_user: CurrentUserDep,
     session: SessionDep,
 ) -> DocumentResponse:
-    """Create a sermon document for the JWT user. 413 if content too large."""
+    """Create a sermon document for the JWT user. 413 if content too large.
+
+    The optional citation-scope arrays are CLAMPED to the JWT user's library /
+    owned collections before persisting — a foreign id is silently dropped (the
+    tenant invariant).
+    """
     _require_content_within_cap(payload.content)
+    scope_book_ids = await _clamp_scope_book_ids(
+        payload.scope_book_ids,
+        current_user.user_id,
+        session,
+    )
+    scope_collection_ids = await _clamp_scope_collection_ids(
+        payload.scope_collection_ids,
+        current_user.user_id,
+        session,
+    )
     document = Document(
         user_id=current_user.user_id,
         title=payload.title,
         content=payload.content,
         content_text=derive_content_text(payload.content),
         schema_version=SCHEMA_VERSION,
+        scope_book_ids=scope_book_ids,
+        scope_collection_ids=scope_collection_ids,
     )
     session.add(document)
     await session.commit()
@@ -576,15 +711,23 @@ async def update_document(
     """Partial update under optimistic concurrency. 409 on stale base, 404 no-oracle.
 
     ``base_updated_at`` must equal the stored ``updated_at`` (single-author
-    409 gate). At least one of ``title``/``content`` must be present. On a
-    ``content`` change, ``content_text`` is re-derived and the size cap is
-    enforced; ``updated_at`` is bumped EXPLICITLY (no ``onupdate`` on the
-    column) so the new value reads back for the next PATCH's gate.
+    409 gate). At least one of ``title`` / ``content`` / ``scope_book_ids`` /
+    ``scope_collection_ids`` must be present. On a ``content`` change,
+    ``content_text`` is re-derived and the size cap is enforced; each present
+    scope set is clamped to the JWT user's library / owned collections;
+    ``updated_at`` is bumped EXPLICITLY (no ``onupdate`` on the column) so the
+    new value reads back for the next PATCH's gate.
     """
-    if payload.title is None and payload.content is None:
+    if (
+        payload.title is None
+        and payload.content is None
+        and payload.scope_book_ids is None
+        and payload.scope_collection_ids is None
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="PATCH must set at least one of title or content.",
+            detail="PATCH must set at least one of title, content, scope_book_ids, "
+            "scope_collection_ids.",
         )
     if payload.content is not None:
         _require_content_within_cap(payload.content)
@@ -609,6 +752,21 @@ async def update_document(
         # content_text is server-derived on every content write — the client
         # never supplies it (extra="forbid" forbids the field outright).
         values["content_text"] = derive_content_text(payload.content)
+    # Scope arrays are three-state: ``None`` = absent (leave stored), present
+    # (incl. ``[]``) = replace. Each present set is clamped to the JWT user's
+    # library / owned collections so a smuggled foreign id is dropped.
+    if payload.scope_book_ids is not None:
+        values["scope_book_ids"] = await _clamp_scope_book_ids(
+            payload.scope_book_ids,
+            current_user.user_id,
+            session,
+        )
+    if payload.scope_collection_ids is not None:
+        values["scope_collection_ids"] = await _clamp_scope_collection_ids(
+            payload.scope_collection_ids,
+            current_user.user_id,
+            session,
+        )
 
     # Statement-level UPDATE bumps updated_at via func.now() in the value set
     # (the column has server_default but no onupdate — the schema-wide
@@ -620,13 +778,25 @@ async def update_document(
         )
     ).one()
     await session.commit()
-    document_id_val, title, content, content_text, schema_version, created_at, updated_at = row
+    (
+        document_id_val,
+        title,
+        content,
+        content_text,
+        schema_version,
+        scope_book_ids,
+        scope_collection_ids,
+        created_at,
+        updated_at,
+    ) = row
     return DocumentResponse(
         document_id=document_id_val,
         title=title,
         content=content,
         content_text=content_text,
         schema_version=schema_version,
+        scope_book_ids=[uuid.UUID(book_id) for book_id in scope_book_ids],
+        scope_collection_ids=[uuid.UUID(collection_id) for collection_id in scope_collection_ids],
         created_at=created_at,
         updated_at=updated_at,
     )
@@ -932,13 +1102,25 @@ async def import_document_docx(
         # real exception nor leave attacker bytes on disk.
         shutil.rmtree(import_subdir, ignore_errors=True)
 
-    document_id_val, title, content, content_text, schema_version, created_at, updated_at = row
+    (
+        document_id_val,
+        title,
+        content,
+        content_text,
+        schema_version,
+        scope_book_ids,
+        scope_collection_ids,
+        created_at,
+        updated_at,
+    ) = row
     return DocumentResponse(
         document_id=document_id_val,
         title=title,
         content=content,
         content_text=content_text,
         schema_version=schema_version,
+        scope_book_ids=[uuid.UUID(book_id) for book_id in scope_book_ids],
+        scope_collection_ids=[uuid.UUID(collection_id) for collection_id in scope_collection_ids],
         created_at=created_at,
         updated_at=updated_at,
     )

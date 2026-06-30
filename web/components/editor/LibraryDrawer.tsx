@@ -1,7 +1,7 @@
 "use client";
 
 import { displaySection, searchQueryProblem } from "@/lib/summary";
-import type { SearchHit, SearchResponse } from "@/lib/types";
+import type { SearchHit, SearchRequest, SearchResponse } from "@/lib/types";
 import type { Editor } from "@tiptap/react";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import type { CitationAttrs } from "./CitationNode";
@@ -58,15 +58,26 @@ function hitToCitationAttrs(
   };
 }
 
+/**
+ * The drawer's search SCOPE (Phase 49): the RAW selection forwarded to the API,
+ * which intersects it with the JWT user's library. Omitted/empty arrays = whole
+ * library. Wired this phase but sourced per-sermon in Phase 50; until then the
+ * editor leaves it undefined, so the drawer searches the whole library exactly
+ * as before.
+ */
+export type LibraryDrawerScope = Pick<SearchRequest, "book_ids" | "collection_ids">;
+
 export function LibraryDrawer({
   editor,
   bookTitles,
+  scope,
   onClose,
 }: {
   editor: Editor | null;
   // The shell's one-shot {book_id -> title} map — the only source of a hit's
   // title (raw /search hits carry none). Read-only; the drawer never fetches it.
   bookTitles: ReadonlyMap<string, string>;
+  scope?: LibraryDrawerScope;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -96,10 +107,18 @@ export function LibraryDrawer({
     setSearching(true);
     setHits(null);
     try {
+      // Fold the scope into the POST: omit empty arrays (= whole library).
+      const body: SearchRequest = { query: q };
+      if (scope?.book_ids && scope.book_ids.length > 0) {
+        body.book_ids = scope.book_ids;
+      }
+      if (scope?.collection_ids && scope.collection_ids.length > 0) {
+        body.collection_ids = scope.collection_ids;
+      }
       const res = await fetch("/api/search", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify(body),
       });
       if (!mounted.current) {
         return;

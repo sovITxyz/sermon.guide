@@ -6,6 +6,7 @@ import {
   formatElapsed,
   searchQueryProblem,
   segmentSummary,
+  whitelistSummary,
 } from "../lib/summary";
 
 function joinSegments(segments: SummarySegment[]): string {
@@ -177,5 +178,49 @@ describe("formatElapsed", () => {
   it("clamps negatives and floors fractions", () => {
     expect(formatElapsed(-5)).toBe("0:00");
     expect(formatElapsed(9.9)).toBe("0:09");
+  });
+});
+
+describe("whitelistSummary", () => {
+  it("forwards exactly query when no scope is present (= whole library)", () => {
+    expect(whitelistSummary({ query: "grace" })).toEqual({ ok: true, body: { query: "grace" } });
+  });
+
+  it("forwards the Phase 49 scope arrays when present", () => {
+    expect(whitelistSummary({ query: "grace", book_ids: ["b1"], collection_ids: ["c1"] })).toEqual({
+      ok: true,
+      body: { query: "grace", book_ids: ["b1"], collection_ids: ["c1"] },
+    });
+  });
+
+  it("drops a smuggled user_id / limit_chunks but keeps the scope", () => {
+    const result = whitelistSummary({
+      query: "grace",
+      user_id: "u1",
+      limit_chunks: 99,
+      book_ids: ["b1"],
+    });
+    expect(result).toEqual({ ok: true, body: { query: "grace", book_ids: ["b1"] } });
+  });
+
+  it("treats a null scope field as absent and omits it", () => {
+    expect(whitelistSummary({ query: "grace", book_ids: null })).toEqual({
+      ok: true,
+      body: { query: "grace" },
+    });
+  });
+
+  it("rejects a non-object body, a non-string query, and a non-array scope", () => {
+    expect(whitelistSummary(null).ok).toBe(false);
+    expect(whitelistSummary([]).ok).toBe(false);
+    expect(whitelistSummary({}).ok).toBe(false);
+    expect(whitelistSummary({ query: 12 }).ok).toBe(false);
+    expect(whitelistSummary({ query: "grace", collection_ids: "c1" }).ok).toBe(false);
+    expect(whitelistSummary({ query: "grace", book_ids: [1] }).ok).toBe(false);
+  });
+
+  it("leaves query length to the API — an empty query passes structurally", () => {
+    expect(whitelistSummary({ query: "" }).ok).toBe(true);
+    expect(whitelistSummary({ query: "x".repeat(MAX_QUERY_LENGTH + 100) }).ok).toBe(true);
   });
 });

@@ -237,6 +237,52 @@ describe("SearchPanel", () => {
     });
   });
 
+  it("folds a collection ticked in the picker into the POST scope, and unticking clears it", async () => {
+    // Phase 55: drive the scope from the CollectionScopePicker (not seeded
+    // sessionStorage). The picker writes the shared selection SearchPanel already
+    // folds into the POST — ticking c1 (member b1) resolves to one book.
+    const fetchStub = installFetch(() =>
+      Promise.resolve(jsonResponse({ summary: "ok", citations: [] } satisfies SummaryResponse)),
+    );
+    const collections = [
+      collection({ collection_id: "c1", name: "Grace Collection", book_ids: ["b1"] }),
+    ];
+    render(
+      <SelectionProvider collections={collections}>
+        <SearchPanel totalBooks={7} collections={collections} />
+      </SelectionProvider>,
+    );
+
+    // Whole library until a collection is ticked.
+    expect(screen.getByTestId("search-scope")).toHaveTextContent(
+      "Searching all 7 books in your library.",
+    );
+
+    // Open the disclosure and tick the collection: its one member resolves the
+    // scope label; the RAW collection_id (not the resolved book) rides the POST.
+    fireEvent.click(screen.getByTestId("collection-scope-picker"));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Grace Collection/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("search-scope")).toHaveTextContent("Searching 1 selected book."),
+    );
+
+    submitQuery("grace");
+    await waitFor(() => expect(fetchStub).toHaveBeenCalled());
+    const [, init] = fetchStub.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      query: "grace",
+      collection_ids: ["c1"],
+    });
+
+    // Unticking clears the scope back to the whole library.
+    fireEvent.click(screen.getByRole("checkbox", { name: /Grace Collection/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("search-scope")).toHaveTextContent(
+        "Searching all 7 books in your library.",
+      ),
+    );
+  });
+
   it("re-enables the form after a successful search so a second query can run", async () => {
     const summary: SummaryResponse = {
       summary: "Grace [Romans:7].",

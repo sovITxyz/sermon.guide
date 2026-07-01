@@ -88,3 +88,36 @@ test("scoping to a selected library book carries book_ids into the summary searc
   // The (stubbed) scoped summary still renders.
   await expect(page.getByRole("heading", { name: "Summary" })).toBeVisible();
 });
+
+/**
+ * Scoped search by COLLECTION (Phase 55): on /search directly, open the
+ * Collections scope picker, tick a collection, and confirm its id is folded into
+ * the /search-summary POST as `collection_ids` (the API resolves it to member
+ * books and intersects with the JWT library). The picker drives the SAME shared
+ * selection the Phase 49 book flow uses, so its one member book resolves the
+ * "N selected" label. The fake api seeds one collection (Grace Collection).
+ */
+test("scoping to a selected collection carries collection_ids into the summary search", async ({
+  page,
+}) => {
+  const user = await signUp(page, makeUser());
+  await loginViaUi(page, user, "/search");
+
+  // Open the disclosure and tick the seeded collection; its single member book
+  // resolves the scope label.
+  await page.getByTestId("collection-scope-picker").click();
+  await page.getByRole("checkbox", { name: /Grace Collection/ }).check();
+  await expect(page.getByTestId("search-scope")).toHaveText("Searching 1 selected book.");
+
+  // The summary POST must carry the chosen collection_ids (scope -> api intersection).
+  const summaryRequest = page.waitForRequest(
+    (req) => req.url().endsWith("/api/search-summary") && req.method() === "POST",
+  );
+  await page.getByLabel("Question").fill("How do grace and faith relate?");
+  await page.getByRole("button", { name: "Search" }).click();
+  const body = JSON.parse((await summaryRequest).postData() ?? "{}");
+  expect(body.collection_ids).toEqual(["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]);
+
+  // The (stubbed) scoped summary still renders.
+  await expect(page.getByRole("heading", { name: "Summary" })).toBeVisible();
+});

@@ -2,7 +2,12 @@
 
 import { SearchPanel } from "@/components/SearchPanel";
 import { RecentSearches } from "@/components/search/RecentSearches";
-import type { SearchHistoryEntry, SearchHistoryItem, SummaryResponse } from "@/lib/types";
+import type {
+  Collection,
+  SearchHistoryEntry,
+  SearchHistoryItem,
+  SummaryResponse,
+} from "@/lib/types";
 import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
 
@@ -24,9 +29,11 @@ import { useCallback, useState } from "react";
  */
 export function SearchWorkspace({
   totalBooks,
+  collections,
   history,
 }: {
   totalBooks: number;
+  collections: Collection[];
   history: SearchHistoryItem[];
 }) {
   const router = useRouter();
@@ -44,7 +51,12 @@ export function SearchWorkspace({
 
   return (
     <div className="grid gap-8 lg:grid-cols-[1fr_20rem]">
-      <SearchPanel totalBooks={totalBooks} hydratedResult={hydrated} onSearched={onSearched} />
+      <SearchPanel
+        totalBooks={totalBooks}
+        collections={collections}
+        hydratedResult={hydrated}
+        onSearched={onSearched}
+      />
       <aside className="lg:border-gray-100 lg:border-l lg:pl-8">
         <RecentSearches items={history} onOpen={onOpen} />
       </aside>

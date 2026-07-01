@@ -290,6 +290,21 @@ const LIBRARY = [
   },
 ];
 
+// One seeded collection (Phase 55 — backs the /search CollectionScopePicker and
+// the /library CollectionsPanel). Its single member is the "On Grace" library
+// book above, so ticking it on /search resolves to exactly one book ("Searching
+// 1 selected book.") and folds this collection_id into the /search-summary POST
+// scope. Shape mirrors api/collections_routes.py CollectionResponse.
+const COLLECTIONS = [
+  {
+    collection_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    name: "Grace Collection",
+    description: null,
+    created_at: "2026-06-15T00:00:00Z",
+    book_ids: ["11111111-1111-1111-1111-111111111111"],
+  },
+];
+
 // Deterministic RAW POST /search hits (Phase 37 — backs the in-editor
 // LibraryDrawer). Shape mirrors api/search.py SearchHit EXACTLY: book_id +
 // content_chunk + metadata{filename,chunk_index,parent_section} + score, NO
@@ -493,14 +508,15 @@ const server = createServer(async (req, res) => {
 
   // --- collections (Phase 48 list) ------------------------------------------
   // The /library + /search server components fetch this alongside /library
-  // (Phase 49 scoped search). The stub keeps no collection store yet, so a fresh
-  // user has none — an empty list is enough for the scoped-search flow, which
-  // selects ad-hoc books. Bearer-scoped like the rest.
+  // (Phase 49 scoped search, Phase 55 collection scope picker). The stub keeps no
+  // collection store yet, so every session sees the SAME seeded collection —
+  // enough for the scoped-search flow to tick a whole collection. Bearer-scoped
+  // like the rest.
   if (req.method === "GET" && path === "/collections") {
     if (!userIdFor(req)) {
       return detail(res, 401, "Not authenticated.");
     }
-    return send(res, 200, { collections: [] });
+    return send(res, 200, { collections: COLLECTIONS });
   }
 
   // --- search history (Phase 51) --------------------------------------------

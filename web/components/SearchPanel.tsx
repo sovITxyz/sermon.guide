@@ -1,9 +1,10 @@
 "use client";
 
 import { useSelection } from "@/components/library/selection-context";
+import { CollectionScopePicker } from "@/components/search/CollectionScopePicker";
 import { readHref } from "@/lib/library";
 import { displaySection, formatElapsed, searchQueryProblem, segmentSummary } from "@/lib/summary";
-import type { SummaryRequest, SummaryResponse } from "@/lib/types";
+import type { Collection, SummaryRequest, SummaryResponse } from "@/lib/types";
 import Link from "next/link";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
@@ -26,13 +27,20 @@ const PREVIEW_TOGGLE_CHARS = 280;
  * effect only fires when the prop reference changes (RecentSearches passes a
  * fresh object per reopen). `onSearched` lets the parent refresh the Recent list
  * after a successful live search so the new row appears.
+ *
+ * `collections` (Phase 55) backs the CollectionScopePicker beside the query
+ * input — the user's collections, threaded from the page (no client fetch). It
+ * is optional (defaults to none) so the component still renders bare in tests /
+ * outside the page; the picker itself renders nothing when the list is empty.
  */
 export function SearchPanel({
   totalBooks,
+  collections = [],
   hydratedResult,
   onSearched,
 }: {
   totalBooks?: number;
+  collections?: Collection[];
   hydratedResult?: SummaryResponse | null;
   onSearched?: () => void;
 }) {
@@ -173,6 +181,10 @@ export function SearchPanel({
           {searching ? "Searching…" : "Search"}
         </button>
       </form>
+
+      {/* Collections scope picker (Phase 55). Folds ticked collections into the
+          shared selection above, which the POST scope already carries. */}
+      <CollectionScopePicker collections={collections} />
 
       {/* Scope hint. A plain <p> (NOT role=status) so it never collides with the
           in-flight searching <output>. */}

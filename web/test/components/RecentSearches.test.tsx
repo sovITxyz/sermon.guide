@@ -221,7 +221,7 @@ describe("SearchWorkspace — reopen hydrates the SearchPanel render", () => {
       return Promise.reject(new Error(`unexpected fetch: ${url}`));
     });
 
-    render(<SearchWorkspace totalBooks={2} history={[makeItem()]} />);
+    render(<SearchWorkspace totalBooks={2} collections={[]} history={[makeItem()]} />);
 
     // No summary is rendered until a recent entry is reopened.
     expect(screen.queryByRole("heading", { name: "Summary" })).not.toBeInTheDocument();

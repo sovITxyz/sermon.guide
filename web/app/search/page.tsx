@@ -39,7 +39,7 @@ export default async function SearchPage() {
       </p>
       {/* The selection set on /library rides over via sessionStorage and scopes the search. */}
       <SelectionProvider collections={collections}>
-        <SearchWorkspace totalBooks={books.length} history={history} />
+        <SearchWorkspace totalBooks={books.length} collections={collections} history={history} />
       </SelectionProvider>
     </section>
   );

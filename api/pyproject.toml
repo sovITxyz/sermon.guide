@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "sermon.guide FastAPI HTTP layer — auth, upload, task status, search."
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "fastapi>=0.115,<0.139",
+  "fastapi>=0.115,<0.140",
   "uvicorn[standard]>=0.32,<0.50",
   # `pydantic[email]` pulls email-validator, required by `EmailStr` fields
   # in the auth schemas. Without it pydantic raises on model definition.

@@ -4,8 +4,8 @@ version = "0.0.0"
 description = "sermon.guide FastAPI HTTP layer — auth, upload, task status, search."
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "fastapi>=0.115,<0.140",
-  "uvicorn[standard]>=0.32,<0.50",
+  "fastapi>=0.115,<0.142",
+  "uvicorn[standard]>=0.32,<0.53",
   # `pydantic[email]` pulls email-validator, required by `EmailStr` fields
   # in the auth schemas. Without it pydantic raises on model definition.
   "pydantic[email]>=2,<3",
@@ -75,7 +75,7 @@ dependencies = [
   # refresh/access tokens before they hit Postgres. Promoted from a TRANSITIVE
   # dep (it arrived via `python-jose[cryptography]`) to an EXPLICIT top-level
   # pin so the vault does not rely on jose's transitive resolution.
-  "cryptography>=43,<50",
+  "cryptography>=43,<51",
 ]
 
 [dependency-groups]

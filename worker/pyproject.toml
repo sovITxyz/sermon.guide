@@ -20,7 +20,7 @@ dependencies = [
   # The `openai` SDK is the embeddings transport (ADR 0006, mirroring the
   # ADR 0005 chat transport in api/); httpx is the thin rerank client —
   # DeepInfra's reranker endpoint is not OpenAI-shaped.
-  "openai>=2,<3",
+  "openai>=2,<4",
   "httpx>=0.27,<1",
   # numpy moves from dev to runtime: it used to ride in transitively via
   # sentence-transformers, which Phase 16b removed.
